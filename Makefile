@@ -16,7 +16,7 @@ BUILD       := build3ds
 # (needs scripts/build_game_lib.sh, build_platform_lib.sh, build_gx_lib.sh, link_test.sh first).
 MODE        ?= stage0
 ifeq ($(MODE),game)
-SOURCES     := source_game
+SOURCES     := source_game platform/3ds/pica
 else
 SOURCES     := source platform/3ds
 endif

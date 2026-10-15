@@ -13,6 +13,10 @@
 extern "C" {
 void port_init(int argc, char** argv);
 void GX3DS_GetStats(uint32_t out[7]);
+uint32_t pica_dropped(void);
+void GX3DS_SetDebugColors(int on);
+int GX3DS_GetDebugColors(void);
+void GX3DS_GetCopyStats(uint32_t out[3]);
 }
 void SMS_main(void);  // the decomp's main(), renamed by port_compat.h (C++ linkage)
 
@@ -31,6 +35,39 @@ extern unsigned char gpApplication[];
 // 0xF0, curAudioNumber 0xF4 (offsets from the ARM build). state 3 = played, 5 = stopped/error.
 extern "C" unsigned char ActivePlayer[];
 extern "C" uint32_t THPPlayerGetTotalFrame(void);
+// TMarDirector (System/MarDirector.hpp): mState u8 at 0x64, TCardLoad* at 0x70; TCardLoad
+// (GC2D/CardLoad.hpp): ints at 0x10, 0x14, 0x18. Checked with static_assert on the ARM build.
+extern unsigned char _ZTV12TMarDirector[];
+// The emulated OS scheduler (sms-pc-port platform/os/os_thread.cpp) and OSThread fields
+// (dolphin/os/OSThread.h; offsets checked on the ARM build): state u16 0x2C8, suspend s32
+// 0x2CC, priority s32 0x2D0, queue (thread queue it waits on) 0x2DC, mutex (waited on) 0x2F0.
+extern "C" int port_os_thread_list(void** out, int max);
+extern "C" void* __gCurrentThread;
+
+// Writes every emulated thread to the log: resolve the addresses with nm on sms3ds.elf
+// (global OSThreads, message queues and mutexes have symbols).
+static void dump_os_threads(const char* why)
+{
+	void* list[48];
+	int n = port_os_thread_list(list, 48);
+	fprintf(stderr, "[threads] %s: %d emulated threads, current %08lx\n", why, n,
+	        (unsigned long)(uintptr_t)__gCurrentThread);
+	for (int i = 0; i < n && i < 48; i++) {
+		const unsigned char* t = (const unsigned char*)list[i];
+		uint16_t state;
+		int32_t suspend, prio;
+		uint32_t queue, mutex;
+		memcpy(&state, t + 0x2C8, 2);
+		memcpy(&suspend, t + 0x2CC, 4);
+		memcpy(&prio, t + 0x2D0, 4);
+		memcpy(&queue, t + 0x2DC, 4);
+		memcpy(&mutex, t + 0x2F0, 4);
+		const char* st = state == 1 ? "ready" : state == 2 ? "running" : state == 4 ? "waiting" : state == 8 ? "exited" : "?";
+		fprintf(stderr, "[threads]   %08lx prio %2ld %-7s suspend %ld queue %08lx mutex %08lx\n",
+		        (unsigned long)(uintptr_t)t, (long)prio, st, (long)suspend, (unsigned long)queue,
+		        (unsigned long)mutex);
+	}
+}
 
 static const char* app_state_name(unsigned s)
 {
@@ -43,6 +80,9 @@ struct SceneState {
 	unsigned state, curr_stage, curr_scen, next_stage, next_scen, movie;
 	uintptr_t director, director_vtbl;
 	unsigned thp_state, thp_internal, thp_play;  // compared for changes; frame counters are not
+	int mar_state;                               // TMarDirector::mState, -1 for other directors
+	uintptr_t cardload;
+	int cl10, cl14, cl18;
 };
 
 static void read_thp_frames(int32_t* video, int32_t* audio)
@@ -68,12 +108,27 @@ static SceneState read_scene()
 	s.thp_state    = ActivePlayer[0xA4];
 	s.thp_internal = ActivePlayer[0xA5];
 	s.thp_play     = ActivePlayer[0xA6];
+	s.mar_state = -1;
+	s.cardload = 0;
+	s.cl10 = s.cl14 = s.cl18 = 0;
+	if (dir && s.director_vtbl == (uintptr_t)(_ZTV12TMarDirector + 8)) {
+		const unsigned char* d = (const unsigned char*)dir;
+		s.mar_state = d[0x64];
+		memcpy(&s.cardload, d + 0x70, sizeof s.cardload);
+		if (s.cardload) {
+			memcpy(&s.cl10, (const unsigned char*)s.cardload + 0x10, 4);
+			memcpy(&s.cl14, (const unsigned char*)s.cardload + 0x14, 4);
+			memcpy(&s.cl18, (const unsigned char*)s.cardload + 0x18, 4);
+		}
+	}
 	return s;
 }
 
 // Logs once a second, and at once whenever the state, area, movie or director changes.
-static void log_scene(uint32_t frames)
+// frames and batches are GX3DS_GetStats totals; draws/frame is over the time since the last line.
+static void log_scene(uint32_t frames, uint32_t batches)
 {
+	static uint32_t last_frames, last_batches;
 	static SceneState last;
 	static bool have_last;
 	static u64 last_ms;
@@ -87,6 +142,22 @@ static void log_scene(uint32_t frames)
 	        (unsigned long)frames, changed ? "CHANGED " : "", s.state, app_state_name(s.state),
 	        s.curr_stage, s.curr_scen, s.next_stage, s.next_scen, s.movie, (unsigned long)s.director,
 	        (unsigned long)s.director_vtbl);
+	// A stage whose setup never finishes sits in TMarDirector state 0: dump the threads after
+	// 8 seconds of that, then every 30.
+	static int state0_secs;
+	if (s.mar_state == 0) {
+		state0_secs++;
+		if (state0_secs == 8 || (state0_secs > 8 && state0_secs % 30 == 8))
+			dump_os_threads("stage setup not finished after 8 s");
+	} else {
+		state0_secs = 0;
+	}
+	uint32_t df = frames - last_frames, db = batches - last_batches;
+	last_frames = frames;
+	last_batches = batches;
+	if (s.mar_state >= 0)
+		fprintf(stderr, "[mar] state=%d cardload=%08lx cl=%d,%d,%d draws/frame=%lu\n", s.mar_state,
+		        (unsigned long)s.cardload, s.cl10, s.cl14, s.cl18, (unsigned long)(df ? db / df : 0));
 	if (s.thp_state || s.thp_internal || s.thp_play) {
 		int32_t video, audio;
 		read_thp_frames(&video, &audio);
@@ -123,7 +194,9 @@ int main()
 {
 	osSetSpeedupEnable(true);
 	gfxInitDefault();
-	consoleInit(GFX_TOP, NULL);
+	// The top screen belongs to the renderer (platform/3ds/pica, citro3d on the game thread);
+	// this status text lives on the bottom screen.
+	consoleInit(GFX_BOTTOM, NULL);
 
 	// Everything the port prints goes to the SD card, unbuffered, so a crash still leaves a log.
 	freopen(LOG_PATH, "w", stderr);
@@ -137,7 +210,7 @@ int main()
 	printf("app mem free %lu MB\n", (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 20));
 	fprintf(stderr, "[3ds] %s 3DS, heap %lu MB, linear free %lu MB\n", isNew ? "New" : "Old",
 	        (unsigned long)(envGetHeapSize() >> 20), (unsigned long)(linearSpaceFree() >> 20));
-	printf("log: %s\nSTART = exit\n\n", LOG_PATH);
+	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\n\n", LOG_PATH);
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
@@ -151,9 +224,17 @@ int main()
 
 	static const char* const phase[] = {"waiting", "port_init", "SMS_main (running)", "SMS_main returned"};
 	while (aptMainLoop()) {
+		// The game thread scans HID too (pad_sdk.cpp), so a press can be consumed there before
+		// hidKeysDown() sees it here: detect edges on the held state instead. START alone is the
+		// game's Start button, so quitting needs START+SELECT.
 		hidScanInput();
-		if (hidKeysDown() & KEY_START)
+		static u32 prevHeld;
+		u32 held = hidKeysHeld(), pressed = held & ~prevHeld;
+		prevHeld = held;
+		if ((held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT))
 			break;
+		if ((pressed & KEY_SELECT) && !(held & KEY_START))
+			GX3DS_SetDebugColors(!GX3DS_GetDebugColors());
 		uint32_t s[7];
 		GX3DS_GetStats(s);
 		printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
@@ -163,10 +244,17 @@ int main()
 			printf("\nscene: %-9s area %2u-%-2u next %2u-%-2u\nmovie %u  director %08lx\n",
 			       app_state_name(sc.state), sc.curr_stage, sc.curr_scen, sc.next_stage, sc.next_scen,
 			       sc.movie, (unsigned long)sc.director_vtbl);
-			log_scene(s[0]);
+			log_scene(s[0], s[1]);
 		}
+		printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
+		       GX3DS_GetDebugColors() ? "debug (per draw)" : "material");
+		uint32_t cs[3];
+		GX3DS_GetCopyStats(cs);
+		printf("draws: %3lu before copy, %3lu after\ntexture copies/frame: %lu  \n", (unsigned long)cs[0],
+		       (unsigned long)cs[1], (unsigned long)cs[2]);
+		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
+		// single-buffered, so writing back the CPU cache is enough.
 		gfxFlushBuffers();
-		gfxSwapBuffers();
 		gspWaitForVBlank();
 	}
 

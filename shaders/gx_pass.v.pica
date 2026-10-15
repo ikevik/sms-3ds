@@ -1,0 +1,26 @@
+; GX pass-through vertex shader (platform/3ds/pica/pica_draw.c).
+; The CPU has already applied the GameCube's position matrix, projection and viewport:
+; v0 is a homogeneous position in EFB pixels with the GameCube depth in z, v1 a 0..255 colour.
+; `projection` maps EFB pixels onto the rotated top screen and z onto the PICA's depth range.
+
+.fvec projection[4]
+
+.constf myconst(0.00392156862745098, 0.0, 0.0, 0.0)
+.alias  inv255 myconst.xxxx
+
+.out outpos position
+.out outclr color
+
+.alias inpos v0
+.alias inclr v1
+
+.proc main
+	dp4 outpos.x, projection[0], inpos
+	dp4 outpos.y, projection[1], inpos
+	dp4 outpos.z, projection[2], inpos
+	dp4 outpos.w, projection[3], inpos
+
+	mul outclr, inv255, inclr
+
+	end
+.end
