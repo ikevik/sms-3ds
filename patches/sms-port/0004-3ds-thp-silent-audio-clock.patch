@@ -1,0 +1,50 @@
+--- a/platform/audio/ai.cpp
++++ b/platform/audio/ai.cpp
+@@ -405,13 +405,46 @@
+ }
+ 
+ } // namespace
++
++namespace JASystem {
++namespace Kernel {
++	typedef s16* (*MixCallback)(s32);
++	MixCallback getMixCallback(u8* mode);
++}
++}
+ 
++// SMS_NO_AUDIO: JAudio's audio thread never mixes, so nothing calls the extra
++// mix callback (JASAiCtrl vframeWork). THPPlayer's is its audio clock: video
++// frames are released only while the audio is at most one frame behind, so a
++// movie with audio stopped on its second frame. Pull the callback at the DAC
++// rate in DAC-sized blocks, discarding the samples.
++static u64 g_silent_acc; // samples owed, in 1/60000 units
++static void silent_mix_on_retrace()
++{
++	u8 mode;
++	JASystem::Kernel::MixCallback cb = JASystem::Kernel::getMixCallback(&mode);
++	if (!cb) {
++		g_silent_acc = 0;
++		return;
++	}
++	g_silent_acc += (u64)kRate * 1001;
++	const u64 perBlock = (u64)kBlockFrames * 60000;
++	while (g_silent_acc >= perBlock) {
++		g_silent_acc -= perBlock;
++		cb((s32)kBlockFrames);
++	}
++}
++
+ // Called by platform/vi once per retrace. In deterministic mode each retrace
+ // owes 32000 * 1001 / 60000 samples; whole DMA blocks become due.
+ extern "C" void port_audio_on_retrace(void)
+ {
+-	if (!port_vi_deterministic() || !g.enabled || !g.running)
++	if (!g.enabled) {
++		silent_mix_on_retrace();
+ 		return;
++	}
++	if (!port_vi_deterministic() || !g.running)
++		return;
+ 	g_det_acc += (u64)kRate * 1001;
+ 	u32 len      = g.latchedLen ? g.latchedLen : 0x460 * 2;
+ 	u64 perBlock = (u64)(len / 4) * 60000;
