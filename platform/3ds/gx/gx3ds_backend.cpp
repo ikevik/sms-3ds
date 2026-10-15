@@ -7,8 +7,10 @@
 //   * drawBatch() transforms each batch on the CPU as sms-pc-port's vertex shader does
 //     (position matrix from XF memory, GX projection, GX viewport) into EFB pixels and hands
 //     the triangles to platform/3ds/pica (citro3d);
-//   * stage 1 is untextured: colour is the channel-0 material or vertex colour, shaded by the
-//     normal when lighting is on; depth test and blending follow the BP registers;
+//   * the rasterised colour is the channel's material or vertex colour, shaded by the normal
+//     when lighting is on; depth test and blending follow the BP registers;
+//   * GX textures are decoded and cached, and the TEV stages are translated into PICA texture
+//     combiner stages (translateTev);
 //   * display copies present the frame.
 // Interface is sms-pc-port's (MIT), the implementation is independent.
 #include "gx_internal.h"
@@ -18,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <initializer_list>
 #include <unordered_map>
 #include <vector>
 
@@ -244,26 +247,640 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	return e.tex;
 }
 
-// The first TEV stage that samples a texture, and what it reads.
-struct TexStage {
-	bool textured;
-	int map, coord;
-	bool rasNull;  // the stage's rasterised colour is GX_COLOR_NULL: the texture stands alone
+// ---- stage 3: TEV -> PICA texture combiners ------------------------------------------------
+// The GX TEV state is read from BP registers as sms-pc-port's shader generator reads it
+// (gx_shader.cpp: buildKey/genFS) and translated into PICA combiner stages. Each GX stage
+// computes, per channel (colour, alpha), r = d +/- lerp(a, b, c) + bias, times a scale, into
+// one of four registers (PREV, C0-C2); the PICA has six stages that see the previous stage's
+// output, a combiner buffer (one stage delayed), one constant colour per stage, the vertex
+// colour and three textures. The translation tracks where each GX register's channel lives:
+//   * a constant known now (the BP_TEV_REG value it starts with, or a stage whose inputs are
+//     all constant, folded on the CPU);
+//   * PREVIOUS, the output of the last PICA stage;
+//   * the combiner buffer, where a live value is saved before a stage overwrites PREVIOUS.
+// Each GX stage channel becomes one or two PICA operations (REPLACE / MODULATE / ADD /
+// ADD_SIGNED / SUBTRACT / INTERPOLATE / MULTIPLY_ADD, and the stage scale); with two, the
+// first one's result is kept in PREVIOUS for the second, and a GX stage takes two PICA
+// stages. A setup that cannot be expressed falls back to the stage-2 rule (first texture x
+// vertex colour) and is logged once.
+enum { CH_RGB = 0, CH_A = 1 };
+enum : uint8_t { SRC_PRIMARY = 0x00, SRC_TEX0 = 0x03, SRC_BUFFER = 0x0D, SRC_CONSTANT = 0x0E, SRC_PREVIOUS = 0x0F };
+enum : uint8_t {
+	FN_REPLACE = 0, FN_MODULATE = 1, FN_ADD = 2, FN_ADD_SIGNED = 3, FN_INTERPOLATE = 4, FN_SUBTRACT = 5,
+	FN_MULTIPLY_ADD = 8
 };
-static TexStage findTexStage() {
-	TexStage ts{false, 0, 0, false};
-	const uint32_t numStages = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
-	for (uint32_t s = 0; s < numStages; s++) {
-		uint32_t order = (g.bp[BP_TREF + (s >> 1)] >> ((s & 1) * 12)) & 0x3FF;
-		if ((order >> 6) & 1) {
-			ts.textured = true;
-			ts.map = order & 7;
-			ts.coord = (order >> 3) & 7;
-			ts.rasNull = ((order >> 7) & 7) == 7;
-			return ts;
+
+// A combiner input for one channel: a constant (rgb, or v[0] for alpha) or a PICA source with
+// the component it reads (0-3: r, g, b, a replicated; 4: the colour as is, rgb only). mid: the
+// result of the channel's first operation (PREVIOUS in its second).
+struct TevSrc {
+	bool k;
+	int16_t v[3];
+	uint8_t src, comp;
+	bool inv;  // 1 - x
+	bool mid;
+};
+static TevSrc tsConst(int r, int g, int b) {
+	return TevSrc{true, {int16_t(r), int16_t(g), int16_t(b)}, 0, 0, false, false};
+}
+static TevSrc tsConst1(int a) { return tsConst(a, a, a); }
+static TevSrc tsSrc(uint8_t src, uint8_t comp) { return TevSrc{false, {0, 0, 0}, src, comp, false, false}; }
+static bool tsSame(const TevSrc& a, const TevSrc& b, int nc) {
+	if (a.k != b.k || a.inv != b.inv || a.mid != b.mid) return false;
+	if (a.k) {
+		for (int i = 0; i < nc; i++)
+			if (a.v[i] != b.v[i]) return false;
+		return true;
+	}
+	return a.src == b.src && a.comp == b.comp;
+}
+static bool tsAll(const TevSrc& s, int nc, int v) {
+	if (!s.k) return false;
+	for (int i = 0; i < nc; i++)
+		if (s.v[i] != v) return false;
+	return true;
+}
+
+struct TevOp {
+	uint8_t func, n, scale;
+	TevSrc s[3];
+};
+// What one channel of a GX stage becomes: folded to a constant, or one or two PICA operations.
+struct ChanPlan {
+	bool folded;
+	int16_t fv[3];
+	int nops;
+	TevOp op[2];
+	const char* fail;
+	bool softScale;  // scale 1/2, drawn at 1
+};
+
+static inline int tevLerp(int a, int b, int c) {
+	int c2 = c + (c >> 7);
+	return (a * (256 - c2) + b * c2 + 128) >> 8;
+}
+
+// GX stage arithmetic on constants (as genFS computes it).
+static int tevFold(int a, int b, int c, int d, uint32_t bias, uint32_t sub, uint32_t scale, uint32_t clampv) {
+	int r = sub ? d - tevLerp(a & 255, b & 255, c & 255) : d + tevLerp(a & 255, b & 255, c & 255);
+	r += bias == 1 ? 128 : bias == 2 ? -128 : 0;
+	if (scale == 1) r *= 2;
+	else if (scale == 2) r *= 4;
+	else if (scale == 3) r >>= 1;
+	if (clampv) return r < 0 ? 0 : r > 255 ? 255 : r;
+	return r < -1024 ? -1024 : r > 1023 ? 1023 : r;
+}
+
+static ChanPlan planChannel(TevSrc A, TevSrc B, TevSrc C, TevSrc D, int nc, uint32_t bias, uint32_t sub,
+                            uint32_t scale, uint32_t clampv) {
+	ChanPlan p;
+	memset(&p, 0, sizeof p);
+	if (bias == 3) {
+		p.fail = "compare stage";
+		return p;
+	}
+	for (TevSrc* s : {&A, &B, &C})
+		if (s->k)
+			for (int i = 0; i < 3; i++) s->v[i] &= 255;
+	// Inputs the lerp ignores.
+	if (tsAll(C, nc, 0)) B = tsConst1(0);
+	else if (tsAll(C, nc, 255)) A = tsConst1(0);
+	if (A.k && B.k && C.k && D.k) {
+		p.folded = true;
+		for (int i = 0; i < nc; i++) p.fv[i] = int16_t(tevFold(A.v[i], B.v[i], C.v[i], D.v[i], bias, sub, scale, clampv));
+		return p;
+	}
+	const uint8_t outScale = scale == 1 ? 1 : scale == 2 ? 2 : 0;
+	p.softScale = scale == 3;
+
+	// lerp(a, b, c) as: nothing, X, X * Y, or a real interpolation.
+	enum { LZ, LX, LXY, LERP } lf;
+	TevSrc X{}, Y{};
+	if (tsAll(C, nc, 0)) { lf = tsAll(A, nc, 0) ? LZ : LX; X = A; }
+	else if (tsAll(C, nc, 255)) { lf = tsAll(B, nc, 0) ? LZ : LX; X = B; }
+	else if (tsAll(A, nc, 0) && tsAll(B, nc, 0)) lf = LZ;
+	else if (tsAll(A, nc, 0)) { lf = LXY; X = B; Y = C; }
+	else if (tsAll(B, nc, 0)) { lf = LXY; X = A; Y = C; Y.inv = !Y.inv; }
+	else if (tsSame(A, B, nc)) { lf = LX; X = A; }
+	else lf = LERP;
+	auto kval = [](const TevSrc& s, int i) { return s.inv ? 255 - s.v[i] : s.v[i]; };
+	if (lf == LXY && X.k && Y.k) {  // a constant product
+		TevSrc K = tsConst1(0);
+		for (int i = 0; i < nc; i++) K.v[i] = int16_t(tevLerp(0, kval(X, i), kval(Y, i)));
+		lf = LX;
+		X = K;
+	}
+
+	auto op = [&](uint8_t fn, std::initializer_list<TevSrc> srcs) {
+		TevOp& o = p.op[p.nops++];
+		o.func = fn;
+		o.n = 0;
+		for (const TevSrc& s : srcs) o.s[o.n++] = s;
+	};
+	TevSrc mid = tsSrc(SRC_PREVIOUS, uint8_t(nc == 3 ? 4 : 3));
+	mid.mid = true;
+	// The lerp alone, as one operation (for LXY and LERP).
+	auto lerpOp = [&] {
+		if (lf == LXY) op(FN_MODULATE, {X, Y});
+		else op(FN_INTERPOLATE, {B, A, C});
+	};
+	auto fold0 = [&] {
+		p.folded = true;
+		memset(p.fv, 0, sizeof p.fv);
+	};
+	auto finish = [&]() -> ChanPlan {
+		if (p.nops) p.op[p.nops - 1].scale = outScale;
+		// Constants under 1 - x are folded.
+		for (int k = 0; k < p.nops; k++)
+			for (int j = 0; j < p.op[k].n; j++) {
+				TevSrc& s = p.op[k].s[j];
+				if (s.k && s.inv) {
+					for (int i = 0; i < 3; i++) s.v[i] = int16_t(255 - s.v[i]);
+					s.inv = false;
+				}
+			}
+		return p;
+	};
+	auto failed = [&](const char* why) {
+		p.fail = why;
+		return p;
+	};
+	const TevSrc half = tsConst1(128);
+
+	int biasv = bias == 1 ? 128 : bias == 2 ? -128 : 0;
+	if (D.k) {  // the bias joins a constant d
+		bool neg = false, pos = false, over = false;
+		for (int i = 0; i < nc; i++) {
+			int v = D.v[i] + biasv;
+			D.v[i] = int16_t(v > 255 ? 255 : v);
+			if (v < 0) neg = true;
+			if (v > 0) pos = true;
+			if (v > 255) over = true;
+		}
+		biasv = 0;
+		if (over && sub) return failed("constant d over 1 minus x");
+		if (neg) {  // lerp - k
+			if (pos || sub) return failed("constant d of mixed sign");
+			TevSrc K = D;
+			for (int i = 0; i < nc; i++) K.v[i] = int16_t(-K.v[i]);
+			if (lf == LZ) fold0();
+			else if (lf == LX) op(FN_SUBTRACT, {X, K});
+			else {
+				lerpOp();
+				op(FN_SUBTRACT, {mid, K});
+			}
+			return finish();
 		}
 	}
-	return ts;
+	const bool dz = tsAll(D, nc, 0);
+	if (biasv) {  // a varying d with a bias
+		if (lf == LZ) {
+			op(biasv > 0 ? FN_ADD : FN_SUBTRACT, {D, half});
+		} else if (!sub && biasv < 0) {  // d + lerp - 1/2
+			if (lf == LX) op(FN_ADD_SIGNED, {X, D});
+			else {
+				lerpOp();
+				op(FN_ADD_SIGNED, {mid, D});
+			}
+		} else if (sub && biasv > 0) {  // d - lerp + 1/2 ~ d + (1 - lerp) - 1/2
+			if (lf == LX) {
+				TevSrc nx = X;
+				nx.inv = !nx.inv;
+				op(FN_ADD_SIGNED, {D, nx});
+			} else {
+				lerpOp();
+				TevSrc nm = mid;
+				nm.inv = true;
+				op(FN_ADD_SIGNED, {D, nm});
+			}
+		} else if (lf == LX) {  // d + x + 1/2, d - x - 1/2: the first result's clamp is harmless
+			op(sub ? FN_SUBTRACT : FN_ADD, sub ? std::initializer_list<TevSrc>{D, X} : std::initializer_list<TevSrc>{X, D});
+			op(sub ? FN_SUBTRACT : FN_ADD, {mid, half});
+		} else {
+			return failed("bias with a varying d");
+		}
+		return finish();
+	}
+	if (!sub) {
+		switch (lf) {
+		case LZ: if (dz) fold0(); else op(FN_REPLACE, {D}); break;
+		case LX: if (dz) op(FN_REPLACE, {X}); else op(FN_ADD, {X, D}); break;
+		case LXY: if (dz) op(FN_MODULATE, {X, Y}); else op(FN_MULTIPLY_ADD, {X, Y, D}); break;
+		case LERP:
+			op(FN_INTERPOLATE, {B, A, C});
+			if (!dz) op(FN_ADD, {mid, D});
+			break;
+		}
+	} else {
+		switch (lf) {
+		case LZ: if (dz) fold0(); else op(FN_REPLACE, {D}); break;
+		case LX: if (dz) fold0(); else op(FN_SUBTRACT, {D, X}); break;
+		case LXY:
+		case LERP:
+			if (dz) {
+				fold0();
+				break;
+			}
+			lerpOp();
+			op(FN_SUBTRACT, {D, mid});
+			break;
+		}
+	}
+	return finish();
+}
+
+// Logs each distinct unsupported TEV pattern once.
+static void tevLogOnce(const char* why, uint32_t stage, uint32_t nStages, uint32_t ce, uint32_t ae) {
+	static std::vector<uint64_t> seen;
+	uint64_t key = (uint64_t(uintptr_t(why)) << 32) ^ (uint64_t(ce) << 8) ^ (uint64_t(ae) << 24) ^ stage;
+	for (uint64_t k : seen)
+		if (k == key) return;
+	if (seen.size() >= 256) return;
+	seen.push_back(key);
+	fprintf(stderr, "[tev] %s: stage %u of %u, colour env %06x, alpha env %06x\n", why, stage, nStages, ce, ae);
+}
+
+// The GX TEV state of the draw, decoded.
+struct TevSetup {
+	uint32_t numStages;
+	uint32_t colorEnv[16], alphaEnv[16], order[16], ksel[16], swap[4];
+	int unit[16];          // PICA texture unit each stage samples (-1: none)
+	int nUnits;
+	int unitMap[PICA_MAX_TEX], unitCoord[PICA_MAX_TEX];
+	int rasChan;           // colour channel the vertex colour carries (0, 1)
+	bool tooManyTex;
+};
+
+static void readTev(TevSetup& t) {
+	memset(&t, 0, sizeof t);
+	t.numStages = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
+	for (uint32_t s = 0; s < t.numStages; s++) {
+		t.colorEnv[s] = g.bp[BP_TEV_COLOR_ENV + 2 * s] & 0xFFFFFF;
+		t.alphaEnv[s] = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1] & 0xFFFFFF;
+		t.order[s] = (g.bp[BP_TREF + (s >> 1)] >> ((s & 1) * 12)) & 0x3FF;
+		const uint32_t ks = g.bp[BP_TEV_KSEL + (s >> 1)];
+		t.ksel[s] = (s & 1) ? ((ks >> 14) & 0x3FF) : ((ks >> 4) & 0x3FF);
+	}
+	for (int i = 0; i < 4; i++)
+		t.swap[i] = (g.bp[BP_TEV_KSEL + 2 * i] & 15) | (g.bp[BP_TEV_KSEL + 2 * i + 1] & 15) << 4;
+	t.rasChan = -1;
+	for (uint32_t s = 0; s < t.numStages; s++) {
+		const uint32_t ord = t.order[s], map = ord & 7, coord = (ord >> 3) & 7, chan = (ord >> 7) & 7;
+		t.unit[s] = -1;
+		if ((ord >> 6) & 1) {
+			int u = 0;
+			while (u < t.nUnits && (t.unitMap[u] != int(map) || t.unitCoord[u] != int(coord))) u++;
+			if (u == t.nUnits) {
+				if (t.nUnits == PICA_MAX_TEX) {
+					t.tooManyTex = true;
+					u = 0;
+				} else {
+					t.unitMap[u] = int(map);
+					t.unitCoord[u] = int(coord);
+					t.nUnits++;
+				}
+			}
+			t.unit[s] = u;
+		}
+		// The vertex colour carries the first channel a stage reads.
+		if (chan <= 1 && t.rasChan < 0) {
+			const uint32_t ce = t.colorEnv[s], ae = t.alphaEnv[s];
+			bool reads = false;
+			for (int i = 0; i < 4; i++) {
+				uint32_t c = (ce >> (4 * i)) & 15, a = (ae >> (4 + 3 * i)) & 7;
+				if (c == 10 || c == 11 || a == 5) reads = true;
+			}
+			if (reads) t.rasChan = int(chan);
+		}
+	}
+	if (t.rasChan < 0) t.rasChan = 0;
+}
+
+// GX registers PREV, C0-C2 by channel: where the value lives.
+enum : uint8_t { LOC_CONST, LOC_PREV, LOC_BUF, LOC_LOST };
+struct TevLoc {
+	uint8_t kind;
+	int16_t v[3];  // LOC_CONST: rgb, or v[0] for alpha
+};
+
+static inline int sext11(uint32_t v) { return int(v << 21) >> 21; }
+
+static inline uint8_t clampByte(int v) { return uint8_t(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+// The channel (CH_RGB, CH_A) of PREVIOUS / the buffer a source reads.
+static inline int srcChannel(const TevSrc& s) { return s.comp == 3 ? CH_A : CH_RGB; }
+
+// Translates the TEV setup into st's combiner stages. unitWhite[u]: unit u has no texture (reads
+// as white). Returns false (and logs) when the setup cannot be expressed.
+static bool translateTev(const TevSetup& t, const bool unitWhite[PICA_MAX_TEX], PicaState& st) {
+	const uint32_t N = t.numStages;
+	if (t.tooManyTex) {
+		tevLogOnce("more than 3 texture coordinate/map pairs", 0, N, t.colorEnv[0], t.alphaEnv[0]);
+		return false;
+	}
+	// Liveness: bit 2 * reg + channel, live after each stage.
+	uint8_t liveAfter[16];
+	{
+		uint8_t live = uint8_t(1u << (2 * ((t.colorEnv[N - 1] >> 22) & 3) + CH_RGB) |
+		                       1u << (2 * ((t.alphaEnv[N - 1] >> 22) & 3) + CH_A));
+		for (int s = int(N) - 1; s >= 0; s--) {
+			liveAfter[s] = live;
+			const uint32_t ce = t.colorEnv[s], ae = t.alphaEnv[s];
+			live &= uint8_t(~(1u << (2 * ((ce >> 22) & 3) + CH_RGB)));
+			live &= uint8_t(~(1u << (2 * ((ae >> 22) & 3) + CH_A)));
+			for (int i = 0; i < 4; i++) {
+				uint32_t c = (ce >> (4 * i)) & 15, a = (ae >> (4 + 3 * i)) & 7;
+				if (c < 8) live |= uint8_t(1u << (2 * (c >> 1) + (c & 1)));
+				if (a < 4) live |= uint8_t(1u << (2 * a + CH_A));
+			}
+		}
+	}
+
+	TevLoc loc[4][2];
+	for (int r = 0; r < 4; r++) {
+		const uint32_t ra = g.bp[BP_TEV_REG + 2 * r], bg = g.bp[BP_TEV_REG + 2 * r + 1];
+		loc[r][CH_RGB] = TevLoc{LOC_CONST, {int16_t(sext11(ra & 0x7FF)), int16_t(sext11((bg >> 12) & 0x7FF)),
+		                                    int16_t(sext11(bg & 0x7FF))}};
+		loc[r][CH_A] = TevLoc{LOC_CONST, {int16_t(sext11((ra >> 12) & 0x7FF)), 0, 0}};
+	}
+	int prevOcc[2] = {-1, -1}, bufOcc[2] = {-1, -1};
+	int n = 0;  // PICA stages emitted
+	int curTex = -1;  // texture unit `tex` holds (-1: white), as genFS keeps it between stages
+	static const int k8[8] = {255, 223, 191, 159, 127, 95, 63, 31};
+	static const int nc[2] = {3, 1};
+
+	for (uint32_t s = 0; s < N; s++) {
+		const uint32_t ce = t.colorEnv[s], ae = t.alphaEnv[s], ord = t.order[s];
+		const uint32_t chan = (ord >> 7) & 7;
+		const uint32_t rasSwap = t.swap[ae & 3], texSwap = t.swap[(ae >> 2) & 3];
+		if (t.unit[s] >= 0) curTex = unitWhite[t.unit[s]] ? -1 : t.unit[s];
+		const char* softFail = nullptr;
+
+		// konst
+		const uint32_t kc = t.ksel[s] & 31, ka = (t.ksel[s] >> 5) & 31;
+		auto kreg = [](uint32_t i, int comp) {  // comp 0-3: r, g, b, a
+			const uint32_t ra = g.kreg[2 * i], bg = g.kreg[2 * i + 1];
+			return int(comp == 0 ? ra & 0xFF : comp == 1 ? (bg >> 12) & 0xFF : comp == 2 ? bg & 0xFF : (ra >> 12) & 0xFF);
+		};
+		TevSrc konstC, konstA;
+		if (kc < 8) konstC = tsConst1(k8[kc]);
+		else if (kc >= 12 && kc < 16) konstC = tsConst(kreg(kc - 12, 0), kreg(kc - 12, 1), kreg(kc - 12, 2));
+		else if (kc >= 16) konstC = tsConst1(kreg(kc & 3, int((kc - 16) >> 2)));
+		else konstC = tsConst1(255);
+		if (ka < 8) konstA = tsConst1(k8[ka]);
+		else if (ka >= 16) konstA = tsConst1(kreg(ka & 3, int((ka - 16) >> 2)));
+		else konstA = tsConst1(255);
+
+		// A texture or vertex colour input through a swap table. comp: 4 colour, 3 alpha.
+		auto swapped = [&](uint8_t src, uint32_t swap, int comp) -> TevSrc {
+			const int sr = swap & 3, sg = (swap >> 2) & 3, sb = (swap >> 4) & 3, sa = (swap >> 6) & 3;
+			if (comp == 3) return tsSrc(src, uint8_t(sa));
+			if (sr == 0 && sg == 1 && sb == 2) return tsSrc(src, 4);
+			if (sr == sg && sg == sb) return tsSrc(src, uint8_t(sr));
+			softFail = "swap table permutes colour";
+			return tsSrc(src, 4);
+		};
+		auto texIn = [&](int comp) -> TevSrc {
+			if (curTex < 0) return tsConst1(255);
+			return swapped(uint8_t(SRC_TEX0 + curTex), texSwap, comp);
+		};
+		auto rasIn = [&](int comp) -> TevSrc {
+			if (chan > 1) {
+				if (chan != 7) softFail = "bump alpha (indirect) colour";
+				return tsConst1(0);
+			}
+			if (int(chan) != t.rasChan) softFail = "stages read both colour channels";
+			return swapped(SRC_PRIMARY, rasSwap, comp);
+		};
+		bool lost = false;
+		// Register reg's channel ch, read as comp (4: colour, 3: alpha replicated).
+		auto regIn = [&](int reg, int ch, int comp) -> TevSrc {
+			const TevLoc& l = loc[reg][ch];
+			switch (l.kind) {
+			case LOC_CONST: return ch == CH_A ? tsConst1(l.v[0]) : tsConst(l.v[0], l.v[1], l.v[2]);
+			case LOC_PREV: return tsSrc(SRC_PREVIOUS, uint8_t(comp));
+			case LOC_BUF: return tsSrc(SRC_BUFFER, uint8_t(comp));
+			default: lost = true; return tsConst1(0);
+			}
+		};
+		auto colorIn = [&](uint32_t c) -> TevSrc {
+			if (c < 8) return regIn(int(c >> 1), (c & 1) ? CH_A : CH_RGB, (c & 1) ? 3 : 4);
+			switch (c) {
+			case 8: return texIn(4);
+			case 9: return texIn(3);
+			case 10: return rasIn(4);
+			case 11: return rasIn(3);
+			case 12: return tsConst1(255);
+			case 13: return tsConst1(128);
+			case 14: return konstC;
+			default: return tsConst1(0);
+			}
+		};
+		auto alphaIn = [&](uint32_t a) -> TevSrc {
+			if (a < 4) return regIn(int(a), CH_A, 3);
+			switch (a) {
+			case 4: return texIn(3);
+			case 5: return rasIn(3);
+			case 6: return konstA;
+			default: return tsConst1(0);
+			}
+		};
+
+		ChanPlan plan[2];
+		plan[CH_RGB] = planChannel(colorIn((ce >> 12) & 15), colorIn((ce >> 8) & 15), colorIn((ce >> 4) & 15),
+		                           colorIn(ce & 15), 3, (ce >> 16) & 3, (ce >> 18) & 1, (ce >> 20) & 3, (ce >> 19) & 1);
+		plan[CH_A] = planChannel(alphaIn((ae >> 13) & 7), alphaIn((ae >> 10) & 7), alphaIn((ae >> 7) & 7),
+		                         alphaIn((ae >> 4) & 7), 1, (ae >> 16) & 3, (ae >> 18) & 1, (ae >> 20) & 3, (ae >> 19) & 1);
+		if (lost) {
+			tevLogOnce("register value lost (no room in the combiner buffer)", s, N, ce, ae);
+			return false;
+		}
+		for (int ch = 0; ch < 2; ch++) {
+			if (plan[ch].fail) {
+				tevLogOnce(plan[ch].fail, s, N, ce, ae);
+				return false;
+			}
+			if (plan[ch].softScale) tevLogOnce("scale 1/2 (drawn at 1)", s, N, ce, ae);
+		}
+		if (softFail) tevLogOnce(softFail, s, N, ce, ae);
+
+		// An operation with two different constants loads one into PREVIOUS first: a one-op
+		// channel becomes two.
+		for (int ch = 0; ch < 2; ch++) {
+			ChanPlan& p = plan[ch];
+			for (int k = 0; k < p.nops; k++) {
+				TevSrc ks[3];
+				int nk = 0;
+				for (int j = 0; j < p.op[k].n; j++) {
+					if (!p.op[k].s[j].k) continue;
+					bool dup = false;
+					for (int i = 0; i < nk; i++) dup |= tsSame(ks[i], p.op[k].s[j], nc[ch]);
+					if (!dup) ks[nk++] = p.op[k].s[j];
+				}
+				if (nk < 2) continue;
+				if (nk > 2 || p.nops == 2) {
+					tevLogOnce("too many constants in one stage", s, N, ce, ae);
+					return false;
+				}
+				TevSrc mid = tsSrc(SRC_PREVIOUS, uint8_t(ch == CH_RGB ? 4 : 3));
+				mid.mid = true;
+				TevOp main = p.op[0];
+				for (int j = 0; j < main.n; j++)
+					if (main.s[j].k && tsSame(main.s[j], ks[0], nc[ch])) main.s[j] = mid;
+				p.op[0] = TevOp{FN_REPLACE, 1, 0, {ks[0]}};
+				p.op[1] = main;
+				p.nops = 2;
+				break;
+			}
+		}
+
+		const int dest[2] = {int((ce >> 22) & 3), int((ae >> 22) & 3)};
+		const bool computes[2] = {!plan[CH_RGB].folded, !plan[CH_A].folded};
+		const bool two = plan[CH_RGB].nops == 2 || plan[CH_A].nops == 2;
+		const int stagesNeeded = (computes[0] || computes[1] ? 1 : 0) + (two ? 1 : 0);
+		if (n + stagesNeeded > PICA_MAX_STAGES) {
+			tevLogOnce("more than 6 combiner stages", s, N, ce, ae);
+			return false;
+		}
+
+		// Values in PREVIOUS that this stage overwrites but later stages read go to the buffer:
+		// the stage that produced them (n - 1) updates it, and it shows from stage n + 1 on.
+		bool saved[2] = {false, false};
+		for (int ch = 0; ch < 2; ch++) {
+			if (!computes[ch]) continue;
+			const int r = prevOcc[ch];
+			if (r < 0) continue;
+			if (dest[ch] != r && (liveAfter[s] >> (2 * r + ch) & 1)) {
+				const int b = bufOcc[ch];
+				const bool bufFree = b < 0 || b == dest[ch] || !(liveAfter[s] >> (2 * b + ch) & 1);
+				if (n < 1 || n - 1 > 3 || !bufFree) {
+					tevLogOnce("no room to keep a register value", s, N, ce, ae);
+					return false;
+				}
+				if (b >= 0) loc[b][ch].kind = LOC_LOST;
+				if (ch == CH_RGB) st.buf_rgb |= uint8_t(1u << (n - 1));
+				else st.buf_alpha |= uint8_t(1u << (n - 1));
+				loc[r][ch].kind = LOC_BUF;
+				bufOcc[ch] = r;
+				saved[ch] = true;
+			} else {
+				loc[r][ch].kind = LOC_LOST;
+			}
+			prevOcc[ch] = -1;
+		}
+		// With two PICA stages, the second one's inputs must still be what this GX stage read:
+		// PREVIOUS only of a channel the first one passes through, the buffer only of a channel
+		// not saved to now.
+		if (two) {
+			for (int ch = 0; ch < 2; ch++) {
+				const ChanPlan& p = plan[ch];
+				if (!p.nops) continue;
+				const TevOp& o = p.op[p.nops - 1];
+				for (int j = 0; j < o.n; j++) {
+					const TevSrc& x = o.s[j];
+					if (x.k || x.mid) continue;
+					const int xc = srcChannel(x);
+					if ((x.src == SRC_PREVIOUS && plan[xc].nops == 2) || (x.src == SRC_BUFFER && saved[xc])) {
+						tevLogOnce("value overwritten between two combiner stages", s, N, ce, ae);
+						return false;
+					}
+				}
+			}
+		}
+
+		auto opRgb = [](const TevSrc& x) -> uint32_t {
+			static const uint8_t k[5] = {0x4, 0x8, 0xC, 0x2, 0x0};
+			return (x.k ? 0u : k[x.comp]) | (x.inv ? 1u : 0u);
+		};
+		auto opA = [](const TevSrc& x) -> uint32_t {
+			static const uint8_t k[4] = {0x2, 0x4, 0x6, 0x0};
+			return (x.k ? 0u : k[x.comp > 3 ? 3 : x.comp]) | (x.inv ? 1u : 0u);
+		};
+		// Emits PICA stage(s): `which` 0 is the first of two, 1 the last (or only) one.
+		for (int which = two ? 0 : 1; which < 2 && stagesNeeded; which++) {
+			PicaTevStage& ps = st.stage[n++];
+			memset(&ps, 0, sizeof ps);
+			int16_t kv[4] = {0, 0, 0, 0};
+			for (int ch = 0; ch < 2; ch++) {
+				const ChanPlan& p = plan[ch];
+				const TevOp* o = nullptr;
+				if (computes[ch]) o = which == 0 ? (p.nops == 2 ? &p.op[0] : nullptr) : &p.op[p.nops - 1];
+				uint32_t srcs = SRC_PREVIOUS, ops = 0;
+				uint8_t func = FN_REPLACE, scl = 0;
+				if (o) {
+					srcs = 0;
+					for (int j = 0; j < 3; j++) {
+						const TevSrc& x = j < o->n ? o->s[j] : o->s[0];
+						srcs |= uint32_t(x.k ? SRC_CONSTANT : x.src) << (4 * j);
+						ops |= (ch == CH_RGB ? opRgb(x) : opA(x)) << (4 * j);
+						if (x.k) {
+							if (ch == CH_RGB) memcpy(kv, x.v, sizeof x.v);
+							else kv[3] = x.v[0];
+						}
+					}
+					func = o->func;
+					scl = o->scale;
+				}
+				if (ch == CH_RGB) {
+					ps.src_rgb = uint16_t(srcs);
+					ps.op_rgb = uint16_t(ops);
+					ps.func_rgb = func;
+					ps.scale_rgb = scl;
+				} else {
+					ps.src_alpha = uint16_t(srcs);
+					ps.op_alpha = uint16_t(ops);
+					ps.func_alpha = func;
+					ps.scale_alpha = scl;
+				}
+			}
+			ps.color = uint32_t(clampByte(kv[0])) | uint32_t(clampByte(kv[1])) << 8 |
+			           uint32_t(clampByte(kv[2])) << 16 | uint32_t(clampByte(kv[3])) << 24;
+		}
+		// Where the stage's results live now.
+		for (int ch = 0; ch < 2; ch++) {
+			const int r = dest[ch];
+			if (bufOcc[ch] == r) bufOcc[ch] = -1;
+			if (computes[ch]) {
+				loc[r][ch].kind = LOC_PREV;
+				prevOcc[ch] = r;
+			} else {
+				if (prevOcc[ch] == r) prevOcc[ch] = -1;
+				loc[r][ch] = TevLoc{LOC_CONST, {plan[ch].fv[0], plan[ch].fv[1], plan[ch].fv[2]}};
+			}
+		}
+	}
+
+	// The output: the last stage's colour and alpha registers, moved into PREVIOUS if needed.
+	const int outReg[2] = {int((t.colorEnv[N - 1] >> 22) & 3), int((t.alphaEnv[N - 1] >> 22) & 3)};
+	if (n == 0 || prevOcc[CH_RGB] != outReg[CH_RGB] || prevOcc[CH_A] != outReg[CH_A]) {
+		if (n == PICA_MAX_STAGES) {
+			tevLogOnce("more than 6 combiner stages", N - 1, N, t.colorEnv[N - 1], t.alphaEnv[N - 1]);
+			return false;
+		}
+		PicaTevStage& ps = st.stage[n++];
+		memset(&ps, 0, sizeof ps);
+		int16_t kv[4] = {0, 0, 0, 0};
+		for (int ch = 0; ch < 2; ch++) {
+			const TevLoc& l = loc[outReg[ch]][ch];
+			uint8_t src = SRC_PREVIOUS;
+			if (l.kind == LOC_LOST) {
+				tevLogOnce("output value lost", N - 1, N, t.colorEnv[N - 1], t.alphaEnv[N - 1]);
+				return false;
+			}
+			if (l.kind == LOC_BUF) src = SRC_BUFFER;
+			if (l.kind == LOC_CONST) {
+				src = SRC_CONSTANT;
+				if (ch == CH_RGB) memcpy(kv, l.v, sizeof l.v);
+				else kv[3] = l.v[0];
+			}
+			if (ch == CH_RGB) ps.src_rgb = src;
+			else ps.src_alpha = src;
+		}
+		ps.color = uint32_t(clampByte(kv[0])) | uint32_t(clampByte(kv[1])) << 8 | uint32_t(clampByte(kv[2])) << 16 |
+		           uint32_t(clampByte(kv[3])) << 24;
+	}
+	st.nstages = uint8_t(n);
+	return true;
 }
 
 // GX alpha compare (BP 0xF3: ref0, ref1, comp0, comp1, op) reduced to the one PICA test.
@@ -329,12 +946,19 @@ static void drawTriangles() {
 	const VtxFmtLayout& L = vtxFmtLayout(s_bfmt);
 	uint32_t n = s_bcount, nidx = uint32_t(s_idx.size());
 
-	// Texture of the first texturing TEV stage (none in debug-colour mode).
-	const TexStage ts = s_debugColors ? TexStage{false, 0, 0, false} : findTexStage();
-	PicaTex* tex = nullptr;
-	const EfbCopy* efbCopy = nullptr;
-	if (ts.textured) tex = textureForMap(ts.map, &efbCopy);
-	const bool textured = tex != nullptr;
+	// Textures the TEV stages sample, one PICA unit per (map, coordinate) pair (none in
+	// debug-colour mode).
+	const bool debug = s_debugColors;
+	TevSetup tev;
+	readTev(tev);
+	const int nUnits = debug ? 0 : tev.nUnits;
+	PicaTex* utex[PICA_MAX_TEX] = {};
+	const EfbCopy* ucopy[PICA_MAX_TEX] = {};
+	bool uwhite[PICA_MAX_TEX] = {true, true, true};
+	for (int u = 0; u < nUnits; u++) {
+		utex[u] = textureForMap(tev.unitMap[u], &ucopy[u]);
+		uwhite[u] = utex[u] == nullptr;
+	}
 
 	PicaVtx* out;
 	uint16_t* oidx;
@@ -348,9 +972,11 @@ static void drawTriangles() {
 	const float vcx = xff(XFR_VIEWPORT + 3) - 342.0f, vcy = xff(XFR_VIEWPORT + 4) - 342.0f, vcz = xff(XFR_VIEWPORT + 5);
 	const float kInvZ = 1.0f / 16777215.0f;
 
-	// Channel 0 colour: material register or vertex colour; lighting reduced to one fixed light.
-	const uint32_t cctrl = g.xfReg[XFR_COLOR0CTRL], actrl = g.xfReg[XFR_ALPHA0CTRL], mat = g.xfReg[XFR_MAT0];
-	const bool hasClr = (s_bfmt & VF_CLR0) != 0, hasNrm = (s_bfmt & VF_NRM) != 0, hasMtx = (s_bfmt & VF_MTX) != 0;
+	// The colour channel the TEV stages read (0 or 1): material register or vertex colour;
+	// lighting reduced to one fixed light.
+	const int ch = debug ? 0 : tev.rasChan;
+	const uint32_t cctrl = g.xfReg[XFR_COLOR0CTRL + ch], actrl = g.xfReg[XFR_ALPHA0CTRL + ch], mat = g.xfReg[XFR_MAT0 + ch];
+	const bool hasClr = (s_bfmt & (VF_CLR0 << ch)) != 0, hasNrm = (s_bfmt & VF_NRM) != 0, hasMtx = (s_bfmt & VF_MTX) != 0;
 	const bool clrFromVtx = (cctrl & 1) && hasClr, alphaFromVtx = (actrl & 1) && hasClr;
 	const bool lit = ((cctrl >> 1) & 1) && hasNrm;
 	const uint8_t matRGBA[4] = {uint8_t(mat >> 24), uint8_t(mat >> 16), uint8_t(mat >> 8), uint8_t(mat)};
@@ -359,9 +985,6 @@ static void drawTriangles() {
 	const uint8_t defTex[8] = {uint8_t((matA >> 6) & 63),  uint8_t((matA >> 12) & 63), uint8_t((matA >> 18) & 63),
 	                           uint8_t((matA >> 24) & 63), uint8_t(matB & 63),         uint8_t((matB >> 6) & 63),
 	                           uint8_t((matB >> 12) & 63), uint8_t((matB >> 18) & 63)};
-	static const uint8_t kWhite[4] = {255, 255, 255, 255};
-	const bool rasWhite = textured && ts.rasNull;
-	const bool debug = s_debugColors;
 	uint8_t dbg[3] = {0, 0, 0};
 	if (debug) debugColor(hasMtx ? s_vdata[L.mtx] : defPm, s_vdata.data(), s_bstride, nidx, dbg);
 
@@ -392,15 +1015,18 @@ static void drawTriangles() {
 		o.z = (vcz * cw + vsz * cz) * kInvZ;
 		o.w = cw;
 
-		if (textured) {
-			texCoord(ts.coord, v, L, s_bfmt, defTex, o.u, o.v);
-			if (efbCopy)  // through the copy's source rectangle into the EFB snapshot
-				pica_efb_uv(efbCopy->x + o.u * efbCopy->w, efbCopy->y + o.v * efbCopy->h, &o.u, &o.v);
-		} else {
-			o.u = o.v = 0.f;
+		for (int u = 0; u < PICA_MAX_TEX; u++) {
+			float* tc = o.tc[u];
+			if (!utex[u]) {
+				tc[0] = tc[1] = 0.f;
+				continue;
+			}
+			texCoord(tev.unitCoord[u], v, L, s_bfmt, defTex, tc[0], tc[1]);
+			if (const EfbCopy* c = ucopy[u])  // through the copy's source rectangle into the EFB snapshot
+				pica_efb_uv(c->x + tc[0] * c->w, c->y + tc[1] * c->h, &tc[0], &tc[1]);
 		}
 
-		const uint8_t* src = debug ? dbg : rasWhite ? kWhite : clrFromVtx ? v + L.clr[0] : matRGBA;
+		const uint8_t* src = debug ? dbg : clrFromVtx ? v + L.clr[ch] : matRGBA;
 		float shade = 1.0f;
 		if (lit || (debug && hasNrm)) {
 			float nrm[3];
@@ -416,7 +1042,7 @@ static void drawTriangles() {
 		o.rgba[0] = clamp255(src[0] * shade);
 		o.rgba[1] = clamp255(src[1] * shade);
 		o.rgba[2] = clamp255(src[2] * shade);
-		o.rgba[3] = rasWhite ? 255 : alphaFromVtx ? v[L.clr[0] + 3] : matRGBA[3];
+		o.rgba[3] = alphaFromVtx ? v[L.clr[ch] + 3] : matRGBA[3];
 	}
 	for (uint32_t i = 0; i < nidx; i++) oidx[i] = uint16_t(s_idx[i]);
 
@@ -424,13 +1050,31 @@ static void drawTriangles() {
 	memset(&st, 0, sizeof st);  // the PICA side compares states bytewise
 	currentPicaState(st);
 	alphaTest(st);
-	if (textured) {
-		const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, ts.map)];
-		static const uint8_t kWrap[4] = {0, 2, 3, 2};  // clamp, repeat, mirror -> GPU_TEXTURE_WRAP_PARAM
-		st.tex = tex;
-		st.wrap_s = kWrap[mode0 & 3];
-		st.wrap_t = kWrap[(mode0 >> 2) & 3];
-		st.linear = (mode0 >> 4) & 1;
+	static const uint8_t kWrap[4] = {0, 2, 3, 2};  // clamp, repeat, mirror -> GPU_TEXTURE_WRAP_PARAM
+	for (int u = 0; u < nUnits; u++) {
+		if (!utex[u]) continue;
+		const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, tev.unitMap[u])];
+		st.tex[u] = utex[u];
+		st.wrap_s[u] = kWrap[mode0 & 3];
+		st.wrap_t[u] = kWrap[(mode0 >> 2) & 3];
+		st.linear[u] = (mode0 >> 4) & 1;
+	}
+	if (!debug && !translateTev(tev, uwhite, st)) {
+		// Stage-2 rule: the first texture times the vertex colour (the texture alone when that
+		// stage's colour is GX_COLOR_NULL).
+		memset(st.stage, 0, sizeof st.stage);
+		st.buf_rgb = st.buf_alpha = 0;
+		st.nstages = 0;
+		for (uint32_t s = 0; s < tev.numStages; s++) {
+			const int u = tev.unit[s];
+			if (u < 0 || !utex[u]) continue;
+			PicaTevStage& ps = st.stage[0];
+			const bool rasNull = ((tev.order[s] >> 7) & 7) == 7;
+			ps.src_rgb = ps.src_alpha = uint16_t(SRC_TEX0 + u) | (rasNull ? 0 : SRC_PRIMARY << 4);
+			ps.func_rgb = ps.func_alpha = rasNull ? FN_REPLACE : FN_MODULATE;
+			st.nstages = 1;
+			break;
+		}
 	}
 	pica_draw_triangles(out, oidx, nidx, &st);
 }

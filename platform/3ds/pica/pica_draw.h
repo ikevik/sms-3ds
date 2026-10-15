@@ -18,24 +18,43 @@ extern "C" {
 #define PICA_EFB_WIDTH  640
 #define PICA_EFB_HEIGHT 448
 
+#define PICA_MAX_TEX    3 /* texture units with their own coordinates (TEXTURE0-2) */
+#define PICA_MAX_STAGES 6 /* texture combiner stages */
+
 typedef struct {
-	float x, y, z, w;  /* EFB pixels and GameCube depth, homogeneous */
-	float u, v;        /* texture coordinate (normalised; v = 0 is the image's top row) */
+	float x, y, z, w;            /* EFB pixels and GameCube depth, homogeneous */
+	float tc[PICA_MAX_TEX][2];   /* texture coordinates per unit (normalised; v = 0 is the image's top row) */
 	uint8_t rgba[4];
 } PicaVtx;
 
 /* A texture owned by this file (an opaque C3D_Tex). */
 typedef struct PicaTex PicaTex;
 
-/* PICA values (GPU_TESTFUNC, GPU_BLENDFACTOR), filled by the back end from BP registers. */
+/* One texture combiner stage, in PICA values: sources (GPU_TEVSOURCES of GPU_TEVSRC),
+ * operands (GPU_TEVOPERANDS of GPU_TEVOP_RGB / GPU_TEVOP_A), GPU_COMBINEFUNC, GPU_TEVSCALE,
+ * and the stage's constant colour (0xAABBGGRR). */
+typedef struct {
+	uint16_t src_rgb, src_alpha;
+	uint16_t op_rgb, op_alpha;
+	uint8_t func_rgb, func_alpha;
+	uint8_t scale_rgb, scale_alpha;
+	uint32_t color;
+} PicaTevStage;
+
+/* PICA values (GPU_TESTFUNC, GPU_BLENDFACTOR), filled by the back end from BP registers. The
+ * PICA side compares states bytewise: zero the whole struct before filling it. */
 typedef struct {
 	uint8_t depth_test, depth_func, depth_write;
 	uint8_t blend, blend_src, blend_dst;
 	uint8_t color_write;
 	uint8_t alpha_test, alpha_func, alpha_ref; /* GPU_TESTFUNC */
-	PicaTex* tex;                              /* null: vertex colour only */
-	uint8_t wrap_s, wrap_t;                    /* GPU_TEXTURE_WRAP_PARAM */
-	uint8_t linear;                            /* bilinear filtering */
+	PicaTex* tex[PICA_MAX_TEX];                /* texture units; null: unused */
+	uint8_t wrap_s[PICA_MAX_TEX], wrap_t[PICA_MAX_TEX]; /* GPU_TEXTURE_WRAP_PARAM */
+	uint8_t linear[PICA_MAX_TEX];              /* bilinear filtering */
+	uint8_t nstages;                           /* combiner stages used; 0: vertex colour only */
+	uint8_t buf_rgb, buf_alpha;                /* combiner buffer update masks (bit i: stage i) */
+	uint32_t buf_color;                        /* combiner buffer's initial colour (0xAABBGGRR) */
+	PicaTevStage stage[PICA_MAX_STAGES];
 } PicaState;
 
 /* Lazily initialises citro3d and the top-screen render target. Returns 0 on failure. */

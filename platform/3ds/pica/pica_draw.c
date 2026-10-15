@@ -76,8 +76,10 @@ int pica_init(void)
 	C3D_AttrInfo* ai = C3D_GetAttrInfo();
 	AttrInfo_Init(ai);
 	AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4);          /* v0: position (EFB pixels, homogeneous) */
-	AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);          /* v1: texture coordinate */
-	AttrInfo_AddLoader(ai, 2, GPU_UNSIGNED_BYTE, 4);  /* v2: colour 0..255 */
+	AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);          /* v1-v3: texture coordinates 0-2 */
+	AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 2);
+	AttrInfo_AddLoader(ai, 3, GPU_FLOAT, 2);
+	AttrInfo_AddLoader(ai, 4, GPU_UNSIGNED_BYTE, 4);  /* v4: colour 0..255 */
 
 	if (!C3D_TexInitVRAM(&s_efbTex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) goto fail;
 	s_efb = C3D_RenderTargetCreateFromTex(&s_efbTex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
@@ -232,21 +234,48 @@ int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx)
 	return 1;
 }
 
+/* Stages from `first` on pass the previous stage through, and the combiner buffer is not
+ * updated. */
+static void passthrough_from(int first)
+{
+	for (int i = first; i < PICA_MAX_STAGES; i++) C3D_TexEnvInit(C3D_GetTexEnv(i));
+	C3D_TexEnvBufUpdate(C3D_Both, 0);
+}
+
 static void apply_state(const PicaState* st)
 {
 	if (s_last_valid && memcmp(st, &s_last, sizeof *st) == 0) return;
-	C3D_TexEnv* env = C3D_GetTexEnv(0);
-	C3D_TexEnvInit(env);
-	if (st->tex) {
-		C3D_Tex* tex = &st->tex->tex;
-		C3D_TexSetWrap(tex, (GPU_TEXTURE_WRAP_PARAM)st->wrap_s, (GPU_TEXTURE_WRAP_PARAM)st->wrap_t);
-		C3D_TexSetFilter(tex, st->linear ? GPU_LINEAR : GPU_NEAREST, st->linear ? GPU_LINEAR : GPU_NEAREST);
-		C3D_TexBind(0, tex);
-		C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
-		C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
-	} else {
+	for (int u = 0; u < PICA_MAX_TEX; u++) {
+		if (!st->tex[u]) continue;
+		C3D_Tex* tex = &st->tex[u]->tex;
+		C3D_TexSetWrap(tex, (GPU_TEXTURE_WRAP_PARAM)st->wrap_s[u], (GPU_TEXTURE_WRAP_PARAM)st->wrap_t[u]);
+		C3D_TexSetFilter(tex, st->linear[u] ? GPU_LINEAR : GPU_NEAREST, st->linear[u] ? GPU_LINEAR : GPU_NEAREST);
+		C3D_TexBind(u, tex);
+	}
+	if (st->nstages == 0) {
+		C3D_TexEnv* env = C3D_GetTexEnv(0);
+		C3D_TexEnvInit(env);
 		C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
 		C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+		passthrough_from(1);
+	} else {
+		for (int i = 0; i < st->nstages && i < PICA_MAX_STAGES; i++) {
+			const PicaTevStage* s = &st->stage[i];
+			C3D_TexEnv* env = C3D_GetTexEnv(i);
+			env->srcRgb = s->src_rgb;
+			env->srcAlpha = s->src_alpha;
+			env->opRgb = s->op_rgb;
+			env->opAlpha = s->op_alpha;
+			env->funcRgb = s->func_rgb;
+			env->funcAlpha = s->func_alpha;
+			env->scaleRgb = s->scale_rgb;
+			env->scaleAlpha = s->scale_alpha;
+			env->color = s->color;
+		}
+		passthrough_from(st->nstages);
+		C3D_TexEnvBufUpdate(C3D_RGB, st->buf_rgb);
+		C3D_TexEnvBufUpdate(C3D_Alpha, st->buf_alpha);
+		C3D_TexEnvBufColor(st->buf_color);
 	}
 	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
 	C3D_DepthTest(st->depth_test, (GPU_TESTFUNC)st->depth_func,
@@ -266,7 +295,7 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 	apply_state(st);
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
-	BufInfo_Add(bi, verts, sizeof(PicaVtx), 3, 0x210);
+	BufInfo_Add(bi, verts, sizeof(PicaVtx), 5, 0x43210);
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 }
 
@@ -334,7 +363,8 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 		v[i].y = corners[i][1];
 		v[i].z = 0.0f;
 		v[i].w = 1.0f;
-		pica_efb_uv(corners[i][0], corners[i][1], &v[i].u, &v[i].v);
+		memset(v[i].tc, 0, sizeof v[i].tc);
+		pica_efb_uv(corners[i][0], corners[i][1], &v[i].tc[0][0], &v[i].tc[0][1]);
 		v[i].rgba[0] = v[i].rgba[1] = v[i].rgba[2] = v[i].rgba[3] = 255;
 	}
 	static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
@@ -351,13 +381,14 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 		C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, 0, 0);
 	}
 	C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+	passthrough_from(1);
 	C3D_TexBind(0, src);
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 	C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL & ~GPU_WRITE_DEPTH);
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
-	BufInfo_Add(bi, v, sizeof(PicaVtx), 3, 0x210);
+	BufInfo_Add(bi, v, sizeof(PicaVtx), 5, 0x43210);
 	C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, idx);
 	s_last_valid = 0;
 }
