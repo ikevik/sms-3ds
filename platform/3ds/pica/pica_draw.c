@@ -21,17 +21,34 @@
 #define CMDBUF_BYTES   (1u << 20)
 #define CMDBUF_LIMIT   0.92f /* leave room for the frame's end */
 
+/* The frame is drawn into an offscreen "EFB" texture (unrotated, covering the GameCube's
+ * 640x448 EFB), so EFB copies can be GPU texture copies of it; a display copy draws it onto
+ * the rotated top screen as one quad. */
+#define EFB_TEX_W 512
+#define EFB_TEX_H 256
+
 static int s_ready, s_failed, s_in_frame;
 static C3D_RenderTarget* s_top;
+static C3D_RenderTarget* s_efb;
+static C3D_Tex s_efbTex;
 static DVLB_s* s_dvlb;
 static shaderProgram_s s_prog;
 static int s_uProj;
-static C3D_Mtx s_proj;
+static C3D_Mtx s_projTop; /* EFB pixels onto the rotated top screen (the present quad) */
+static C3D_Mtx s_projEfb; /* EFB pixels onto the EFB texture (game draws) */
 
 static uint8_t* s_vring[2];
 static uint8_t* s_iring[2];
 static uint32_t s_half, s_vused, s_iused;
-static uint32_t s_dropped;
+static uint32_t s_vflushed, s_iflushed; /* ring bytes already written back for the GPU */
+static uint32_t s_dropped, s_copies;
+
+/* Copy viewer (pica_set_view): 0 shows the EFB as usual, n shows the n-th EFB copy made in the
+ * previous frame instead, to inspect render-to-texture passes. */
+#define MAX_VIEW_COPIES 4
+static PicaTex* s_frameCopies[MAX_VIEW_COPIES];
+static PicaTex* s_lastFrameCopies[MAX_VIEW_COPIES];
+static int s_nFrameCopies, s_nLastFrameCopies, s_view;
 
 static uint32_t s_clear_rgba = 0x000000FF, s_clear_depth = 0xFFFFFF;
 static int s_clear_pending = 1;
@@ -62,13 +79,23 @@ int pica_init(void)
 	AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);          /* v1: texture coordinate */
 	AttrInfo_AddLoader(ai, 2, GPU_UNSIGNED_BYTE, 4);  /* v2: colour 0..255 */
 
-	/* EFB pixels (y down) onto the rotated top screen. Depth: z = -(GameCube depth), so the
-	 * default depth map (-z/w) stores the GameCube's own depth and its compare modes carry over. */
-	Mtx_OrthoTilt(&s_proj, 0.0f, (float)PICA_EFB_WIDTH, (float)PICA_EFB_HEIGHT, 0.0f, 0.0f, 1.0f, true);
-	s_proj.r[2].x = 0.0f;
-	s_proj.r[2].y = 0.0f;
-	s_proj.r[2].z = -1.0f;
-	s_proj.r[2].w = 0.0f;
+	if (!C3D_TexInitVRAM(&s_efbTex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) goto fail;
+	s_efb = C3D_RenderTargetCreateFromTex(&s_efbTex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
+	if (!s_efb) goto fail;
+	C3D_TexSetFilter(&s_efbTex, GPU_LINEAR, GPU_LINEAR);
+	C3D_TexSetWrap(&s_efbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+
+	/* EFB pixels (y down). Depth: z = -(GameCube depth), so the default depth map (-z/w) stores
+	 * the GameCube's own depth and its compare modes carry over. */
+	Mtx_OrthoTilt(&s_projTop, 0.0f, (float)PICA_EFB_WIDTH, (float)PICA_EFB_HEIGHT, 0.0f, 0.0f, 1.0f, true);
+	Mtx_Ortho(&s_projEfb, 0.0f, (float)PICA_EFB_WIDTH, (float)PICA_EFB_HEIGHT, 0.0f, 0.0f, 1.0f, true);
+	C3D_Mtx* m[2] = {&s_projTop, &s_projEfb};
+	for (int i = 0; i < 2; i++) {
+		m[i]->r[2].x = 0.0f;
+		m[i]->r[2].y = 0.0f;
+		m[i]->r[2].z = -1.0f;
+		m[i]->r[2].w = 0.0f;
+	}
 	C3D_DepthMap(true, -1.0f, 0.0f);
 
 	C3D_CullFace(GPU_CULL_NONE);
@@ -79,8 +106,9 @@ int pica_init(void)
 		if (!s_vring[i] || !s_iring[i]) goto fail;
 	}
 	s_ready = 1;
-	fprintf(stderr, "[pica] citro3d ready: EFB %dx%d -> top screen 400x240, rings %u+%u KB x2\n",
-	        PICA_EFB_WIDTH, PICA_EFB_HEIGHT, VTX_RING_BYTES >> 10, IDX_RING_BYTES >> 10);
+	fprintf(stderr, "[pica] citro3d ready: EFB %dx%d drawn into a %dx%d texture -> top screen 400x240, "
+	        "rings %u+%u KB x2\n", PICA_EFB_WIDTH, PICA_EFB_HEIGHT, EFB_TEX_W, EFB_TEX_H, VTX_RING_BYTES >> 10,
+	        IDX_RING_BYTES >> 10);
 	return 1;
 fail:
 	s_failed = 1;
@@ -92,6 +120,7 @@ fail:
 struct PicaTex {
 	C3D_Tex tex;
 	uint32_t bytes;
+	C3D_RenderTarget* rt; /* EFB copy textures are drawn into */
 };
 
 /* A texture freed while a frame may still be drawing with it waits for two frame starts. */
@@ -104,6 +133,7 @@ static void release_dead(void)
 	/* After C3D_FrameBegin the GPU has finished the previous frame (citro3d waits for it): the
 	 * textures freed before that frame was submitted can go. */
 	for (int i = 0; i < s_ndead[1]; i++) {
+		if (s_dead[1][i]->rt) C3D_RenderTargetDelete(s_dead[1][i]->rt);
 		C3D_TexDelete(&s_dead[1][i]->tex);
 		free(s_dead[1][i]);
 	}
@@ -173,14 +203,14 @@ static void frame_begin(void)
 	C3D_FrameBegin(0);
 	release_dead();
 	s_half ^= 1;
-	s_vused = s_iused = 0;
+	s_vused = s_iused = s_vflushed = s_iflushed = 0;
 	s_last_valid = 0;
 	if (s_clear_pending) {
-		C3D_RenderTargetClear(s_top, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
+		C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
 		s_clear_pending = 0;
 	}
-	C3D_FrameDrawOn(s_top);
-	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uProj, &s_proj);
+	C3D_FrameDrawOn(s_efb);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uProj, &s_projEfb);
 	s_in_frame = 1;
 }
 
@@ -245,24 +275,136 @@ void pica_clear(uint32_t rgba, uint32_t depth24)
 	s_clear_rgba = rgba;
 	s_clear_depth = depth24 & 0xFFFFFF;
 	if (s_in_frame) {
-		C3D_RenderTargetClear(s_top, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
-		C3D_FrameDrawOn(s_top);
+		C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
+		C3D_FrameDrawOn(s_efb);
 		s_last_valid = 0;
 	} else {
 		s_clear_pending = 1;
 	}
 }
 
+/* The GPU reads the rings from memory: write back what the CPU wrote since the last time. */
+static void flush_rings(void)
+{
+	if (s_vused > s_vflushed) GSPGPU_FlushDataCache(s_vring[s_half] + s_vflushed, s_vused - s_vflushed);
+	if (s_iused > s_iflushed) GSPGPU_FlushDataCache(s_iring[s_half] + s_iflushed, s_iused - s_iflushed);
+	s_vflushed = s_vused;
+	s_iflushed = s_iused;
+}
+
+void pica_efb_uv(float x, float y, float* s, float* t)
+{
+	*s = x * (1.0f / PICA_EFB_WIDTH);
+	*t = 1.0f - y * (1.0f / PICA_EFB_HEIGHT);
+}
+
+PicaTex* pica_copy_tex_create(void)
+{
+	if (!pica_init()) return NULL;
+	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
+	if (!t) return NULL;
+	if (!C3D_TexInitVRAM(&t->tex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) {
+		free(t);
+		return NULL;
+	}
+	t->rt = C3D_RenderTargetCreateFromTex(&t->tex, GPU_TEXFACE_2D, 0, -1);
+	if (!t->rt) {
+		C3D_TexDelete(&t->tex);
+		free(t);
+		return NULL;
+	}
+	t->bytes = EFB_TEX_W * EFB_TEX_H * 4;
+	return t;
+}
+
+/* Draws the EFB texture over the whole of the bound target (EFB pixel space), as the present
+ * pass and EFB copies do. alpha_one: alpha 1 instead of the EFB's (formats without alpha). */
+static void draw_efb_quad(int alpha_one, C3D_Tex* src)
+{
+	PicaVtx* v;
+	uint16_t* idx;
+	uint32_t keep = s_dropped;
+	int ok = pica_alloc(4, 6, &v, &idx);
+	s_dropped = keep; /* not a game draw */
+	if (!ok) return;
+	static const float corners[4][2] = {{0, 0}, {PICA_EFB_WIDTH, 0}, {PICA_EFB_WIDTH, PICA_EFB_HEIGHT},
+	                                    {0, PICA_EFB_HEIGHT}};
+	for (int i = 0; i < 4; i++) {
+		v[i].x = corners[i][0];
+		v[i].y = corners[i][1];
+		v[i].z = 0.0f;
+		v[i].w = 1.0f;
+		pica_efb_uv(corners[i][0], corners[i][1], &v[i].u, &v[i].v);
+		v[i].rgba[0] = v[i].rgba[1] = v[i].rgba[2] = v[i].rgba[3] = 255;
+	}
+	static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
+	memcpy(idx, q, sizeof q);
+
+	C3D_TexEnv* env = C3D_GetTexEnv(0);
+	C3D_TexEnvInit(env);
+	C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, 0, 0);
+	C3D_TexEnvFunc(env, C3D_RGB, GPU_REPLACE);
+	if (alpha_one) {
+		C3D_TexEnvColor(env, 0xFFFFFFFF);
+		C3D_TexEnvSrc(env, C3D_Alpha, GPU_CONSTANT, 0, 0);
+	} else {
+		C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, 0, 0);
+	}
+	C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+	C3D_TexBind(0, src);
+	C3D_AlphaTest(false, GPU_ALWAYS, 0);
+	C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL & ~GPU_WRITE_DEPTH);
+	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+	C3D_BufInfo* bi = C3D_GetBufInfo();
+	BufInfo_Init(bi);
+	BufInfo_Add(bi, v, sizeof(PicaVtx), 3, 0x210);
+	C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, idx);
+	s_last_valid = 0;
+}
+
+void pica_efb_copy_to(PicaTex* dst, int alpha_one)
+{
+	if (!dst || !dst->rt || !pica_init()) return;
+	if (!s_in_frame) frame_begin();
+	/* A draw pass, not a texture copy: it stays in the frame's command list (no CPU wait) and
+	 * can fix alpha, as the GameCube's copy does for EFB formats without alpha. */
+	C3D_FrameDrawOn(dst->rt);
+	draw_efb_quad(alpha_one, &s_efbTex);
+	C3D_FrameDrawOn(s_efb);
+	s_copies++;
+	if (s_nFrameCopies < MAX_VIEW_COPIES) s_frameCopies[s_nFrameCopies++] = dst;
+}
+
 void pica_present(void)
 {
 	if (!pica_init()) return;
 	if (!s_in_frame) frame_begin();
-	/* The GPU reads the rings from memory: write back what the CPU wrote this frame. */
-	if (s_vused) GSPGPU_FlushDataCache(s_vring[s_half], s_vused);
-	if (s_iused) GSPGPU_FlushDataCache(s_iring[s_half], s_iused);
+
+	/* The EFB texture as one quad over the whole top screen. */
+	C3D_FrameDrawOn(s_top);
+	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uProj, &s_projTop);
+	C3D_Tex* show = &s_efbTex;
+	if (s_view > 0 && s_view <= s_nLastFrameCopies) show = &s_lastFrameCopies[s_view - 1]->tex;
+	draw_efb_quad(1, show);
+	flush_rings();
+	memcpy(s_lastFrameCopies, s_frameCopies, sizeof s_frameCopies);
+	s_nLastFrameCopies = s_nFrameCopies;
+	s_nFrameCopies = 0;
 	C3D_FrameEnd(0);
 	s_in_frame = 0;
+	s_last_valid = 0;
 	s_clear_pending = 1; /* the GameCube clears the EFB as it copies it out */
 }
+
+uint32_t pica_copies(void) { return s_copies; }
+
+int pica_cycle_view(void)
+{
+	s_view = s_view >= s_nLastFrameCopies ? 0 : s_view + 1;
+	return s_view;
+}
+
+int pica_view(void) { return s_view; }
+int pica_view_count(void) { return s_nLastFrameCopies; }
 
 uint32_t pica_dropped(void) { return s_dropped; }

@@ -81,9 +81,7 @@ static inline uint8_t clamp255(float v) { return v <= 0.f ? 0 : v >= 255.f ? 255
 // colour from frame to frame, and every surface is shaded by its view-space normal. Alpha and
 // blending are left alone so fades stay transparent.
 static volatile bool s_debugColors;
-// In debug mode a frame is drawn only up to its first EFB-to-texture copy, whose clear is
-// ignored: post effects (the title's shimmer mesh) redraw that copy over the whole screen, and
-// untextured they would hide the scene. Counters for the status screen.
+// Draws before and after the frame's first EFB-to-texture copy, and the copies (status screen).
 static bool s_afterTexCopy;
 static uint32_t s_drawsBeforeCopy, s_drawsAfterCopy, s_texCopies;
 static uint32_t s_lastBefore, s_lastAfter, s_lastCopies;
@@ -134,10 +132,40 @@ struct TexEntry {
 static std::unordered_map<TexKey, TexEntry, TexKeyHash> s_texCache;
 static uint32_t s_texBytes;
 static std::vector<uint8_t> s_decodeBuf, s_scaleBuf;
-static uint32_t s_texUploads, s_texSkippedCopies;
+static uint32_t s_texUploads, s_copyTexDraws;
 
-// EFB copy destinations of recent frames (textures that are rendered images).
-static std::vector<const void*> s_copyDests;
+// EFB copies: each destination address the game copies the EFB to gets a whole-EFB snapshot
+// texture (platform/3ds/pica), with the source rectangle of its latest copy. A draw sampling
+// that address maps its texture coordinates through the rectangle into the snapshot.
+struct EfbCopy {
+	const void* dest;
+	PicaTex* tex;
+	float x, y, w, h;  // source rectangle in EFB pixels
+	uint32_t usedFrame;
+};
+static std::vector<EfbCopy> s_efbCopies;
+static const size_t kMaxEfbCopies = 6;
+
+// Logs each distinct kind of EFB copy once (destination, rectangle, format, flags).
+static void logCopyKind(const EfbCopy* c, uint32_t ctrl, uint32_t pix) {
+	static std::vector<uint64_t> seen;
+	const uint32_t fmt = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7);
+	uint64_t key = (uint64_t(uintptr_t(c->dest)) << 32) ^ (uint64_t(ctrl) << 8) ^ pix ^
+	               (uint64_t(uint32_t(c->w)) << 20) ^ (uint64_t(uint32_t(c->h)) << 40);
+	for (uint64_t k : seen)
+		if (k == key) return;
+	if (seen.size() < 64) seen.push_back(key);
+	fprintf(stderr,
+	        "[copy] dest %p rect %d,%d %dx%d fmt %u intensity %d half %d clear %d efb-pixfmt %u%s\n",
+	        c->dest, int(c->x), int(c->y), int(c->w), int(c->h), fmt, ((ctrl >> 15) & 3) == 3, (ctrl >> 9) & 1,
+	        (ctrl >> 11) & 1, pix, pix == 3 ? " (Z copy: not supported, colour copied)" : "");
+}
+
+static EfbCopy* findEfbCopy(const void* p) {
+	for (EfbCopy& c : s_efbCopies)
+		if (c.dest == p) return &c;
+	return nullptr;
+}
 
 static inline uint32_t pow2Side(uint32_t v) {
 	uint32_t p = 8;
@@ -159,17 +187,20 @@ static void evictTextures() {
 	}
 }
 
-// The PICA texture for GX texture map `map`, or null (no data, an EFB copy, out of memory).
-static PicaTex* textureForMap(int map) {
+// The PICA texture for GX texture map `map`, or null (no data, out of memory). *copy is set
+// when the map is an EFB copy.
+static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	const uint32_t img0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)], tlutReg = g.bp[bpTexReg(BP_TX_TLUT, map)];
 	const uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
 	const uint8_t* ptr = g.texImage[map];
 	if (!ptr) return nullptr;
-	for (const void* d : s_copyDests)
-		if (d == ptr) {
-			s_texSkippedCopies++;
-			return reinterpret_cast<PicaTex*>(uintptr_t(1));  // marker: skip this draw
-		}
+	*copy = nullptr;
+	if (EfbCopy* c = findEfbCopy(ptr)) {
+		c->usedFrame = g_displayFrames;
+		s_copyTexDraws++;
+		*copy = c;
+		return c->tex;
+	}
 	const bool ci = fmt == 8 || fmt == 9 || fmt == 10;
 	TexKey key{ptr, fmt, w, h, ci ? (tlutReg & 0x3FF) : 0, ci ? ((tlutReg >> 10) & 3) : 0};
 	const uint8_t* tlut = ci ? g.tlutMem + ((tlutReg & 0x3FF) << 9) : nullptr;
@@ -295,17 +326,14 @@ static void texCoord(int coord, const uint8_t* v, const VtxFmtLayout& L, uint32_
 static void drawTriangles() {
 	if (s_afterTexCopy) s_drawsAfterCopy++;
 	else s_drawsBeforeCopy++;
-	if (s_debugColors && s_afterTexCopy) return;
 	const VtxFmtLayout& L = vtxFmtLayout(s_bfmt);
 	uint32_t n = s_bcount, nidx = uint32_t(s_idx.size());
 
 	// Texture of the first texturing TEV stage (none in debug-colour mode).
 	const TexStage ts = s_debugColors ? TexStage{false, 0, 0, false} : findTexStage();
 	PicaTex* tex = nullptr;
-	if (ts.textured) {
-		tex = textureForMap(ts.map);
-		if (tex == reinterpret_cast<PicaTex*>(uintptr_t(1))) return;  // samples an EFB copy: not yet
-	}
+	const EfbCopy* efbCopy = nullptr;
+	if (ts.textured) tex = textureForMap(ts.map, &efbCopy);
 	const bool textured = tex != nullptr;
 
 	PicaVtx* out;
@@ -364,8 +392,13 @@ static void drawTriangles() {
 		o.z = (vcz * cw + vsz * cz) * kInvZ;
 		o.w = cw;
 
-		if (textured) texCoord(ts.coord, v, L, s_bfmt, defTex, o.u, o.v);
-		else o.u = o.v = 0.f;
+		if (textured) {
+			texCoord(ts.coord, v, L, s_bfmt, defTex, o.u, o.v);
+			if (efbCopy)  // through the copy's source rectangle into the EFB snapshot
+				pica_efb_uv(efbCopy->x + o.u * efbCopy->w, efbCopy->y + o.v * efbCopy->h, &o.u, &o.v);
+		} else {
+			o.u = o.v = 0.f;
+		}
 
 		const uint8_t* src = debug ? dbg : rasWhite ? kWhite : clrFromVtx ? v + L.clr[0] : matRGBA;
 		float shade = 1.0f;
@@ -534,12 +567,36 @@ void executeCopy(uint32_t ctrl) {
 	if (!disp) {
 		s_texCopies++;
 		s_afterTexCopy = true;
+		flushBatch();
 		const void* d = g.copyDest;
-		bool known = false;
-		for (const void* c : s_copyDests) known |= c == d;
-		if (!known && d) {
-			if (s_copyDests.size() >= 32) s_copyDests.erase(s_copyDests.begin());
-			s_copyDests.push_back(d);
+		EfbCopy* c = d ? findEfbCopy(d) : nullptr;
+		if (d && !c) {
+			if (s_efbCopies.size() >= kMaxEfbCopies) {  // replace the least recently sampled
+				size_t oldest = 0;
+				for (size_t i = 1; i < s_efbCopies.size(); i++)
+					if (s_efbCopies[i].usedFrame < s_efbCopies[oldest].usedFrame) oldest = i;
+				pica_tex_free(s_efbCopies[oldest].tex);
+				s_efbCopies.erase(s_efbCopies.begin() + oldest);
+			}
+			PicaTex* t = pica_copy_tex_create();
+			if (t) {
+				s_efbCopies.push_back(EfbCopy{d, t, 0, 0, 0, 0, g_displayFrames});
+				c = &s_efbCopies.back();
+			}
+		}
+		if (c) {
+			// BP 0x49: top-left (x, y), 0x4A: size - 1 (w, h), in EFB pixels.
+			const uint32_t tl = g.bp[BP_COPY_SRC_TL], wh = g.bp[BP_COPY_SRC_WH];
+			c->x = float(tl & 0x3FF);
+			c->y = float((tl >> 10) & 0x3FF);
+			c->w = float((wh & 0x3FF) + 1);
+			c->h = float(((wh >> 10) & 0x3FF) + 1);
+			// Alpha reads as 1 when the EFB format has none (anything but RGBA6_Z24, as sms-pc-port's
+			// copy) or the copy's texture format has none (RGB565: a GX texture of it decodes alpha 1).
+			const uint32_t pix = g.bp[BP_PE_CONTROL] & 7;
+			const uint32_t cfmt = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7);
+			pica_efb_copy_to(c->tex, pix != 1 || cfmt == 4);
+			logCopyKind(c, ctrl, pix);
 		}
 	}
 	if (clear || disp) {
@@ -549,7 +606,7 @@ void executeCopy(uint32_t ctrl) {
 		if (disp) pica_present();
 		// A texture copy that clears (render-to-texture passes) clears the frame in progress; the
 		// display copy's clear applies to the next frame.
-		if (clear && !(s_debugColors && !disp)) pica_clear(rgba, g.bp[BP_CLEAR_Z] & 0xFFFFFF);
+		if (clear) pica_clear(rgba, g.bp[BP_CLEAR_Z] & 0xFFFFFF);
 	}
 	if (disp) {
 		g_displayFrames++;
@@ -603,7 +660,7 @@ int GX3DS_GetDebugColors(void) { return gx::s_debugColors ? 1 : 0; }
 void GX3DS_GetTexStats(uint32_t out[3]) {
 	out[0] = gx::s_texUploads;
 	out[1] = gx::s_texBytes;
-	out[2] = gx::s_texSkippedCopies;
+	out[2] = gx::s_copyTexDraws;
 }
 
 void GX3DS_GetCopyStats(uint32_t out[3]) {

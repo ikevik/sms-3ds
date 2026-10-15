@@ -53,13 +53,26 @@ void pica_tex_upload(PicaTex* t, const uint8_t* rgba);
 void pica_tex_free(PicaTex* t);
 uint32_t pica_tex_bytes(const PicaTex* t);
 
+/* EFB copies: a copy texture is a whole-EFB snapshot (texture copy of the EFB render target).
+ * pica_efb_uv maps an EFB pixel position to texture coordinates in such a texture (and in the
+ * EFB texture). */
+PicaTex* pica_copy_tex_create(void);
+void pica_efb_copy_to(PicaTex* dst, int alpha_one); /* alpha_one: EFB format without alpha */
+void pica_efb_uv(float x, float y, float* s, float* t);
+uint32_t pica_copies(void);
+/* Debug viewer: cycles what the top screen shows between the EFB (0) and each EFB copy of the
+ * previous frame (1..n); returns the new view. */
+int pica_cycle_view(void);
+int pica_view(void);
+int pica_view_count(void);
+
 /* Draws triangles from the last pica_alloc. */
 void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nidx, const PicaState* st);
 
 /* Clears colour (0xRRGGBBAA) and depth (24-bit) of the frame in progress, or of the next one. */
 void pica_clear(uint32_t rgba, uint32_t depth24);
 
-/* Ends and presents the frame in progress (a GX display copy). */
+/* Ends and presents the frame in progress (a GX display copy): the EFB onto the top screen. */
 void pica_present(void);
 
 /* Draws and drops made because the ring or command buffer was full (for the status screen). */

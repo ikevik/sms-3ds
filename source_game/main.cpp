@@ -14,6 +14,9 @@ extern "C" {
 void port_init(int argc, char** argv);
 void GX3DS_GetStats(uint32_t out[7]);
 uint32_t pica_dropped(void);
+int pica_cycle_view(void);
+int pica_view(void);
+int pica_view_count(void);
 void GX3DS_SetDebugColors(int on);
 int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
@@ -236,6 +239,9 @@ int main()
 			break;
 		if ((pressed & KEY_SELECT) && !(held & KEY_START))
 			GX3DS_SetDebugColors(!GX3DS_GetDebugColors());
+		// Touching the bottom screen cycles the top screen through the last frame's EFB copies.
+		if (pressed & KEY_TOUCH)
+			pica_cycle_view();
 		uint32_t s[7];
 		GX3DS_GetStats(s);
 		printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
@@ -255,7 +261,9 @@ int main()
 		       (unsigned long)cs[1], (unsigned long)cs[2]);
 		uint32_t ts[3];
 		GX3DS_GetTexStats(ts);
-		printf("textures: %lu uploads, %lu KB\nskipped (EFB copy tex): %lu   \n", (unsigned long)ts[0],
+		printf("\x1b[22;0Htop shows: %s %d of %d  (touch: next)   \n", pica_view() ? "EFB copy" : "frame",
+		       pica_view(), pica_view_count());
+		printf("\x1b[20;0Htextures: %lu uploads, %lu KB\nEFB-copy texture draws: %lu   \n", (unsigned long)ts[0],
 		       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);
 		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 		// single-buffered, so writing back the CPU cache is enough.
