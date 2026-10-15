@@ -17,6 +17,7 @@ uint32_t pica_dropped(void);
 void GX3DS_SetDebugColors(int on);
 int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
+void GX3DS_GetTexStats(uint32_t out[3]);
 }
 void SMS_main(void);  // the decomp's main(), renamed by port_compat.h (C++ linkage)
 
@@ -252,6 +253,10 @@ int main()
 		GX3DS_GetCopyStats(cs);
 		printf("draws: %3lu before copy, %3lu after\ntexture copies/frame: %lu  \n", (unsigned long)cs[0],
 		       (unsigned long)cs[1], (unsigned long)cs[2]);
+		uint32_t ts[3];
+		GX3DS_GetTexStats(ts);
+		printf("textures: %lu uploads, %lu KB\nskipped (EFB copy tex): %lu   \n", (unsigned long)ts[0],
+		       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);
 		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 		// single-buffered, so writing back the CPU cache is enough.
 		gfxFlushBuffers();

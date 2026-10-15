@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unordered_map>
 #include <vector>
 
 namespace gx {
@@ -102,12 +103,211 @@ static void debugColor(uint32_t pm, const uint8_t* v0, uint32_t stride, uint32_t
 	out[o[2]] = uint8_t(h >> 24);
 }
 
+// ---- stage 2: textures ---------------------------------------------------------------------
+// GX textures are decoded to RGBA8 (gx3ds_texdecode.cpp), resampled to a power of two from 8
+// to kMaxTexSide, and kept in a cache keyed like sms-pc-port's (address, format, size, TLUT).
+// The data is hashed once per frame to catch changes. Textures that are EFB copies are not
+// supported yet: draws sampling them are skipped.
+void decodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h, const uint8_t* tlut, uint32_t tlutFmt,
+                   uint8_t* out);
+
+static const uint32_t kMaxTexSide = 256;
+static const uint32_t kTexBudget = 8u << 20;
+
+struct TexKey {
+	const uint8_t* ptr;
+	uint32_t fmt, w, h, tlutAddr, tlutFmt;
+	bool operator==(const TexKey& o) const {
+		return ptr == o.ptr && fmt == o.fmt && w == o.w && h == o.h && tlutAddr == o.tlutAddr && tlutFmt == o.tlutFmt;
+	}
+};
+struct TexKeyHash {
+	size_t operator()(const TexKey& k) const {
+		return size_t(uintptr_t(k.ptr)) ^ (k.fmt << 28) ^ (k.w << 16) ^ k.h ^ (k.tlutAddr << 8);
+	}
+};
+struct TexEntry {
+	PicaTex* tex = nullptr;
+	uint64_t dataHash = 0, tlutHash = 0;
+	uint32_t checkedFrame = ~0u, usedFrame = 0;
+};
+static std::unordered_map<TexKey, TexEntry, TexKeyHash> s_texCache;
+static uint32_t s_texBytes;
+static std::vector<uint8_t> s_decodeBuf, s_scaleBuf;
+static uint32_t s_texUploads, s_texSkippedCopies;
+
+// EFB copy destinations of recent frames (textures that are rendered images).
+static std::vector<const void*> s_copyDests;
+
+static inline uint32_t pow2Side(uint32_t v) {
+	uint32_t p = 8;
+	while (p < v && p < kMaxTexSide) p <<= 1;
+	return p;
+}
+
+static void evictTextures() {
+	while (s_texBytes > kTexBudget) {
+		auto victim = s_texCache.end();
+		for (auto it = s_texCache.begin(); it != s_texCache.end(); ++it)
+			if (it->second.usedFrame != g_displayFrames &&
+			    (victim == s_texCache.end() || it->second.usedFrame < victim->second.usedFrame))
+				victim = it;
+		if (victim == s_texCache.end()) return;  // everything is in use this frame
+		s_texBytes -= pica_tex_bytes(victim->second.tex);
+		pica_tex_free(victim->second.tex);
+		s_texCache.erase(victim);
+	}
+}
+
+// The PICA texture for GX texture map `map`, or null (no data, an EFB copy, out of memory).
+static PicaTex* textureForMap(int map) {
+	const uint32_t img0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)], tlutReg = g.bp[bpTexReg(BP_TX_TLUT, map)];
+	const uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
+	const uint8_t* ptr = g.texImage[map];
+	if (!ptr) return nullptr;
+	for (const void* d : s_copyDests)
+		if (d == ptr) {
+			s_texSkippedCopies++;
+			return reinterpret_cast<PicaTex*>(uintptr_t(1));  // marker: skip this draw
+		}
+	const bool ci = fmt == 8 || fmt == 9 || fmt == 10;
+	TexKey key{ptr, fmt, w, h, ci ? (tlutReg & 0x3FF) : 0, ci ? ((tlutReg >> 10) & 3) : 0};
+	const uint8_t* tlut = ci ? g.tlutMem + ((tlutReg & 0x3FF) << 9) : nullptr;
+	uint32_t tlutBytes = fmt == 8 ? 32 : fmt == 9 ? 512 : 0x8000;
+	if (tlut && ((tlutReg & 0x3FF) << 9) + tlutBytes > TMEM_TLUT_SIZE) tlutBytes = TMEM_TLUT_SIZE - ((tlutReg & 0x3FF) << 9);
+
+	TexEntry& e = s_texCache[key];
+	e.usedFrame = g_displayFrames;
+	if (e.tex && e.checkedFrame == g_displayFrames) return e.tex;
+	const uint32_t bytes = texLevelBytes(fmt, w, h);
+	const uint64_t dh = hashBytes(ptr, bytes), th = tlut ? hashBytes(tlut, tlutBytes) : 0;
+	e.checkedFrame = g_displayFrames;
+	if (e.tex && dh == e.dataHash && th == e.tlutHash) return e.tex;
+
+	const uint32_t pw = pow2Side(w), ph = pow2Side(h);
+	if (!e.tex) {
+		e.tex = pica_tex_create(pw, ph);
+		if (!e.tex) {
+			s_texCache.erase(key);
+			return nullptr;
+		}
+		s_texBytes += pica_tex_bytes(e.tex);
+	}
+	s_decodeBuf.resize(size_t(w) * h * 4);
+	decodeTexture(ptr, fmt, w, h, tlut, key.tlutFmt, s_decodeBuf.data());
+	const uint8_t* src = s_decodeBuf.data();
+	if (pw != w || ph != h) {  // nearest resample to the power-of-two size
+		s_scaleBuf.resize(size_t(pw) * ph * 4);
+		for (uint32_t y = 0; y < ph; y++) {
+			const uint8_t* row = s_decodeBuf.data() + size_t(y * h / ph) * w * 4;
+			uint8_t* o = s_scaleBuf.data() + size_t(y) * pw * 4;
+			for (uint32_t x = 0; x < pw; x++) memcpy(o + x * 4, row + (x * w / pw) * 4, 4);
+		}
+		src = s_scaleBuf.data();
+	}
+	pica_tex_upload(e.tex, src);
+	e.dataHash = dh;
+	e.tlutHash = th;
+	s_texUploads++;
+	evictTextures();
+	return e.tex;
+}
+
+// The first TEV stage that samples a texture, and what it reads.
+struct TexStage {
+	bool textured;
+	int map, coord;
+	bool rasNull;  // the stage's rasterised colour is GX_COLOR_NULL: the texture stands alone
+};
+static TexStage findTexStage() {
+	TexStage ts{false, 0, 0, false};
+	const uint32_t numStages = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
+	for (uint32_t s = 0; s < numStages; s++) {
+		uint32_t order = (g.bp[BP_TREF + (s >> 1)] >> ((s & 1) * 12)) & 0x3FF;
+		if ((order >> 6) & 1) {
+			ts.textured = true;
+			ts.map = order & 7;
+			ts.coord = (order >> 3) & 7;
+			ts.rasNull = ((order >> 7) & 7) == 7;
+			return ts;
+		}
+	}
+	return ts;
+}
+
+// GX alpha compare (BP 0xF3: ref0, ref1, comp0, comp1, op) reduced to the one PICA test.
+static void alphaTest(PicaState& st) {
+	const uint32_t r = g.bp[BP_ALPHACOMPARE];
+	const uint32_t ref0 = r & 0xFF, ref1 = (r >> 8) & 0xFF, c0 = (r >> 16) & 7, c1 = (r >> 19) & 7, op = (r >> 22) & 3;
+	uint32_t comp = c0, ref = ref0;
+	if (op == 0 && c0 == 7) comp = c1, ref = ref1;       // AND with ALWAYS: the other one decides
+	else if (op == 1 && c0 == 0) comp = c1, ref = ref1;  // OR with NEVER: the other one decides
+	st.alpha_test = comp != 7;
+	st.alpha_func = kTestFunc[comp];
+	st.alpha_ref = uint8_t(ref);
+}
+
+// Texture coordinate `coord` of a vertex: texgen (XF 0x1040 + coord) with its texture matrix,
+// and the dual-texture post matrix when enabled, as sms-pc-port's vertex shader computes it.
+static void texCoord(int coord, const uint8_t* v, const VtxFmtLayout& L, uint32_t fmt, const uint8_t defTex[8],
+                     float& u, float& w) {
+	const uint32_t tg = g.xfReg[XFR_TEXGEN + coord];
+	const uint32_t proj = (tg >> 1) & 1, form = (tg >> 2) & 1, type = (tg >> 4) & 7, row = (tg >> 7) & 31;
+	float sv[4] = {0, 0, 1, 1};
+	if (row == 0) {
+		memcpy(sv, v, 12);
+	} else if (row == 1 && (fmt & VF_NRM)) {
+		memcpy(sv, v + L.nrm, 12);
+	} else if (row >= 5 && row <= 12 && (fmt & (VF_TEX0 << (row - 5)))) {
+		memcpy(sv, v + L.tex[row - 5], 8);
+	}
+	if (form == 0 && row < 5) sv[2] = 1.0f;  // AB11
+	if (type != 0) {  // emboss and colour texgens: not supported, pass the source through
+		u = sv[0];
+		w = sv[1];
+		return;
+	}
+	uint32_t tm = (fmt & VF_MTX) ? v[L.mtx + 1 + coord] : defTex[coord];
+	const float* m = reinterpret_cast<const float*>(&g.xfMem[tm * 4]);
+	float t0 = m[0] * sv[0] + m[1] * sv[1] + m[2] * sv[2] + m[3] * sv[3];
+	float t1 = m[4] * sv[0] + m[5] * sv[1] + m[6] * sv[2] + m[7] * sv[3];
+	float t2 = proj ? m[8] * sv[0] + m[9] * sv[1] + m[10] * sv[2] + m[11] * sv[3] : 1.0f;
+	if (g.xfReg[XFR_DUALTEX] & 1) {
+		const uint32_t post = g.xfReg[XFR_POSTTEX + coord];
+		if ((post >> 8) & 1) {
+			float len = sqrtf(t0 * t0 + t1 * t1 + t2 * t2);
+			if (len > 0.f) t0 /= len, t1 /= len, t2 /= len;
+		}
+		const float* p = reinterpret_cast<const float*>(&g.xfMem[0x500 + (post & 63) * 4]);
+		float a = p[0] * t0 + p[1] * t1 + p[2] * t2 + p[3];
+		float b = p[4] * t0 + p[5] * t1 + p[6] * t2 + p[7];
+		float c = p[8] * t0 + p[9] * t1 + p[10] * t2 + p[11];
+		t0 = a, t1 = b, t2 = c;
+	}
+	if (t2 != 0.f && t2 != 1.f) {
+		t0 /= t2;
+		t1 /= t2;
+	}
+	u = t0;
+	w = t1;
+}
+
 static void drawTriangles() {
 	if (s_afterTexCopy) s_drawsAfterCopy++;
 	else s_drawsBeforeCopy++;
 	if (s_debugColors && s_afterTexCopy) return;
 	const VtxFmtLayout& L = vtxFmtLayout(s_bfmt);
 	uint32_t n = s_bcount, nidx = uint32_t(s_idx.size());
+
+	// Texture of the first texturing TEV stage (none in debug-colour mode).
+	const TexStage ts = s_debugColors ? TexStage{false, 0, 0, false} : findTexStage();
+	PicaTex* tex = nullptr;
+	if (ts.textured) {
+		tex = textureForMap(ts.map);
+		if (tex == reinterpret_cast<PicaTex*>(uintptr_t(1))) return;  // samples an EFB copy: not yet
+	}
+	const bool textured = tex != nullptr;
+
 	PicaVtx* out;
 	uint16_t* oidx;
 	if (!pica_alloc(n, nidx, &out, &oidx)) return;
@@ -127,6 +327,12 @@ static void drawTriangles() {
 	const bool lit = ((cctrl >> 1) & 1) && hasNrm;
 	const uint8_t matRGBA[4] = {uint8_t(mat >> 24), uint8_t(mat >> 16), uint8_t(mat >> 8), uint8_t(mat)};
 	const uint32_t defPm = g.xfReg[XFR_MATIDX_A] & 63;
+	const uint32_t matA = g.xfReg[XFR_MATIDX_A], matB = g.xfReg[XFR_MATIDX_B];
+	const uint8_t defTex[8] = {uint8_t((matA >> 6) & 63),  uint8_t((matA >> 12) & 63), uint8_t((matA >> 18) & 63),
+	                           uint8_t((matA >> 24) & 63), uint8_t(matB & 63),         uint8_t((matB >> 6) & 63),
+	                           uint8_t((matB >> 12) & 63), uint8_t((matB >> 18) & 63)};
+	static const uint8_t kWhite[4] = {255, 255, 255, 255};
+	const bool rasWhite = textured && ts.rasNull;
 	const bool debug = s_debugColors;
 	uint8_t dbg[3] = {0, 0, 0};
 	if (debug) debugColor(hasMtx ? s_vdata[L.mtx] : defPm, s_vdata.data(), s_bstride, nidx, dbg);
@@ -158,7 +364,10 @@ static void drawTriangles() {
 		o.z = (vcz * cw + vsz * cz) * kInvZ;
 		o.w = cw;
 
-		const uint8_t* src = debug ? dbg : clrFromVtx ? v + L.clr[0] : matRGBA;
+		if (textured) texCoord(ts.coord, v, L, s_bfmt, defTex, o.u, o.v);
+		else o.u = o.v = 0.f;
+
+		const uint8_t* src = debug ? dbg : rasWhite ? kWhite : clrFromVtx ? v + L.clr[0] : matRGBA;
 		float shade = 1.0f;
 		if (lit || (debug && hasNrm)) {
 			float nrm[3];
@@ -174,12 +383,22 @@ static void drawTriangles() {
 		o.rgba[0] = clamp255(src[0] * shade);
 		o.rgba[1] = clamp255(src[1] * shade);
 		o.rgba[2] = clamp255(src[2] * shade);
-		o.rgba[3] = alphaFromVtx ? v[L.clr[0] + 3] : matRGBA[3];
+		o.rgba[3] = rasWhite ? 255 : alphaFromVtx ? v[L.clr[0] + 3] : matRGBA[3];
 	}
 	for (uint32_t i = 0; i < nidx; i++) oidx[i] = uint16_t(s_idx[i]);
 
 	PicaState st;
+	memset(&st, 0, sizeof st);  // the PICA side compares states bytewise
 	currentPicaState(st);
+	alphaTest(st);
+	if (textured) {
+		const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, ts.map)];
+		static const uint8_t kWrap[4] = {0, 2, 3, 2};  // clamp, repeat, mirror -> GPU_TEXTURE_WRAP_PARAM
+		st.tex = tex;
+		st.wrap_s = kWrap[mode0 & 3];
+		st.wrap_t = kWrap[(mode0 >> 2) & 3];
+		st.linear = (mode0 >> 4) & 1;
+	}
 	pica_draw_triangles(out, oidx, nidx, &st);
 }
 
@@ -315,6 +534,13 @@ void executeCopy(uint32_t ctrl) {
 	if (!disp) {
 		s_texCopies++;
 		s_afterTexCopy = true;
+		const void* d = g.copyDest;
+		bool known = false;
+		for (const void* c : s_copyDests) known |= c == d;
+		if (!known && d) {
+			if (s_copyDests.size() >= 32) s_copyDests.erase(s_copyDests.begin());
+			s_copyDests.push_back(d);
+		}
 	}
 	if (clear || disp) {
 		// BP 0x4F: A<<8|R, 0x50: G<<8|B, 0x51: 24-bit Z.
@@ -373,6 +599,13 @@ void GX3DS_SetDebugColors(int on) { gx::s_debugColors = on != 0; }
 int GX3DS_GetDebugColors(void) { return gx::s_debugColors ? 1 : 0; }
 
 // Last frame: triangle draws before its first EFB-to-texture copy, after it, and the copies.
+// Texture uploads so far, cache bytes, draws skipped for sampling an EFB copy.
+void GX3DS_GetTexStats(uint32_t out[3]) {
+	out[0] = gx::s_texUploads;
+	out[1] = gx::s_texBytes;
+	out[2] = gx::s_texSkippedCopies;
+}
+
 void GX3DS_GetCopyStats(uint32_t out[3]) {
 	out[0] = gx::s_lastBefore;
 	out[1] = gx::s_lastAfter;

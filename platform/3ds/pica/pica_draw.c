@@ -4,6 +4,7 @@
 #include <3ds.h>
 #include <citro3d.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gx_pass_shbin.h"
@@ -58,7 +59,8 @@ int pica_init(void)
 	C3D_AttrInfo* ai = C3D_GetAttrInfo();
 	AttrInfo_Init(ai);
 	AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4);          /* v0: position (EFB pixels, homogeneous) */
-	AttrInfo_AddLoader(ai, 1, GPU_UNSIGNED_BYTE, 4);  /* v1: colour 0..255 */
+	AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);          /* v1: texture coordinate */
+	AttrInfo_AddLoader(ai, 2, GPU_UNSIGNED_BYTE, 4);  /* v2: colour 0..255 */
 
 	/* EFB pixels (y down) onto the rotated top screen. Depth: z = -(GameCube depth), so the
 	 * default depth map (-z/w) stores the GameCube's own depth and its compare modes carry over. */
@@ -69,11 +71,6 @@ int pica_init(void)
 	s_proj.r[2].w = 0.0f;
 	C3D_DepthMap(true, -1.0f, 0.0f);
 
-	/* Untextured: the fragment is the vertex colour. */
-	C3D_TexEnv* env = C3D_GetTexEnv(0);
-	C3D_TexEnvInit(env);
-	C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
-	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
 	C3D_CullFace(GPU_CULL_NONE);
 
 	for (int i = 0; i < 2; i++) {
@@ -91,9 +88,90 @@ fail:
 	return 0;
 }
 
+/* ---- textures ------------------------------------------------------------------------- */
+struct PicaTex {
+	C3D_Tex tex;
+	uint32_t bytes;
+};
+
+/* A texture freed while a frame may still be drawing with it waits for two frame starts. */
+#define MAX_DEFERRED 256
+static PicaTex* s_dead[2][MAX_DEFERRED];
+static int s_ndead[2];
+
+static void release_dead(void)
+{
+	/* After C3D_FrameBegin the GPU has finished the previous frame (citro3d waits for it): the
+	 * textures freed before that frame was submitted can go. */
+	for (int i = 0; i < s_ndead[1]; i++) {
+		C3D_TexDelete(&s_dead[1][i]->tex);
+		free(s_dead[1][i]);
+	}
+	memcpy(s_dead[1], s_dead[0], sizeof(PicaTex*) * (size_t)s_ndead[0]);
+	s_ndead[1] = s_ndead[0];
+	s_ndead[0] = 0;
+}
+
+PicaTex* pica_tex_create(uint32_t w, uint32_t h)
+{
+	if (!pica_init()) return NULL;
+	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
+	if (!t) return NULL;
+	if (!C3D_TexInit(&t->tex, (u16)w, (u16)h, GPU_RGBA8)) {
+		free(t);
+		return NULL;
+	}
+	t->bytes = w * h * 4;
+	return t;
+}
+
+/* The PICA stores textures in 8x8 tiles, texels in Morton (Z) order inside a tile, tile rows
+ * in memory order from t = 0, and samples t = 0 at the image's bottom: the image is stored
+ * bottom row first, so the back end's v = 0 (top row) lands where it samples. */
+static inline uint32_t morton8(uint32_t x, uint32_t y)
+{
+	return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+}
+
+void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
+{
+	if (!t) return;
+	uint32_t w = t->tex.width, h = t->tex.height;
+	uint32_t* dst = (uint32_t*)t->tex.data;
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t* row = rgba + (size_t)(h - 1 - y) * w * 4;
+		uint32_t tileRow = (y >> 3) * (w >> 3) * 64;
+		for (uint32_t x = 0; x < w; x++) {
+			const uint8_t* p = row + x * 4;
+			/* GPU_RGBA8 texel: 0xRRGGBBAA as a little-endian word */
+			dst[tileRow + (x >> 3) * 64 + morton8(x & 7, y & 7)] =
+			    ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+		}
+	}
+	GSPGPU_FlushDataCache(t->tex.data, t->bytes);
+}
+
+void pica_tex_free(PicaTex* t)
+{
+	if (!t) return;
+	if (s_ndead[0] < MAX_DEFERRED) {
+		s_dead[0][s_ndead[0]++] = t;
+	} else {
+		/* Should not happen; leak rather than free a texture the GPU may read. */
+	}
+}
+
+uint32_t pica_tex_bytes(const PicaTex* t) { return t ? t->bytes : 0; }
+
 static void frame_begin(void)
 {
-	C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+	/* No C3D_FRAME_SYNCDRAW: that waits for the 3DS's vblank, and this runs on the game thread
+	 * while it holds the emulated CPU (sms-pc-port's OS scheduler). The game paces itself on
+	 * its emulated VI retrace; blocking here as well left the retrace already due whenever the
+	 * game waited for it, so the main thread never slept and lower-priority threads (stage
+	 * setup, priority 17) were starved. citro3d still waits for the previous frame's GPU work. */
+	C3D_FrameBegin(0);
+	release_dead();
 	s_half ^= 1;
 	s_vused = s_iused = 0;
 	s_last_valid = 0;
@@ -127,6 +205,20 @@ int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx)
 static void apply_state(const PicaState* st)
 {
 	if (s_last_valid && memcmp(st, &s_last, sizeof *st) == 0) return;
+	C3D_TexEnv* env = C3D_GetTexEnv(0);
+	C3D_TexEnvInit(env);
+	if (st->tex) {
+		C3D_Tex* tex = &st->tex->tex;
+		C3D_TexSetWrap(tex, (GPU_TEXTURE_WRAP_PARAM)st->wrap_s, (GPU_TEXTURE_WRAP_PARAM)st->wrap_t);
+		C3D_TexSetFilter(tex, st->linear ? GPU_LINEAR : GPU_NEAREST, st->linear ? GPU_LINEAR : GPU_NEAREST);
+		C3D_TexBind(0, tex);
+		C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+	} else {
+		C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
+		C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	}
+	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
 	C3D_DepthTest(st->depth_test, (GPU_TESTFUNC)st->depth_func,
 	              (GPU_WRITEMASK)((st->color_write ? GPU_WRITE_COLOR : 0) | (st->depth_write ? GPU_WRITE_DEPTH : 0)));
 	if (st->blend)
@@ -144,7 +236,7 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 	apply_state(st);
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
-	BufInfo_Add(bi, verts, sizeof(PicaVtx), 2, 0x10);
+	BufInfo_Add(bi, verts, sizeof(PicaVtx), 3, 0x210);
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 }
 

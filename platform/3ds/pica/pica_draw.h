@@ -20,14 +20,22 @@ extern "C" {
 
 typedef struct {
 	float x, y, z, w;  /* EFB pixels and GameCube depth, homogeneous */
+	float u, v;        /* texture coordinate (normalised; v = 0 is the image's top row) */
 	uint8_t rgba[4];
 } PicaVtx;
+
+/* A texture owned by this file (an opaque C3D_Tex). */
+typedef struct PicaTex PicaTex;
 
 /* PICA values (GPU_TESTFUNC, GPU_BLENDFACTOR), filled by the back end from BP registers. */
 typedef struct {
 	uint8_t depth_test, depth_func, depth_write;
 	uint8_t blend, blend_src, blend_dst;
 	uint8_t color_write;
+	uint8_t alpha_test, alpha_func, alpha_ref; /* GPU_TESTFUNC */
+	PicaTex* tex;                              /* null: vertex colour only */
+	uint8_t wrap_s, wrap_t;                    /* GPU_TEXTURE_WRAP_PARAM */
+	uint8_t linear;                            /* bilinear filtering */
 } PicaState;
 
 /* Lazily initialises citro3d and the top-screen render target. Returns 0 on failure. */
@@ -37,6 +45,13 @@ int pica_init(void);
  * frame first if none is open. Returns 0 (and draws nothing) when the ring or the command
  * buffer is full. */
 int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx);
+
+/* Textures: power-of-two sizes from 8 to 1024. pica_tex_upload takes RGBA8 rows, top row
+ * first, and tiles them for the PICA. Returns null when out of linear memory. */
+PicaTex* pica_tex_create(uint32_t w, uint32_t h);
+void pica_tex_upload(PicaTex* t, const uint8_t* rgba);
+void pica_tex_free(PicaTex* t);
+uint32_t pica_tex_bytes(const PicaTex* t);
 
 /* Draws triangles from the last pica_alloc. */
 void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nidx, const PicaState* st);
