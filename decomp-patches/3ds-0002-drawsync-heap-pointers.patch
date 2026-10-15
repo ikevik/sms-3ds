@@ -1,0 +1,18 @@
+--- a/src/System/DrawSyncManager.cpp	2026-10-14 22:07:35
++++ b/src/System/DrawSyncManager.cpp	2026-10-14 22:07:35
+@@ -93,7 +93,15 @@
+ 	for (;;) {
+ 		void* msg;
+ 		OSReceiveMessage(&self->mMessageQueue, &msg, 1);
++#if defined(__3DS__)
++		// 3DS port: the FIFO pointers pushBreakPoint() sends are heap addresses below
++		// 0x80000000 here, not GameCube MEM1 ones, so they fell into the shutdown range and
++		// the thread quit, leaving drawSyncCallbackSub() to block on a full queue. Tokens
++		// are u16 and the destructor's shutdown message is exactly 0x10000.
++		if ((size_t)msg > 0x10000) {
++#else
+ 		if ((size_t)msg >= 0x80000000) {
++#endif
+ 			self->mFifo->push(msg);
+ 
+ 			u32 iVar1 = self->mFifo->size();

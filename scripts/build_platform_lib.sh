@@ -35,13 +35,21 @@ echo "platform units: $(wc -l < "$ROOT/build/platform_units.txt"), jobs: $JOBS, 
 
 INCS="-I$PCPORT/platform -I$PCPORT/platform/mods/include -I$PCPORT/src -I$PCPORT/src/port_include -I$P3DS/include -I$P3DS -I$PCPORT/platform/gx/port_include -I$PCPORT/platform/gx/include -I$DECOMP/include"
 for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
-COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -DSMS_AUDIO_DSP_HLE=1 -include $PCPORT/src/port_compat.h -include $P3DS/sms_compat_3ds.h -D__3DS__ -DSMS_PLATFORM_3DS=1"
-export CXX CC INCS OBJ PCPORT P3DS
+# No -include port_compat.h here: as in sms-pc-port's CMakeLists, only game code gets it. Its
+# math macros (sqrtf -> sms_msl_sqrtf, ...) would turn platform/misc/msl_math.c's own
+# implementations into calls to themselves (sms_msl_sqrtf compiled to a branch-to-self).
+COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -DSMS_AUDIO_DSP_HLE=1 -include $P3DS/sms_compat_3ds.h -D__3DS__ -DSMS_PLATFORM_3DS=1"
+# GameCube ABI for sms-pc-port's units (4-byte enums, signed plain char), matching the game
+# and GX libraries. The @3ds units below include libctru headers, whose structs use the
+# toolchain's variable-size enums, so they keep the defaults; they share no enum-typed
+# structs with the game (PADStatus is all integer fields).
+GC_ABI="-fno-short-enums -fsigned-char"
+export CXX CC INCS OBJ PCPORT P3DS GC_ABI
 export CXXF="$COMMON -std=gnu++11"
 export CF="$COMMON -std=gnu99 -fcommon"
 
 # 3DS-side units (shims + pad) live in platform/3ds and need libctru headers.
-for f in posix_shims.cpp pad_sdk.cpp stubs_3ds.cpp pad_3ds.c; do echo "@3ds/$f" >> "$ROOT/build/platform_units.txt"; done
+for f in posix_shims.cpp pad_sdk.cpp stubs_3ds.cpp game_new_3ds.cpp pad_3ds.c; do echo "@3ds/$f" >> "$ROOT/build/platform_units.txt"; done
 CTRU="-I$DEVKITPRO/libctru/include"
 export CTRU
 
@@ -52,8 +60,8 @@ compile_one() {
             case "$f" in *.cpp) CMP="$CXX $CXXF" ;; *) CMP="$CC $CF" ;; esac
             $CMP $INCS $CTRU -c "$P3DS/$f" -o "$out" 2>"$out.err" || { echo "FAIL $rel: $(grep -m1 'error' "$out.err" | cut -c1-140)"; return 1; }
             rm -f "$out.err"; return 0 ;;
-    *.cpp) $CXX $CXXF $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
-    *)     $CC  $CF   $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
+    *.cpp) $CXX $CXXF $GC_ABI $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
+    *)     $CC  $CF   $GC_ABI $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
   esac || { echo "FAIL $rel: $(grep -m1 'error' "$out.err" | cut -c1-140)"; return 1; }
   rm -f "$out.err"
 }

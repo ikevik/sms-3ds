@@ -39,7 +39,13 @@ CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 ifeq ($(MODE),game)
-SMSLIBS  := -Wl,--whole-archive $(TOPDIR)/build/libsms_game.a $(TOPDIR)/build/libsms_platform.a $(TOPDIR)/build/libsms_gx.a -Wl,--no-whole-archive $(TOPDIR)/build/linktest/gx_stubs.o
+# Route the game's renamed operator new/new[] through platform/3ds/game_new_3ds.cpp,
+# which logs allocations the game heap could not satisfy.
+SMSLIBS  := -Wl,--wrap=__sms_game_new -Wl,--wrap=__sms_game_new_array
+# The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
+# and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
+SMSLIBS  += -Wl,--no-enum-size-warning
+SMSLIBS  += -Wl,--whole-archive $(TOPDIR)/build/libsms_game.a $(TOPDIR)/build/libsms_platform.a $(TOPDIR)/build/libsms_gx.a -Wl,--no-whole-archive $(TOPDIR)/build/linktest/gx_stubs.o
 endif
 LIBS     := $(SMSLIBS) -lcitro3d -lctru -lm
 LIBDIRS  := $(PORTLIBS) $(CTRULIB)

@@ -42,6 +42,10 @@ pch = set(block('SMS_DECOMP_PCH_SOURCES'))
 for kind, name in (('cxx', 'SMS_DECOMP_CXX_SOURCES'), ('c', 'SMS_DECOMP_C_SOURCES')):
     for p in block(name):
         print('%s\t%s\t%d' % (kind, p, 1 if p in pch else 0))
+# THP movie decoders: sms-pc-port links these via platform/thp/thp.cmake rather than the
+# generated list. Their strong THPInit/THPVideoDecode/THPAudioDecode replace the SDK stubs.
+for p in ('libs/dolphin/src/thp/THPDec.c', 'libs/dolphin/src/thp/THPAudio.c'):
+    print('c\t%s\t0' % p)
 PY
 TOTAL=$(wc -l < "$ROOT/build/units.tsv")
 [ -n "${LIMIT:-}" ] && head -n "$LIMIT" "$ROOT/build/units.tsv" > "$ROOT/build/units.limit.tsv" && mv "$ROOT/build/units.limit.tsv" "$ROOT/build/units.tsv"
@@ -49,7 +53,12 @@ echo "units: $(wc -l < "$ROOT/build/units.tsv") of $TOTAL, jobs: $JOBS, compiler
 
 INCS="-I$PCPORT/src/port_include -I$PCPORT/src -I$PCPORT/platform/gx/port_include -I$PCPORT/platform/gx/include -I$DECOMP/include"
 for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
-COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 -include $PCPORT/src/port_compat.h"
+# GameCube ABI: enums are 4 bytes and plain char is signed (MWCC). arm-none-eabi defaults to
+# variable-size enums and unsigned char, which breaks every struct read straight from game
+# files (e.g. GXVtxAttrFmtList in J3D models) and char comparisons. Units that talk to
+# libctru keep the toolchain defaults (see build_platform_lib.sh).
+GC_ABI="-fno-short-enums -fsigned-char"
+COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT/src/port_compat.h"
 CXXF="$COMMON -std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics"
 CF="$COMMON -std=gnu99 -fcommon"
 CP932=""

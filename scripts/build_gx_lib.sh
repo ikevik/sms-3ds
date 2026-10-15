@@ -24,7 +24,12 @@ mkdir -p "$OBJ"; rm -f "$OBJ"/*.o "$OBJ"/*.err
 
 INCS="-I$GX/src -I$GX/include -I$GX/port_include -I$PCPORT/platform -I$PCPORT/src -I$PCPORT/src/port_include -I$P3DS/include -I$DECOMP/include -I$DECOMP/libs/dolphin/include"
 for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
-COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -ffp-contract=off -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1"
+# GameCube ABI: enums are 4 bytes and plain char is signed (MWCC). arm-none-eabi defaults to
+# variable-size enums and unsigned char, which breaks every struct read straight from game
+# files (e.g. GXVtxAttrFmtList in J3D models) and char comparisons. Units that talk to
+# libctru keep the toolchain defaults (see build_platform_lib.sh).
+GC_ABI="-fno-short-enums -fsigned-char"
+COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -ffp-contract=off -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI"
 fail=0
 cxx() { # src out
   $CXX $COMMON -std=gnu++17 -fpermissive -include "$PCPORT/src/port_compat.h" -include "$P3DS/sms_compat_3ds.h" $INCS -c "$1" -o "$2" 2>"$2.err" \
