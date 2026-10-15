@@ -1,0 +1,6 @@
+[submodule "decomp"]
+	path = decomp
+	url = https://github.com/chasem-dev/sms-english
+[submodule "ext/sms-pc-port"]
+	path = ext/sms-pc-port
+	url = https://github.com/chasem-dev/sms-pc-port

@@ -1,0 +1,59 @@
+--- a/platform/port_runtime.cpp	2026-10-14 20:30:48.268447692 -0400
++++ b/platform/port_runtime.cpp	2026-10-14 20:30:48.293232434 -0400
+@@ -24,14 +24,16 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ #include <dlfcn.h>
++#ifndef __3DS__
+ #include <sys/wait.h>
++#endif
+ #include <fcntl.h>
+ #include <pthread.h>
+ #ifdef __linux__
+ #include <link.h>
+ #include <sys/syscall.h>
+ #endif
+-#ifndef __APPLE__
++#if !defined(__APPLE__) && !defined(__3DS__)
+ #include <ucontext.h>
+ #endif
+ #ifdef __APPLE__
+@@ -130,6 +132,7 @@
+ 		port_log("[stub]   %-32s %lu\n", r->name, r->count);
+ }
+ 
++#ifndef __3DS__ // no POSIX signals on Horizon: crash reporting is host-only
+ // Symbolise the backtrace's frames in the executable (addr2line on Linux,
+ // atos on macOS) so a crash report names functions and source lines without
+ // the exact binary at hand. Not async-signal-safe: it runs last, after the
+@@ -436,9 +439,11 @@
+ }
+ #endif
+ 
++#endif // !__3DS__
++
+ void port_crash_thread_init()
+ {
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__3DS__)
+ 	// A separate stack allows the first diagnostic to survive stack exhaustion.
+ 	alignas(16) static thread_local unsigned char crash_stack[64 * 1024];
+ 	stack_t stack = {};
+@@ -457,7 +462,7 @@
+ 	// Native hardware exceptions keep their Windows status. Translating them
+ 	// through a CRT signal handler would replace it with a generic abort code.
+ 	signal(SIGABRT, crash_handler);
+-#else
++#elif !defined(__3DS__)
+ 	// The first backtrace() loads the unwinder, which allocates: do it now.
+ 	void* warm[1];
+ 	backtrace(warm, 1);
+@@ -677,7 +682,7 @@
+ // window instead, unless the user chose a GLX vendor.
+ static void pick_glx_vendor()
+ {
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__3DS__)
+ 	if (sizeof(void*) != 4 || getenv("__GLX_VENDOR_LIBRARY_NAME"))
+ 		return;
+ 	FILE* f = fopen("/proc/driver/nvidia/version", "r");

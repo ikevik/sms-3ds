@@ -1,0 +1,11 @@
+build/
+*.3dsx
+*.elf
+*.smdh
+*.map
+rom/*
+!rom/.gitkeep
+*.iso
+*.gcm
+*.ciso
+build3ds/

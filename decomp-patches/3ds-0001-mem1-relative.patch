@@ -1,0 +1,21 @@
+--- a/libs/dolphin/include/dolphin/os.h
++++ b/libs/dolphin/include/dolphin/os.h
+@@ -171,7 +171,17 @@
+ u32 OSUncachedToPhysical(void* ucaddr);
+ void* OSCachedToUncached(void* caddr);
+ void* OSUncachedToCached(void* ucaddr);
+-#if !DEBUG
++#if defined(__3DS__)
++/* 3DS port: Horizon cannot map MEM1 at 0x80000000, so "physical" addresses are offsets into
++ * the block the platform layer allocated (port_mem1_base). Cached and uncached are one view. */
++extern unsigned char* port_mem1_base;
++#define OSPhysicalToCached(paddr)    ((void*)(port_mem1_base + (u32)(paddr)))
++#define OSPhysicalToUncached(paddr)  ((void*)(port_mem1_base + (u32)(paddr)))
++#define OSCachedToPhysical(caddr)    ((u32)((u8*)(caddr) - port_mem1_base))
++#define OSUncachedToPhysical(ucaddr) ((u32)((u8*)(ucaddr) - port_mem1_base))
++#define OSCachedToUncached(caddr)    ((void*)(caddr))
++#define OSUncachedToCached(ucaddr)   ((void*)(ucaddr))
++#elif !DEBUG
+ #define OSPhysicalToCached(paddr)                                              \
+ 	((void*)((u32)(OS_BASE_CACHED + (u32)(paddr))))
+ #define OSPhysicalToUncached(paddr)                                            \

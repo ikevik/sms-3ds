@@ -1,0 +1,29 @@
+--- a/platform/os/crash_info.cpp
++++ b/platform/os/crash_info.cpp
+@@ -94,6 +94,10 @@
+ 	vm_size_t copied = 0;
+ 	return vm_read_overwrite(mach_task_self(), (vm_address_t)from, size, (vm_address_t)to, &copied) == KERN_SUCCESS &&
+ 	       copied == size;
++#elif defined(__3DS__)
++	// Horizon has no process_vm_readv; refuse rather than risk a data abort while reporting one.
++	(void)to; (void)from; (void)size;
++	return false;
+ #else
+ 	// The kernel checks the source and fails with EFAULT instead of faulting.
+ 	struct iovec local = {to, size}, remote = {(void*)from, size};
+--- a/platform/os/os_core.cpp
++++ b/platform/os/os_core.cpp
+@@ -39,6 +39,13 @@
+ #ifdef _WIN32
+ 	localtime_s(&lt, &now);
+ 	s64 local = (s64)_mkgmtime(&lt) - 946684800LL;
++#elif defined(__3DS__)
++	// newlib's struct tm has no tm_gmtoff: derive the local offset from mktime.
++	localtime_r(&now, &lt);
++	struct tm gm;
++	gmtime_r(&now, &gm);
++	gm.tm_isdst = -1;
++	s64 local = (s64)now + ((s64)now - (s64)mktime(&gm)) - 946684800LL;
+ #else
+ 	localtime_r(&now, &lt);
+ 	s64 local = (s64)now + lt.tm_gmtoff - 946684800LL;

@@ -1,0 +1,27 @@
+--- a/platform/port_runtime.cpp
++++ b/platform/port_runtime.cpp
+@@ -669,6 +669,7 @@
+ 
+ // Window/headless switches belong to the GX layer (weak: absent without it).
+ extern "C" __attribute__((weak)) int GXPC_ParseArgs(int* argc, char** argv);
++extern "C" __attribute__((weak)) void GXPC_SetMemoryWindow(void* base, uint32_t size);
+ extern "C" __attribute__((weak)) void GXPC_SetHeadless(int headless);
+ 
+ // The 32-bit NVIDIA GLX library must match the kernel module's version
+@@ -870,8 +871,16 @@
+ 		}
+ 	atexit(port_stub_report);
+ 	map_mem1();
++#ifdef __3DS__
++	// MEM1 is not at 0x80000000 here: the GX layer's physical-address window follows it.
++	if (GXPC_SetMemoryWindow)
++		GXPC_SetMemoryWindow(port_mem1_base, port_mem1_size);
++	else
++		port_log("[port] no GX layer: memory window not set\n");
++#else
+ 	if (sizeof(void*) == 4)
+ 		map_hw_sink();
++#endif
+ 	port_os_init();
+ 	port_dvd_init();
+ 	port_window_icon_init();
