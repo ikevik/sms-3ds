@@ -18,6 +18,7 @@ int pica_cycle_view(void);
 int pica_view(void);
 int pica_view_count(void);
 void GX3DS_SetDebugColors(int on);
+void GX3DS_TraceNextFrame(void);
 int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
 void GX3DS_GetTexStats(uint32_t out[3]);
@@ -238,8 +239,10 @@ int main()
 		if ((held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT))
 			break;
 		if ((pressed & KEY_SELECT) && !(held & KEY_START))
-			GX3DS_SetDebugColors(!GX3DS_GetDebugColors());
+			GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);  // material, debug, opaque
 		// Touching the bottom screen cycles the top screen through the last frame's EFB copies.
+		if (pressed & KEY_L)  // log the next frame's draws (sdmc:/sms/log.txt)
+			GX3DS_TraceNextFrame();
 		if (pressed & KEY_TOUCH)
 			pica_cycle_view();
 		uint32_t s[7];
@@ -254,7 +257,7 @@ int main()
 			log_scene(s[0], s[1]);
 		}
 		printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
-		       GX3DS_GetDebugColors() ? "debug (per draw)" : "material");
+		       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
 		uint32_t cs[3];
 		GX3DS_GetCopyStats(cs);
 		printf("draws: %3lu before copy, %3lu after\ntexture copies/frame: %lu  \n", (unsigned long)cs[0],

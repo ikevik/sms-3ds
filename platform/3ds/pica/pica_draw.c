@@ -278,12 +278,24 @@ static void apply_state(const PicaState* st)
 		C3D_TexEnvBufColor(st->buf_color);
 	}
 	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
+	C3D_CullFace((GPU_CULLMODE)st->cull);
+	if (st->scissor) {
+		/* The EFB texture holds the EFB with its bottom row first (pica_efb_uv); scissor
+		 * coordinates are its pixels. */
+		u32 l = st->sc_x0 * EFB_TEX_W / PICA_EFB_WIDTH, r = (st->sc_x1 * EFB_TEX_W + PICA_EFB_WIDTH - 1) / PICA_EFB_WIDTH;
+		u32 b = (PICA_EFB_HEIGHT - st->sc_y1) * EFB_TEX_H / PICA_EFB_HEIGHT;
+		u32 t = ((PICA_EFB_HEIGHT - st->sc_y0) * EFB_TEX_H + PICA_EFB_HEIGHT - 1) / PICA_EFB_HEIGHT;
+		C3D_SetScissor(GPU_SCISSOR_NORMAL, l, b, r, t);
+	} else {
+		C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+	}
 	C3D_DepthTest(st->depth_test, (GPU_TESTFUNC)st->depth_func,
-	              (GPU_WRITEMASK)((st->color_write ? GPU_WRITE_COLOR : 0) | (st->depth_write ? GPU_WRITE_DEPTH : 0)));
-	if (st->blend)
-		C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, (GPU_BLENDFACTOR)st->blend_src, (GPU_BLENDFACTOR)st->blend_dst,
-		               (GPU_BLENDFACTOR)st->blend_src, (GPU_BLENDFACTOR)st->blend_dst);
-	else
+	              (GPU_WRITEMASK)((st->write_mask & GPU_WRITE_COLOR) | (st->depth_write ? GPU_WRITE_DEPTH : 0)));
+	if (st->blend) {
+		C3D_AlphaBlend((GPU_BLENDEQUATION)st->blend_eq, (GPU_BLENDEQUATION)st->blend_aeq, (GPU_BLENDFACTOR)st->blend_src,
+		               (GPU_BLENDFACTOR)st->blend_dst, (GPU_BLENDFACTOR)st->blend_asrc, (GPU_BLENDFACTOR)st->blend_adst);
+		C3D_BlendingColor(st->blend_color);
+	} else
 		C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
 	s_last = *st;
 	s_last_valid = 1;
@@ -310,6 +322,46 @@ void pica_clear(uint32_t rgba, uint32_t depth24)
 	} else {
 		s_clear_pending = 1;
 	}
+}
+
+void pica_clear_rect(float x, float y, float w, float h, uint32_t rgba, uint32_t depth24)
+{
+	if (!pica_init()) return;
+	if (!s_in_frame) frame_begin();
+	PicaVtx* v;
+	uint16_t* idx;
+	uint32_t keep = s_dropped;
+	int ok = pica_alloc(4, 6, &v, &idx);
+	s_dropped = keep; /* not a game draw */
+	if (!ok) return;
+	const float z = (float)(depth24 & 0xFFFFFF) / 16777215.0f;
+	const float cx[4] = {x, x + w, x + w, x}, cy[4] = {y, y, y + h, y + h};
+	for (int i = 0; i < 4; i++) {
+		memset(&v[i], 0, sizeof v[i]);
+		v[i].x = cx[i];
+		v[i].y = cy[i];
+		v[i].z = z;
+		v[i].w = 1.0f;
+	}
+	static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
+	memcpy(idx, q, sizeof q);
+	C3D_TexEnv* env = C3D_GetTexEnv(0);
+	C3D_TexEnvInit(env);
+	C3D_TexEnvSrc(env, C3D_Both, GPU_CONSTANT, 0, 0);
+	C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+	/* 0xRRGGBBAA -> the constant's 0xAABBGGRR */
+	C3D_TexEnvColor(env, (rgba >> 24) | ((rgba >> 8) & 0xFF00) | ((rgba << 8) & 0xFF0000) | (rgba << 24));
+	passthrough_from(1);
+	C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+	C3D_CullFace(GPU_CULL_NONE);
+	C3D_AlphaTest(false, GPU_ALWAYS, 0);
+	C3D_DepthTest(true, GPU_ALWAYS, GPU_WRITE_ALL);
+	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+	C3D_BufInfo* bi = C3D_GetBufInfo();
+	BufInfo_Init(bi);
+	BufInfo_Add(bi, v, sizeof(PicaVtx), 5, 0x43210);
+	C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, idx);
+	s_last_valid = 0;
 }
 
 /* The GPU reads the rings from memory: write back what the CPU wrote since the last time. */
@@ -383,6 +435,8 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 	C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
 	passthrough_from(1);
 	C3D_TexBind(0, src);
+	C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
+	C3D_CullFace(GPU_CULL_NONE);
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 	C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL & ~GPU_WRITE_DEPTH);
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);

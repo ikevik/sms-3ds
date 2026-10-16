@@ -1,0 +1,21 @@
+--- a/libs/JSystem/src/JRenderer.cpp	2026-10-15 21:45:25
++++ b/libs/JSystem/src/JRenderer.cpp	2026-10-15 21:45:25
+@@ -279,9 +279,18 @@
+ void J3DGDSetTexImgPtr(GXTexMapID map, void* image)
+ {
+ 	// clang-format off
++#if defined(__3DS__)
++	/* MEM1 is not at 0x80000000 here. On the GameCube, adding the cached base to a cached
++	 * pointer wraps to the physical address; here it lands outside MEM1 (the textures came out
++	 * black). The register wants the offset into the MEM1 block. */
+ 	u32 reg =
++		(u32) (OSCachedToPhysical(image) >> 5) |
++		(u32) GXTexImage3Ids[map] << 24;
++#else
++	u32 reg =
+ 		(u32) ((u32)OSPhysicalToCached(image) >> 5) |
+ 		(u32) GXTexImage3Ids[map] << 24;
++#endif
+ 	// clang-format on
+ 
+ 	GDOverflowCheck(5);

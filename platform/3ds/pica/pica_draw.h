@@ -45,8 +45,13 @@ typedef struct {
  * PICA side compares states bytewise: zero the whole struct before filling it. */
 typedef struct {
 	uint8_t depth_test, depth_func, depth_write;
-	uint8_t blend, blend_src, blend_dst;
-	uint8_t color_write;
+	uint8_t blend, blend_eq, blend_src, blend_dst;     /* colour: GPU_BLENDEQUATION, GPU_BLENDFACTOR */
+	uint8_t blend_aeq, blend_asrc, blend_adst;        /* alpha */
+	uint32_t blend_color;                             /* constant (0xAABBGGRR) */
+	uint8_t write_mask;                               /* GPU_WRITE_RED..ALPHA (depth: depth_write) */
+	uint8_t cull;                                     /* GPU_CULLMODE */
+	uint8_t scissor;                                  /* scissor box in EFB pixels: x0, y0 (top) to x1, y1 */
+	uint16_t sc_x0, sc_y0, sc_x1, sc_y1;
 	uint8_t alpha_test, alpha_func, alpha_ref; /* GPU_TESTFUNC */
 	PicaTex* tex[PICA_MAX_TEX];                /* texture units; null: unused */
 	uint8_t wrap_s[PICA_MAX_TEX], wrap_t[PICA_MAX_TEX]; /* GPU_TEXTURE_WRAP_PARAM */
@@ -64,6 +69,10 @@ int pica_init(void);
  * frame first if none is open. Returns 0 (and draws nothing) when the ring or the command
  * buffer is full. */
 int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx);
+
+/* EFB pixel to EFB texture pixel: x right, rows from the texture's first (bottom) row. */
+#define PICA_EFB_TEX_W 512
+#define PICA_EFB_TEX_H 256
 
 /* Textures: power-of-two sizes from 8 to 1024. pica_tex_upload takes RGBA8 rows, top row
  * first, and tiles them for the PICA. Returns null when out of linear memory. */
@@ -90,6 +99,9 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 
 /* Clears colour (0xRRGGBBAA) and depth (24-bit) of the frame in progress, or of the next one. */
 void pica_clear(uint32_t rgba, uint32_t depth24);
+/* Clears an EFB rectangle (EFB pixels) of the frame in progress, in order with its draws, as a
+ * texture copy's clear does. */
+void pica_clear_rect(float x, float y, float w, float h, uint32_t rgba, uint32_t depth24);
 
 /* Ends and presents the frame in progress (a GX display copy): the EFB onto the top screen. */
 void pica_present(void);
