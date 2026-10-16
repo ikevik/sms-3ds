@@ -1,0 +1,18 @@
+--- a/libs/JSystem/src/JAudio/JAInterface/JAIBasic.cpp	2026-10-15 17:29:26
++++ b/libs/JSystem/src/JAudio/JAInterface/JAIBasic.cpp	2026-10-15 17:29:26
+@@ -1376,6 +1376,15 @@
+ 
+ int JAIBasic::loadArcSeqData(u32 sound_id, bool param_2)
+ {
++#if defined(__3DS__)
++	// 3DS port: SMS_NO_AUDIO has no sequence table or archive, so the sound info
++	// below is null and Vload has no handle: the async load was queued with size
++	// 0 ("whole file") and a path built from null archive data, and the DVD
++	// thread's read into an auto-heap slot corrupted memory a few frames later
++	// (title stage: MSoundMainSide's loadArcSeqData(MSD_BGM_MAIN_TITLE)).
++	if (port_no_audio)
++		return 0;
++#endif
+ 	u32 uVar1   = sound_id & JAISoundID_IndexMask;
+ 	u32 uVar2   = JASystem::Vload::checkSize(uVar1);
+ 	void* iVar3 = unk0->checkOnMemory(uVar1, nullptr);

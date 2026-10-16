@@ -1,0 +1,18 @@
+--- a/libs/JSystem/src/JAudio/JALibrary/JALModSe.cpp	2026-10-15 21:23:45
++++ b/libs/JSystem/src/JAudio/JALibrary/JALModSe.cpp	2026-10-15 21:23:45
+@@ -400,6 +400,15 @@
+ 	u16 j;
+ 	for (i = 0; i < 16; ++i) {
+ 		size    = JAIBasic::getInterface()->unk0->mSeTable.mSoundMax[i];
++#if defined(__3DS__)
++		// 3DS port: SMS_NO_AUDIO's sound table has (almost) no entries, but the
++		// game still registers its modulation effects by sound id (MSoundSE::
++		// construct's JALSystem::append calls), and addUseFlag added to index
++		// id & 0x3FF of these near-empty arrays: heap corruption that broke
++		// MSRandPlay::smList and crashed the title stage. Cover every index.
++		if (port_no_audio)
++			size = JAISoundID_IndexMask + 1;
++#endif
+ 		unk0[i] = new u16[size];
+ 		for (j = 0; j < size; ++j)
+ 			unk0[i][j] = 0;
