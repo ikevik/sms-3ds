@@ -30,6 +30,7 @@ uint32_t pica_frame_draws(void);
 int pica_selftest(void);
 void pica_set_gpu_check(int on);
 void GX3DS_SetVerboseLog(int on);
+extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
 void GX3DS_GetTexStats(uint32_t out[3]);
@@ -234,6 +235,11 @@ static void* game_thread(void*)
 	// and the game thread is never scheduled again (seen as a freeze on entering the title
 	// stage). Run silently until there is an ndsp backend and a cheaper mixer.
 	setenv("SMS_NO_AUDIO", "1", 0);
+	// Gameplay at the game's own 30 fps. sms-pc-port defaults to 60, which runs the game's logic
+	// twice as often: on a New 3DS that doubled the CPU work per second of play and halved the
+	// speed of a game that already cannot keep up. (An environment variable wins over
+	// settings.txt's frame_rate.)
+	setenv("SMS_FRAME_RATE", "30", 0);
 	// Everything the game keeps lives under sdmc:/sms/, next to the disc image: the memory card
 	// (sms-pc-port's card.cpp: SMS_SAVE_DIR), settings.txt (port_runtime.cpp: SMS_SETTINGS), and,
 	// through the working directory, the relative lookups (mods/, mods/languages/,
@@ -354,6 +360,19 @@ int main()
 		}
 		uint32_t s[7];
 		GX3DS_GetStats(s);
+		if (g_phase == 2) {
+			log_scene(s[0], s[1]);
+			check_stall(s[0], s[1]);
+		}
+		// The status text is redrawn twice a second, not every vblank: this thread shares the
+		// game thread's core, and redrawing it 60 times a second took a large share of the
+		// frame on a New 3DS. Only the redraw is timed, for the [perf] "status screen" figure.
+		static unsigned statusTick;
+		if (++statusTick % 30 != 0) {
+			gspWaitForVBlank();
+			continue;
+		}
+		const u64 busy0 = svcGetSystemTick();
 		printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
 		       (unsigned long)s[0], (unsigned long)s[1], (unsigned long)s[2], (unsigned long)s[3]);
 		if (g_phase == 2) {
@@ -361,8 +380,6 @@ int main()
 			printf("\nscene: %-9s area %2u-%-2u next %2u-%-2u\nmovie %u  director %08lx\n",
 			       app_state_name(sc.state), sc.curr_stage, sc.curr_scen, sc.next_stage, sc.next_scen,
 			       sc.movie, (unsigned long)sc.director_vtbl);
-			log_scene(s[0], s[1]);
-			check_stall(s[0], s[1]);
 		}
 		printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
 		       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
@@ -389,12 +406,13 @@ int main()
 		       (unsigned long)ps2[1]);
 		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 		// single-buffered, so writing back the CPU cache is enough.
+		gfxFlushBuffers();
+		GX3DS_MainBusyTicks += svcGetSystemTick() - busy0;
 		static u64 lastFlush;
 		if (osGetTime() - lastFlush >= 1000) {
 			lastFlush = osGetTime();
 			flush_log();
 		}
-		gfxFlushBuffers();
 		gspWaitForVBlank();
 	}
 

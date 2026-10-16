@@ -117,6 +117,16 @@ static inline bool batchHasVertices() { return !s_idx.empty(); }
 // kPerfFrames frames for the status screen and logged as [perf] lines. "other" is the rest of the
 // frame: game logic, the GX front half (command parsing, vertex decoding) and waiting.
 extern "C" uint64_t svcGetSystemTick(void);
+// The "other" breakdown: GX command parsing and display-list calls (gx_fifo.cpp, patch 0006; it
+// includes our draw work done inside them), the emulated OS's idle time (no game thread runnable:
+// waiting for the retrace), and beside them the main thread's bottom-screen status redraw, which
+// shares the game thread's core (source_game/main.cpp adds to GX3DS_MainBusyTicks).
+extern "C" uint64_t GXPC_CmdTicks;
+extern "C" double port_idle_seconds(void);
+extern "C" volatile uint64_t GX3DS_MainBusyTicks;
+volatile uint64_t GX3DS_MainBusyTicks;
+static uint64_t s_perfCmd0, s_perfMain0;
+static double s_perfIdle0;
 enum PerfPhase { PERF_TEX, PERF_TEV, PERF_XFORM, PERF_SUBMIT, PERF_COPY, PERF_PRESENT, PERF_DECODE, PERF_COUNT };
 static uint64_t s_perfAcc[PERF_COUNT], s_perfFrameStart, s_perfWindowStart;
 static uint32_t s_perfFrames, s_perfBatches, s_perfVerts;
@@ -153,6 +163,9 @@ static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
 	if (!s_perfWindowStart) {
 		s_perfWindowStart = now;
+		s_perfCmd0 = GXPC_CmdTicks;
+		s_perfMain0 = GX3DS_MainBusyTicks;
+		s_perfIdle0 = port_idle_seconds();
 		memset(s_perfAcc, 0, sizeof s_perfAcc);
 		s_perfFrames = s_perfBatches = s_perfVerts = 0;
 		return;
@@ -181,6 +194,23 @@ static void perfFrameEnd() {
 			at += snprintf(fb + at, sizeof fb - at, " %s %.1f/%.0fv", kFallbackName[i], s_fbBatches[i] / frames,
 			               s_fbVerts[i] / frames);
 	if (at) fprintf(stderr, "[perf]   cpu fallbacks per frame (batches/verts):%s\n", fb);
+	{
+		// other = idle + GX commands outside our phases + status screen + the game itself
+		const double perMs = 1.0 / frames / kTicksPerMs;
+		const double cmd = double(GXPC_CmdTicks - s_perfCmd0), mainBusy = double(GX3DS_MainBusyTicks - s_perfMain0);
+		const double idleMs = (port_idle_seconds() - s_perfIdle0) * 1000.0 / frames;
+		const double cmdOnly = cmd > ours ? (cmd - ours) * perMs : 0.0;
+		const double otherMs = s_perfAvgMs[PERF_COUNT + 1], mainMs = mainBusy * perMs;
+		// Wall-clock times on a shared core: the status screen's redraw can preempt the game thread
+		// inside any of the others, so it is reported beside them, not subtracted.
+		fprintf(stderr,
+		        "[perf]   other %.1f = idle %.1f + gx commands %.1f + game %.1f ms/frame (gx commands incl. our draw "
+		        "work: %.1f; status screen redraw, main thread: %.1f)\n",
+		        otherMs, idleMs, cmdOnly, otherMs - idleMs - cmdOnly, cmd * perMs, mainMs);
+		s_perfCmd0 = GXPC_CmdTicks;
+		s_perfMain0 = GX3DS_MainBusyTicks;
+		s_perfIdle0 = port_idle_seconds();
+	}
 	memset(s_fbBatches, 0, sizeof s_fbBatches);
 	memset(s_fbVerts, 0, sizeof s_fbVerts);
 	s_perfWindowStart = now;

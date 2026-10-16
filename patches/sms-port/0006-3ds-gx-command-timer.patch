@@ -1,0 +1,42 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 14:08:55
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 14:08:55
+@@ -892,7 +892,31 @@
+ 
+ // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
+ // tail holds an incomplete command, *need receives its total length.
++#if defined(__3DS__)
++// 3DS port: time spent in the command parser and display-list calls (outermost call only), for
++// the renderer's [perf] breakdown. It includes the back end's draw work done inside them.
++extern "C" {
++uint64_t GXPC_CmdTicks;
++uint64_t svcGetSystemTick(void);
++}
++namespace {
++struct CmdTimer {
++    static int depth;
++    uint64_t t0;
++    CmdTimer() : t0(depth++ ? 0 : svcGetSystemTick()) {}
++    ~CmdTimer() {
++        if (--depth == 0) GXPC_CmdTicks += svcGetSystemTick() - t0;
++    }
++};
++int CmdTimer::depth;
++}
++#define GXPC_CMD_TIMER CmdTimer cmdTimer_
++#else
++#define GXPC_CMD_TIMER
++#endif
++
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
++    GXPC_CMD_TIMER;
+     const uint8_t* start = p;
+     const uint8_t* end = p + n;
+     while (p < end) {
+@@ -1238,6 +1262,7 @@
+ }
+ 
+ void callDisplayList(const uint8_t* data, uint32_t size) {
++    GXPC_CMD_TIMER;
+     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
+         runCommands(data, size);
+         return;
