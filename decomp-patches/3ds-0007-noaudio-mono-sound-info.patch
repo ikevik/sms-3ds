@@ -1,0 +1,21 @@
+--- a/src/MSound/MSoundSE.cpp	2026-10-16 13:51:24
++++ b/src/MSound/MSoundSE.cpp	2026-10-16 13:51:24
+@@ -850,7 +850,18 @@
+ bool MSoundSE::checkMonoSound(u32 id, JAIActor* actor)
+ {
+ 	JAISoundInfo* local_c;
++#if defined(__3DS__)
++	// 3DS port: with SMS_NO_AUDIO's empty sound table the lookup finds no info and
++	// leaves local_c null; an NPC's animation sound then crashed entering Delfino
++	// Airstrip (data abort at address 0). No info: the sound does not exist, so do
++	// not start it.
++	local_c = nullptr;
++#endif
+ 	JAIBasic::getInterface()->unk0->getInfoPointer(id, (void**)&local_c);
++#if defined(__3DS__)
++	if (local_c == nullptr)
++		return false;
++#endif
+ 	if (local_c->mSwBit & JAISeSwBit_Mono) {
+ 		JAISound* sound
+ 		    = JAIBasic::getInterface()
