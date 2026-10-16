@@ -29,6 +29,7 @@ const char* pica_where(void);
 uint32_t pica_frame_draws(void);
 int pica_selftest(void);
 void pica_set_gpu_check(int on);
+void GX3DS_SetVerboseLog(int on);
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
 void GX3DS_GetTexStats(uint32_t out[3]);
@@ -186,7 +187,6 @@ static void log_scene(uint32_t frames, uint32_t batches)
 	last      = s;
 	have_last = true;
 	last_ms   = now;
-	flush_log();
 }
 
 // No new frame for 5 s: says where the renderer is on the game thread and dumps the emulated
@@ -260,12 +260,16 @@ int main()
 	// this status text lives on the bottom screen.
 	consoleInit(GFX_BOTTOM, NULL);
 
-	// Everything the port prints goes to the SD card, unbuffered, so a crash still leaves a log.
+	// Everything the port prints goes to the SD card (sdmc:/sms/log.txt).
 	// The previous run's log is kept as log-prev.txt (FAT's rename does not replace a file).
 	remove(SMS_DIR "/log-prev.txt");
 	rename(LOG_PATH, SMS_DIR "/log-prev.txt");
 	freopen(LOG_PATH, "w", stderr);
-	setvbuf(stderr, NULL, _IONBF, 0);
+	// A 64 KB buffer, written out once a second by the main loop (flush_log). Unbuffered, every
+	// line was its own SD write: slow on a New 3DS, and garbled when threads wrote at once. A
+	// crash loses at most the last second (Luma's crash dump has the rest).
+	static char logBuf[64 << 10];
+	setvbuf(stderr, logBuf, _IOFBF, sizeof logBuf);
 
 	bool isNew = false;
 	APT_CheckNew3DS(&isNew);
@@ -292,6 +296,12 @@ int main()
 		pica_set_gpu_check(1);
 		printf("Y held: GPU check after every draw (slow)\n");
 		fprintf(stderr, "[3ds] Y held at launch: GPU check after every draw\n");
+	}
+	// Holding X at launch logs each new TEV setup, unsupported TEV pattern and EFB copy kind.
+	if (launchHeld & KEY_X) {
+		GX3DS_SetVerboseLog(1);
+		printf("X held: detailed renderer log\n");
+		fprintf(stderr, "[3ds] X held at launch: [tevdump]/[tev]/[copy] lines on\n");
 	}
 	if (launchHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
@@ -379,6 +389,11 @@ int main()
 		       (unsigned long)ps2[1]);
 		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 		// single-buffered, so writing back the CPU cache is enough.
+		static u64 lastFlush;
+		if (osGetTime() - lastFlush >= 1000) {
+			lastFlush = osGetTime();
+			flush_log();
+		}
 		gfxFlushBuffers();
 		gspWaitForVBlank();
 	}

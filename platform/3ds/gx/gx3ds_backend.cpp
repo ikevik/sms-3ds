@@ -286,6 +286,9 @@ static volatile bool s_opaque;
 // next frame, in order, to the log.
 static volatile bool s_traceArm;
 static bool s_tracing;
+// GX3DS_SetVerboseLog: the once-per-kind [tevdump], [tev] and [copy] lines. Off by default: on a
+// New 3DS each new TEV setup's dump cost several ms of SD writes on the game thread.
+static bool s_verbose;
 static unsigned s_traceDraw;
 // Draws before and after the frame's first EFB-to-texture copy, and the copies (status screen).
 static bool s_afterTexCopy;
@@ -356,6 +359,7 @@ static const size_t kMaxEfbCopies = 6;
 
 // Logs each distinct kind of EFB copy once (destination, rectangle, format, flags).
 static void logCopyKind(const EfbCopy* c, uint32_t ctrl, uint32_t pix) {
+	if (!s_verbose) return;
 	static std::vector<uint64_t> seen;
 	const uint32_t fmt = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7);
 	uint64_t key = (uint64_t(uintptr_t(c->dest)) << 32) ^ (uint64_t(ctrl) << 8) ^ pix ^
@@ -885,6 +889,7 @@ static ChanPlan planChannel(TevSrc A, TevSrc B, TevSrc C, TevSrc D, int nc, uint
 
 // Logs each distinct unsupported TEV pattern once.
 static void tevLogOnce(const char* why, uint32_t stage, uint32_t nStages, uint32_t ce, uint32_t ae) {
+	if (!s_verbose) return;
 	static std::vector<uint64_t> seen;
 	uint64_t key = (uint64_t(uintptr_t(why)) << 32) ^ (uint64_t(ce) << 8) ^ (uint64_t(ae) << 24) ^ stage;
 	for (uint64_t k : seen)
@@ -1929,7 +1934,7 @@ static void drawTriangles() {
 		st.wrap_t[u] = kWrap[(mode0 >> 2) & 3];
 		st.linear[u] = (mode0 >> 4) & 1;
 	}
-	if (!debug && !cached) {
+	if (!debug && !cached && s_verbose) {
 		// Blend (BP 0x41), depth (0x40), alpha compare (0xF3), channel controls and the first
 		// vertex's colours, for the dump.
 		const VtxFmtLayout& L0 = vtxFmtLayout(s_bfmt);
@@ -2350,6 +2355,7 @@ int GXPC_InitAuto(int) {
 void GX3DS_TraceNextFrame(void) { gx::s_traceArm = true; }
 
 void GX3DS_SetGpuTransform(int on) { gx::s_gpuTransform = on != 0; }
+void GX3DS_SetVerboseLog(int on) { gx::s_verbose = on != 0; }
 int GX3DS_GetGpuTransform(void) { return gx::s_gpuTransform ? 1 : 0; }
 // Batches drawn on the GPU and the CPU path so far.
 void GX3DS_GetPathStats(uint32_t out[2]) {
