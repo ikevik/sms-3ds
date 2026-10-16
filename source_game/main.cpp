@@ -25,6 +25,10 @@ int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
 void GX3DS_GetPerf(float out[11]);
 void GX3DS_SetGpuTransform(int on);
+const char* pica_where(void);
+uint32_t pica_frame_draws(void);
+int pica_selftest(void);
+void pica_set_gpu_check(int on);
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
 void GX3DS_GetTexStats(uint32_t out[3]);
@@ -58,6 +62,8 @@ extern "C" void* __gCurrentThread;
 
 // Writes every emulated thread to the log: resolve the addresses with nm on sms3ds.elf
 // (global OSThreads, message queues and mutexes have symbols).
+static void flush_log(void);
+
 static void dump_os_threads(const char* why)
 {
 	void* list[48];
@@ -180,6 +186,42 @@ static void log_scene(uint32_t frames, uint32_t batches)
 	last      = s;
 	have_last = true;
 	last_ms   = now;
+	flush_log();
+}
+
+// No new frame for 5 s: says where the renderer is on the game thread and dumps the emulated
+// threads, once, then every 30 s while it lasts. Batches still rising means the game is drawing
+// but never presents; C3D_FrameBegin means the GPU never finished the last frame.
+static void check_stall(uint32_t frames, uint32_t batches)
+{
+	static uint32_t last_frames = ~0u;
+	static u64 since;
+	static int reports;
+	u64 now = osGetTime();
+	if (frames != last_frames) {
+		if (reports) fprintf(stderr, "[stall] frames moving again at %lu\n", (unsigned long)frames);
+		last_frames = frames;
+		since = now;
+		reports = 0;
+		return;
+	}
+	u64 secs = (now - since) / 1000;
+	if (secs < 5 || (reports && secs < 5 + 30u * (u64)reports)) return;
+	reports++;
+	fprintf(stderr, "[stall] no frame for %lu s at frame %lu: renderer %s, %lu draws this frame, %lu batches total, %s transform\n",
+	        (unsigned long)secs, (unsigned long)frames, pica_where(), (unsigned long)pica_frame_draws(),
+	        (unsigned long)batches, GX3DS_GetGpuTransform() ? "GPU" : "CPU");
+	dump_os_threads("no frame for 5 s");
+	flush_log();
+	printf("\x1b[29;0Hstalled: %.30s", pica_where());
+}
+
+// Commits the log to the SD card. Written data only becomes part of the file when it is flushed
+// or closed, so a console turned off without this leaves gaps and stale bytes in log.txt.
+static void flush_log(void)
+{
+	fflush(stderr);
+	fsync(fileno(stderr));
 }
 
 static void* game_thread(void*)
@@ -219,12 +261,16 @@ int main()
 	consoleInit(GFX_BOTTOM, NULL);
 
 	// Everything the port prints goes to the SD card, unbuffered, so a crash still leaves a log.
+	// The previous run's log is kept as log-prev.txt (FAT's rename does not replace a file).
+	remove(SMS_DIR "/log-prev.txt");
+	rename(LOG_PATH, SMS_DIR "/log-prev.txt");
 	freopen(LOG_PATH, "w", stderr);
 	setvbuf(stderr, NULL, _IONBF, 0);
 
 	bool isNew = false;
 	APT_CheckNew3DS(&isNew);
-	printf("SMS 3DS stage 2 (%s 3DS)\n", isNew ? "New" : "Old");
+	printf("SMS 3DS stage 2 (%s 3DS) %s %s\n", isNew ? "New" : "Old", __DATE__, __TIME__);
+	fprintf(stderr, "[3ds] build %s %s\n", __DATE__, __TIME__);
 	printf("heap %lu MB, linear free %lu MB\n", (unsigned long)(envGetHeapSize() >> 20),
 	       (unsigned long)(linearSpaceFree() >> 20));
 	printf("app mem free %lu MB\n", (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 20));
@@ -232,11 +278,39 @@ int main()
 	        (unsigned long)(envGetHeapSize() >> 20), (unsigned long)(linearSpaceFree() >> 20));
 	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\ntouch: top=view  BL=trace  BR=GPU\n", LOG_PATH);
 
+	// Holding B at launch starts on the CPU vertex path (as the BR touch toggle), to tell a GPU
+	// lock-up in the GPU transform path from other hangs on hardware.
+	// The first HID reads after launch can come back empty: watch the buttons for half a second.
+	u32 launchHeld = 0;
+	for (int i = 0; i < 30; i++) {
+		hidScanInput();
+		launchHeld |= hidKeysHeld();
+		gspWaitForVBlank();
+	}
+	// Holding Y at launch waits for the GPU after every draw and logs the one it never finishes.
+	if (launchHeld & KEY_Y) {
+		pica_set_gpu_check(1);
+		printf("Y held: GPU check after every draw (slow)\n");
+		fprintf(stderr, "[3ds] Y held at launch: GPU check after every draw\n");
+	}
+	if (launchHeld & KEY_B) {
+		GX3DS_SetGpuTransform(0);
+		printf("B held: CPU vertex path\n");
+		fprintf(stderr, "[3ds] B held at launch: starting on the CPU vertex path\n");
+	}
+
+	printf("GPU self-test... ");
+	const bool gpuOk = pica_selftest() != 0;
+	printf(gpuOk ? "ok\n" : "HUNG: see log; game not started\n");
+	flush_log();
+
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 4u << 20);  // the game's call chains are deep
 	pthread_t th;
-	if (pthread_create(&th, &attr, game_thread, NULL) != 0) {
+	if (!gpuOk) {
+		// A hung GPU would only stop the game at its first frame again.
+	} else if (pthread_create(&th, &attr, game_thread, NULL) != 0) {
 		printf("cannot start the game thread\n");
 		fprintf(stderr, "[3ds] pthread_create failed\n");
 	}
@@ -278,6 +352,7 @@ int main()
 			       app_state_name(sc.state), sc.curr_stage, sc.curr_scen, sc.next_stage, sc.next_scen,
 			       sc.movie, (unsigned long)sc.director_vtbl);
 			log_scene(s[0], s[1]);
+			check_stall(s[0], s[1]);
 		}
 		printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
 		       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
@@ -309,6 +384,10 @@ int main()
 	}
 
 	fprintf(stderr, "[3ds] exiting\n");
+	flush_log();
+	// _exit, not a return from main: exit's atexit handlers and static destructors can wait on
+	// the game thread (its locks, its emulated OS), and a stuck game thread then kept the
+	// console from quitting. _exit still runs libctru's service cleanup.
 	gfxExit();
-	return 0;
+	_exit(0);
 }

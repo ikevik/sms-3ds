@@ -242,14 +242,32 @@ static void cpu_mode(void)
 	}
 }
 
-static void frame_begin(void)
+/* Where the game thread is in the renderer, for the main thread's hang report (pica_where). */
+static const char* volatile s_where = "not started";
+static volatile uint32_t s_frameDraws;
+const char* pica_where(void) { return s_where; }
+static int s_check;                         /* pica_set_gpu_check */
+static uint32_t s_checkDraws, s_checkFrames;
+static void s_checkFramesInc(void)
+{
+	if (!s_check) return;
+	if (++s_checkFrames % 30 == 0)
+		fprintf(stderr, "[gpucheck] %lu frames, %lu draws checked, none hung\n", (unsigned long)s_checkFrames,
+		        (unsigned long)s_checkDraws);
+}
+uint32_t pica_frame_draws(void) { return s_frameDraws; }
+
+/* flags: C3D_FRAME_NONBLOCK returns 0 instead of waiting while the GPU is busy. */
+static int frame_begin_ex(u8 flags)
 {
 	/* No C3D_FRAME_SYNCDRAW: that waits for the 3DS's vblank, and this runs on the game thread
 	 * while it holds the emulated CPU (sms-pc-port's OS scheduler). The game paces itself on
 	 * its emulated VI retrace; blocking here as well left the retrace already due whenever the
 	 * game waited for it, so the main thread never slept and lower-priority threads (stage
 	 * setup, priority 17) were starved. citro3d still waits for the previous frame's GPU work. */
-	C3D_FrameBegin(0);
+	s_where = "C3D_FrameBegin (waiting for the GPU to finish the last frame)";
+	if (!C3D_FrameBegin(flags)) return 0;
+	s_where = "in a frame (game code or drawing)";
 	release_dead();
 	s_half ^= 1;
 	s_vused = s_iused = s_vflushed = s_iflushed = 0;
@@ -261,7 +279,10 @@ static void frame_begin(void)
 	C3D_FrameDrawOn(s_efb);
 	set_cpu_proj(&s_projEfb);
 	s_in_frame = 1;
+	return 1;
 }
+
+static void frame_begin(void) { frame_begin_ex(0); }
 
 int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx)
 {
@@ -298,6 +319,7 @@ int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
 }
 
 static void apply_state(const PicaState* st);
+static void gpu_check(const char* kind, const PicaGxLayout* L, uint32_t nidx, const PicaState* st);
 
 void* pica_ring_tail(uint32_t* avail)
 {
@@ -327,10 +349,11 @@ static int gx_attribs(const PicaGxLayout* L, u64* perm)
 	struct Field { int off, size, reg, fmt, count; } f[NUM_GX_REGS];
 	int nf = 0;
 	const int offs[NUM_GX_REGS] = {0, L->off_nrm, L->off_clr, L->off_tex[0], L->off_tex[1], L->off_tex[2], L->off_mtx};
-	static const int sizes[NUM_GX_REGS] = {12, 12, 4, 8, 8, 8, 1};
+	/* The matrix index is read as 4 bytes (the shader uses the first): the GameCube block has 12. */
+	static const int sizes[NUM_GX_REGS] = {12, 12, 4, 8, 8, 8, 4};
 	static const int fmts[NUM_GX_REGS] = {GPU_FLOAT, GPU_FLOAT, GPU_UNSIGNED_BYTE, GPU_FLOAT, GPU_FLOAT, GPU_FLOAT,
 	                                      GPU_UNSIGNED_BYTE};
-	static const int counts[NUM_GX_REGS] = {3, 3, 4, 2, 2, 2, 1};
+	static const int counts[NUM_GX_REGS] = {3, 3, 4, 2, 2, 2, 4};
 	for (int r = 0; r < NUM_GX_REGS; r++)
 		if (offs[r] >= 0) f[nf++] = (struct Field){offs[r], sizes[r], r, fmts[r], counts[r]};
 	/* memory order (insertion sort: at most 7 fields) */
@@ -356,6 +379,14 @@ static int gx_attribs(const PicaGxLayout* L, u64* perm)
 		if (attr < 0 || entries >= 12) return 0;
 		p |= (u64)attr << (4 * entries++);
 		at = f[i].off + f[i].size;
+	}
+	/* The bytes after the last field are padding entries too: on a New 3DS the GPU locked up on a
+	 * draw whose loaders covered 49 of its 60-byte vertices (Azahar stepped by the stride anyway). */
+	for (int gap = (int)L->stride - at; gap > 0;) {
+		int chunk = gap > 16 ? 16 : gap;
+		if (chunk & 3 || entries >= 12) return 0;
+		p |= (u64)(0xB + chunk / 4) << (4 * entries++);
+		gap -= chunk;
 	}
 	for (int r = 0; r < NUM_GX_REGS; r++)
 		if (offs[r] < 0) {
@@ -419,7 +450,9 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, verts, L->stride, s_gxEntries, s_gxPerm);
+	s_frameDraws++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
+	gpu_check("GPU-transform draw", L, nidx, st);
 	return 1;
 }
 
@@ -509,7 +542,9 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, verts, sizeof(PicaVtx), 5, 0x43210);
+	s_frameDraws++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
+	gpu_check("CPU-path draw", NULL, nidx, st);
 }
 
 void pica_clear(uint32_t rgba, uint32_t depth24)
@@ -520,6 +555,7 @@ void pica_clear(uint32_t rgba, uint32_t depth24)
 		C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
 		C3D_FrameDrawOn(s_efb);
 		s_last_valid = 0;
+		gpu_check("EFB clear", NULL, 0, NULL);
 	} else {
 		s_clear_pending = 1;
 	}
@@ -564,6 +600,7 @@ void pica_clear_rect(float x, float y, float w, float h, uint32_t rgba, uint32_t
 	BufInfo_Add(bi, v, sizeof(PicaVtx), 5, 0x43210);
 	C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, idx);
 	s_last_valid = 0;
+	gpu_check("EFB rectangle clear", NULL, 6, NULL);
 }
 
 /* The GPU reads the rings from memory: write back what the CPU wrote since the last time. */
@@ -659,6 +696,12 @@ void pica_efb_copy_to(PicaTex* dst, int alpha_one)
 	C3D_FrameDrawOn(dst->rt);
 	draw_efb_quad(alpha_one, &s_efbTex);
 	C3D_FrameDrawOn(s_efb);
+	{
+		char what[96];
+		snprintf(what, sizeof what, "EFB copy into texture %p (%ux%u, fmt %d)", (void*)dst, dst->tex.width,
+		         dst->tex.height, (int)dst->tex.fmt);
+		gpu_check(what, NULL, 6, NULL);
+	}
 	s_copies++;
 	if (s_nFrameCopies < MAX_VIEW_COPIES) s_frameCopies[s_nFrameCopies++] = dst;
 }
@@ -678,7 +721,11 @@ void pica_present(void)
 	memcpy(s_lastFrameCopies, s_frameCopies, sizeof s_frameCopies);
 	s_nLastFrameCopies = s_nFrameCopies;
 	s_nFrameCopies = 0;
+	s_where = "C3D_FrameEnd (submitting the frame)";
 	C3D_FrameEnd(0);
+	s_where = "between frames (game code)";
+	s_frameDraws = 0;
+	s_checkFramesInc();
 	s_in_frame = 0;
 	s_last_valid = 0;
 	s_clear_pending = 1; /* the GameCube clears the EFB as it copies it out */
@@ -696,3 +743,243 @@ int pica_view(void) { return s_view; }
 int pica_view_count(void) { return s_nLastFrameCopies; }
 
 uint32_t pica_dropped(void) { return s_dropped; }
+
+/* ---- hardware self-test ------------------------------------------------------------------ */
+/* Runs the pieces of a game frame one frame at a time and logs each: a piece the GPU never
+ * finishes leaves the next frame unable to start, which is reported (with a timeout) instead of
+ * hanging the way the game's first frame did on a New 3DS. */
+static int selftest_wait(const char* after)
+{
+	u64 t0 = osGetTime();
+	while (!frame_begin_ex(C3D_FRAME_NONBLOCK)) {
+		if (osGetTime() - t0 > 3000) {
+			fprintf(stderr, "[gputest] %s: the GPU never finished (HUNG)\n", after);
+			s_where = "GPU self-test: hung";
+			return 0;
+		}
+		svcSleepThread(1000000);
+	}
+	fprintf(stderr, "[gputest] %s: ok (%lu ms)\n", after, (unsigned long)(osGetTime() - t0));
+	fflush(stderr);
+	return 1;
+}
+
+static void selftest_end(void)
+{
+	flush_rings();
+	C3D_FrameEnd(0);
+	s_in_frame = 0;
+	s_last_valid = 0;
+}
+
+/* A vertex-colour quad (blue) with every gx_pass GX-mode input in the buffer: position, normal,
+ * colour, three texture coordinates, matrix index (stride 56). Sets the uniforms prog declares:
+ * identity matrices, no texture coordinates, colour = vertex colour. gx: the `cpu` bool is false. */
+static void selftest_quad56(shaderProgram_s* prog, int gx)
+{
+	void* vb;
+	uint16_t* ib;
+	if (!pica_alloc_raw(4 * 56, 6, &vb, &ib)) {
+		fprintf(stderr, "[gputest] no ring space\n");
+		return;
+	}
+	const float cx[4] = {320, 576, 576, 320}, cy[4] = {224, 224, 352, 352};
+	for (int i = 0; i < 4; i++) {
+		uint8_t* v = (uint8_t*)vb + i * 56;
+		memset(v, 0, 56);
+		float* f = (float*)v;
+		f[0] = cx[i];
+		f[1] = cy[i];
+		f[5] = 1.0f; /* normal z */
+		v[26] = 255; /* colour: blue, alpha 255 */
+		v[27] = 255;
+		/* texture coordinates (28..51) and the matrix index (52, float) stay 0 */
+	}
+	static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
+	memcpy(ib, q, sizeof q);
+	PicaState st;
+	memset(&st, 0, sizeof st);
+	st.write_mask = 0x0F;
+	st.depth_func = GPU_ALWAYS;
+	st.alpha_func = GPU_ALWAYS;
+	st.cull = GPU_CULL_NONE;
+	st.blend_eq = st.blend_aeq = GPU_BLEND_ADD;
+	st.blend_src = st.blend_asrc = GPU_ONE;
+	st.blend_dst = st.blend_adst = GPU_ZERO;
+	s_last_valid = 0;
+	apply_state(&st);
+	C3D_AttrInfo* ai = C3D_GetAttrInfo();
+	AttrInfo_Init(ai);
+	AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3);
+	AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 3);
+	AttrInfo_AddLoader(ai, 2, GPU_UNSIGNED_BYTE, 4);
+	AttrInfo_AddLoader(ai, 3, GPU_FLOAT, 2);
+	AttrInfo_AddLoader(ai, 4, GPU_FLOAT, 2);
+	AttrInfo_AddLoader(ai, 5, GPU_FLOAT, 2);
+	AttrInfo_AddLoader(ai, 6, GPU_FLOAT, 1);
+	s_mode = MODE_NONE; /* the attribute setup is the test's own */
+	s_gxLayoutValid = 0;
+	s_gxMatricesLoaded = 0;
+	s_fIsCpu = 0;
+	shaderInstance_s* vs = prog->vertexShader;
+	if (gx) C3D_BoolUnifSet(GPU_VERTEX_SHADER, shaderInstanceGetUniformLocation(vs, "cpu"), false);
+	PicaGxUniforms u;
+	memset(&u, 0, sizeof u);
+	static const float ident[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+	pica_gx_projection(ident, &u);
+	int l;
+	if ((l = shaderInstanceGetUniformLocation(vs, "F")) >= 0)
+		for (int r = 0; r < 4; r++) C3D_FVUnifSet(GPU_VERTEX_SHADER, l + r, u.F[r][0], u.F[r][1], u.F[r][2], u.F[r][3]);
+	static const char* const rowsNames[2] = {"P", "N"};
+	for (int k = 0; k < 2; k++)
+		if ((l = shaderInstanceGetUniformLocation(vs, rowsNames[k])) >= 0)
+			for (int r = 0; r < PICA_GX_MTX_ROWS; r++) {
+				const int c = r % 3;
+				C3D_FVUnifSet(GPU_VERTEX_SHADER, l + r, c == 0, c == 1, c == 2, 0.0f);
+			}
+	static const char* const zeroNames[2] = {"T", "W"};
+	for (int k = 0; k < 2; k++)
+		if ((l = shaderInstanceGetUniformLocation(vs, zeroNames[k])) >= 0)
+			for (int r = 0; r < 6; r++) C3D_FVUnifSet(GPU_VERTEX_SHADER, l + r, 0, 0, 0, 0);
+	if ((l = shaderInstanceGetUniformLocation(vs, "CS")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 1, 1, 1, 1);
+	if ((l = shaderInstanceGetUniformLocation(vs, "CM")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 0, 0, 0, 0);
+	if ((l = shaderInstanceGetUniformLocation(vs, "LD")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 0, 0, 0, 0);
+	C3D_BufInfo* bi = C3D_GetBufInfo();
+	BufInfo_Init(bi);
+	BufInfo_Add(bi, vb, 56, 7, 0x6543210);
+	C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, ib);
+}
+
+int pica_selftest(void)
+{
+	if (!pica_init()) return 0;
+	fprintf(stderr, "[gputest] start\n");
+	if (!selftest_wait("start")) return 0;
+	/* 1: clear the EFB target (memory fill), nothing drawn */
+	selftest_end();
+	if (!selftest_wait("1 EFB clear")) return 0;
+	/* 2: a constant-colour quad on the CPU vertex path */
+	pica_clear_rect(64.0f, 64.0f, 256.0f, 128.0f, 0xFF0000FF, 0);
+	selftest_end();
+	if (!selftest_wait("2 CPU-path quad")) return 0;
+	/* 3a: gx_pass's GX mode with every input read from the vertex buffer (no fixed attributes) */
+	selftest_quad56(&s_prog, 1);
+	selftest_end();
+	if (!selftest_wait("3a gx_pass shader (GX mode), all inputs from the buffer")) return 0;
+	/* 3b: a vertex-colour quad on the GPU transform path, laid out as the game's first draw
+	 * (position f32x3, colour u8x4: stride 16), identity matrices */
+	{
+		void* vb;
+		uint16_t* ib;
+		if (pica_alloc_raw(4 * 16, 6, &vb, &ib)) {
+			const float cx[4] = {320, 576, 576, 320}, cy[4] = {64, 64, 192, 192};
+			for (int i = 0; i < 4; i++) {
+				float* f = (float*)((uint8_t*)vb + i * 16);
+				f[0] = cx[i];
+				f[1] = cy[i];
+				f[2] = 0.0f;
+				uint8_t* c = (uint8_t*)vb + i * 16 + 12;
+				c[0] = 0;
+				c[1] = 255;
+				c[2] = 0;
+				c[3] = 255;
+			}
+			static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
+			memcpy(ib, q, sizeof q);
+			PicaGxLayout L;
+			memset(&L, 0, sizeof L);
+			L.stride = 16;
+			L.off_nrm = L.off_mtx = -1;
+			L.off_tex[0] = L.off_tex[1] = L.off_tex[2] = -1;
+			L.off_clr = 12;
+			L.fixed_idx = 0;
+			PicaGxUniforms u;
+			memset(&u, 0, sizeof u);
+			static const float ident[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+			pica_gx_projection(ident, &u);
+			for (int i = 0; i < 4; i++) u.CS[i] = 1.0f;
+			float rows[PICA_GX_MTX_ROWS][4];
+			memset(rows, 0, sizeof rows);
+			for (int r = 0; r < PICA_GX_MTX_ROWS; r++) rows[r][r % 3] = 1.0f;
+			PicaState st;
+			memset(&st, 0, sizeof st);
+			st.write_mask = 0x0F;
+			st.depth_func = GPU_ALWAYS;
+			st.alpha_func = GPU_ALWAYS;
+			st.cull = GPU_CULL_NONE;
+			st.blend_eq = st.blend_aeq = GPU_BLEND_ADD;
+			st.blend_src = st.blend_asrc = GPU_ONE;
+			st.blend_dst = st.blend_adst = GPU_ZERO;
+			pica_draw_gx(vb, 4, &L, ib, 6, &u, 1, (const float(*)[4])rows, (const float(*)[4])rows, &st);
+		} else {
+			fprintf(stderr, "[gputest] 3: no ring space\n");
+		}
+	}
+	selftest_end();
+	if (!selftest_wait("3b GPU-transform quad with fixed inputs (as the game)")) return 0;
+	/* 4: the present: the EFB texture drawn onto the top screen, then the display transfer */
+	pica_present();
+	if (!selftest_wait("4 present (EFB onto the top screen)")) return 0;
+	selftest_end();
+	if (!selftest_wait("5 empty frame")) return 0;
+	selftest_end();
+	fprintf(stderr, "[gputest] all steps finished\n");
+	return 1;
+}
+
+/* ---- per-draw GPU check (pica_set_gpu_check) -------------------------------------------------- */
+/* Each draw is submitted on its own and waited for (2 s timeout), so a draw the GPU never finishes
+ * is named in the log with its vertex layout, textures and combiner stages. Very slow; diagnosis
+ * only. */
+void pica_set_gpu_check(int on) { s_check = on; }
+
+static void describe_state(const PicaState* st)
+{
+	fprintf(stderr, "[gpucheck]   state: depth test %u func %u write %u, blend %u eq %u src %u dst %u / a eq %u src %u dst %u, "
+	        "mask %02x, cull %u, scissor %u (%u,%u)-(%u,%u), alpha test %u func %u ref %u, stages %u, buf %02x/%02x %08lx\n",
+	        st->depth_test, st->depth_func, st->depth_write, st->blend, st->blend_eq, st->blend_src, st->blend_dst,
+	        st->blend_aeq, st->blend_asrc, st->blend_adst, st->write_mask, st->cull, st->scissor, st->sc_x0, st->sc_y0,
+	        st->sc_x1, st->sc_y1, st->alpha_test, st->alpha_func, st->alpha_ref, st->nstages, st->buf_rgb, st->buf_alpha,
+	        (unsigned long)st->buf_color);
+	for (int u = 0; u < PICA_MAX_TEX; u++) {
+		const PicaTex* t = st->tex[u];
+		if (!t) continue;
+		fprintf(stderr, "[gpucheck]   texture %d: %ux%u fmt %d data %p (phys %08lx) %s, wrap %u/%u, %s\n", u,
+		        t->tex.width, t->tex.height, (int)t->tex.fmt, t->tex.data,
+		        (unsigned long)osConvertVirtToPhys(t->tex.data), t->rt ? "EFB copy" : "uploaded", st->wrap_s[u],
+		        st->wrap_t[u], st->linear[u] ? "linear" : "nearest");
+	}
+	for (int i = 0; i < st->nstages && i < PICA_MAX_STAGES; i++) {
+		const PicaTevStage* g = &st->stage[i];
+		fprintf(stderr, "[gpucheck]   stage %d: src %03x/%03x op %03x/%03x fn %u/%u scale %u/%u const %08lx\n", i,
+		        g->src_rgb, g->src_alpha, g->op_rgb, g->op_alpha, g->func_rgb, g->func_alpha, g->scale_rgb,
+		        g->scale_alpha, (unsigned long)g->color);
+	}
+}
+
+static void gpu_check(const char* kind, const PicaGxLayout* L, uint32_t nidx, const PicaState* st)
+{
+	if (!s_check || !s_in_frame) return;
+	s_checkDraws++;
+	flush_rings();
+	C3D_FrameEnd(0);
+	s_in_frame = 0;
+	s_last_valid = 0;
+	u64 t0 = osGetTime();
+	while (!frame_begin_ex(C3D_FRAME_NONBLOCK)) {
+		if (osGetTime() - t0 > 2000) {
+			fprintf(stderr, "[gpucheck] HUNG on draw %u of frame %u (%lu checked): %s, %lu indices\n",
+			        (unsigned)s_frameDraws, (unsigned)s_checkFrames, (unsigned long)s_checkDraws, kind, (unsigned long)nidx);
+			if (L)
+				fprintf(stderr, "[gpucheck]   layout: stride %u, normal %d, colour %d, tex %d %d %d, matrix %d (fixed %d)\n",
+				        L->stride, L->off_nrm, L->off_clr, L->off_tex[0], L->off_tex[1], L->off_tex[2], L->off_mtx,
+				        L->fixed_idx);
+			if (st) describe_state(st);
+			fflush(stderr);
+			s_where = "GPU check: a draw hung the GPU (see log)";
+			s_check = 0;
+			for (;;) svcSleepThread(1000000000LL); /* the GPU is gone; keep the log as it is */
+		}
+		svcSleepThread(200000);
+	}
+}

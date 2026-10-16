@@ -113,6 +113,14 @@ $(OUTPUT).elf  : $(OFILES)
 # parallel make can compile a source before its header exists.
 $(OFILES_SOURCES) : $(HFILES)
 
+# main.cpp shows the build's date and time (__DATE__/__TIME__): rebuild it every time, so the stamp
+# names this build and not the last one that happened to change main.cpp.
+ifneq ($(filter main.o,$(OFILES_SOURCES)),)
+main.o : FORCE
+FORCE:
+.PHONY: FORCE
+endif
+
 # Compile .v.pica vertex shaders to embeddable .shbin objects
 %.shbin.o %_shbin.h : %.shbin
 	@echo $(notdir $<)

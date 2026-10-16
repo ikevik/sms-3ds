@@ -153,6 +153,15 @@ void pica_present(void);
 
 /* Draws and drops made because the ring or command buffer was full (for the status screen). */
 uint32_t pica_dropped(void);
+/* For a hang report: what the renderer is doing on the game thread, and draws in this frame. */
+const char* pica_where(void);
+uint32_t pica_frame_draws(void);
+/* Runs a frame's pieces one at a time and logs which, if any, the GPU never finishes ([gputest]
+ * lines); returns 0 at the first that hangs. Call before the game thread starts. */
+int pica_selftest(void);
+/* On: every draw is submitted and waited for on its own, and one the GPU never finishes is logged
+ * ([gpucheck] lines) with its layout, textures and combiner stages. Very slow. */
+void pica_set_gpu_check(int on);
 
 #ifdef __cplusplus
 }
