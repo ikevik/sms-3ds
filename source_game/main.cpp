@@ -23,7 +23,7 @@ void GX3DS_SetDebugColors(int on);
 void GX3DS_TraceNextFrame(void);
 int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
-void GX3DS_GetPerf(float out[10]);
+void GX3DS_GetPerf(float out[11]);
 void GX3DS_SetGpuTransform(int on);
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
@@ -291,13 +291,13 @@ int main()
 		       pica_view(), pica_view_count());
 		printf("\x1b[20;0Htextures: %lu uploads, %lu KB\nEFB-copy texture draws: %lu   \n", (unsigned long)ts[0],
 		       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);
-		float pf[10];
+		float pf[11];
 		GX3DS_GetPerf(pf);
 		// Renderer profile (ms per frame, averaged over 60 frames): see gx3ds_backend.cpp.
-		printf("\x1b[24;0Hframe %5.1f ms  %4.1f fps  other %5.1f\n"
+		printf("\x1b[24;0Hframe %5.1fms %4.1ffps dec%5.1f oth%5.1f\n"
 		       "tex %4.1f tev %4.1f xform %4.1f sub %4.1f\n"
 		       "copy %4.1f present %4.1f  %4.0f draws  \n",
-		       pf[6], pf[6] > 0 ? 1000.0f / pf[6] : 0.0f, pf[7], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], pf[8]);
+		       pf[6], pf[6] > 0 ? 1000.0f / pf[6] : 0.0f, pf[10], pf[7], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], pf[8]);
 		uint32_t ps2[2];
 		GX3DS_GetPathStats(ps2);
 		printf("transform: %s  gpu %lu cpu %lu   \n", GX3DS_GetGpuTransform() ? "GPU" : "CPU", (unsigned long)ps2[0],

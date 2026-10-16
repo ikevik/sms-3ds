@@ -115,6 +115,12 @@ typedef struct {
 	float LD[4];    /* light direction, and w: how much of the shade applies (0 or 1) */
 } PicaGxUniforms;
 
+/* The free tail of this frame's vertex ring (begins a frame if none is open): a batch can be
+ * decoded there and drawn in place. pica_ring_claim then reserves the bytes it used; it fails
+ * (returns 0) when anything else took ring space meanwhile. */
+void* pica_ring_tail(uint32_t* avail);
+int pica_ring_claim(const void* p, uint32_t bytes);
+
 /* Room for raw vertex bytes and indices in this frame's ring (as pica_alloc). */
 int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx);
 /* F for GX-mode draws: the PICA projection applied after o (view space -> EFB pixels and

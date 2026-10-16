@@ -40,7 +40,70 @@ static Stats s_frame;  // the frame in progress
 
 // ---- the batch --------------------------------------------------------------------------
 static bool s_ready;
-static std::vector<uint8_t> s_vdata;   // packed vertices (layout: vtxFmtLayout(s_bfmt))
+// The batch's packed vertices (layout: vtxFmtLayout(s_bfmt)). The front half decodes them straight
+// into the free tail of the PICA vertex ring, so the GPU path draws them in place: flushBatch claims
+// the bytes before drawing, and the CPU path's output and the indices go after them. A batch that
+// outgrows the ring moves to an ordinary heap buffer (then the GPU path copies it, as before).
+class BatchBuf {
+public:
+	uint8_t* data() { return p_; }
+	const uint8_t* data() const { return p_; }
+	uint8_t* end() { return p_ + n_; }
+	size_t size() const { return n_; }
+	uint8_t& operator[](size_t i) { return p_[i]; }
+	const uint8_t& operator[](size_t i) const { return p_[i]; }
+	bool inRing() const { return ring_; }
+	void resize(size_t sz) {
+		ensure(sz);
+		n_ = sz;
+	}
+	void insert(uint8_t*, const uint8_t* b, const uint8_t* e) {
+		const size_t k = size_t(e - b), at = n_;
+		ensure(at + k);
+		memcpy(p_ + at, b, k);
+		n_ = at + k;
+	}
+	// Reserves the ring bytes of a batch about to be drawn; false when it is (now) on the heap.
+	bool claim() {
+		if (ring_ && !pica_ring_claim(p_, uint32_t(n_))) toHeap(n_);
+		return ring_;
+	}
+	void clear() {
+		n_ = 0;
+		open_ = false;
+	}
+
+private:
+	void open() {
+		uint32_t avail = 0;
+		void* t = pica_ring_tail(&avail);
+		ring_ = t != nullptr && avail >= (64u << 10);
+		if (ring_) {
+			p_ = static_cast<uint8_t*>(t);
+			cap_ = avail;
+		} else {
+			p_ = heap_.data();
+			cap_ = heap_.size();
+		}
+		open_ = true;
+	}
+	void toHeap(size_t need) {
+		if (heap_.size() < need) heap_.resize(need + need / 2 + 4096);
+		if (ring_ && n_) memcpy(heap_.data(), p_, n_);
+		ring_ = false;
+		p_ = heap_.data();
+		cap_ = heap_.size();
+	}
+	void ensure(size_t sz) {
+		if (!open_) open();
+		if (sz > cap_) toHeap(sz);
+	}
+	uint8_t* p_ = nullptr;
+	size_t n_ = 0, cap_ = 0;
+	bool ring_ = false, open_ = false;
+	std::vector<uint8_t> heap_;
+};
+static BatchBuf s_vdata;
 static std::vector<uint32_t> s_idx;    // indices into s_vdata
 static uint32_t s_bcount;              // vertices in the batch
 static uint32_t s_bstride;
@@ -54,12 +117,13 @@ static inline bool batchHasVertices() { return !s_idx.empty(); }
 // kPerfFrames frames for the status screen and logged as [perf] lines. "other" is the rest of the
 // frame: game logic, the GX front half (command parsing, vertex decoding) and waiting.
 extern "C" uint64_t svcGetSystemTick(void);
-enum PerfPhase { PERF_TEX, PERF_TEV, PERF_XFORM, PERF_SUBMIT, PERF_COPY, PERF_PRESENT, PERF_COUNT };
+enum PerfPhase { PERF_TEX, PERF_TEV, PERF_XFORM, PERF_SUBMIT, PERF_COPY, PERF_PRESENT, PERF_DECODE, PERF_COUNT };
 static uint64_t s_perfAcc[PERF_COUNT], s_perfFrameStart, s_perfWindowStart;
 static uint32_t s_perfFrames, s_perfBatches, s_perfVerts;
 static float s_perfAvgMs[PERF_COUNT + 2];  // phases, then frame and other
 static float s_perfAvgBatches, s_perfAvgVerts;
 static const uint32_t kPerfFrames = 60;
+static uint64_t s_decodeT0;  // primitiveBegin -> primitiveEnd: the GX front half decoding vertices
 static const double kTicksPerMs = 268111.856;
 struct PerfScope {
 	PerfPhase ph;
@@ -67,6 +131,23 @@ struct PerfScope {
 	explicit PerfScope(PerfPhase p) : ph(p), t0(svcGetSystemTick()) {}
 	~PerfScope() { s_perfAcc[ph] += svcGetSystemTick() - t0; }
 };
+
+// Why batches fell back to the CPU path: batches and vertices per reason over the profiler window,
+// logged with the [perf] lines.
+enum GpuFallback {
+	FB_TRACE, FB_NOCLIP, FB_SIZE, FB_PNMTX, FB_TWOCOLOURS, FB_TEXGEN_TYPE, FB_TEXGEN_PROJ, FB_TEXGEN_SRC,
+	FB_TEXMTX_VARIES, FB_POST_NORMALISE, FB_POST_PROJ, FB_LAYOUT, FB_COUNT
+};
+static const char* const kFallbackName[FB_COUNT] = {
+	"trace", "clip-off", "size", "pos-matrix>27", "two-colours", "texgen-type", "texgen-proj", "texgen-src",
+	"texmtx-varies", "post-normalise", "post-proj", "layout"};
+static uint32_t s_fbBatches[FB_COUNT], s_fbVerts[FB_COUNT];
+
+static bool gpuFail(GpuFallback why, uint32_t n) {
+	s_fbBatches[why]++;
+	s_fbVerts[why] += n;
+	return false;
+}
 
 static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
@@ -89,10 +170,19 @@ static void perfFrameEnd() {
 	s_perfAvgVerts = float(s_perfVerts / frames);
 	fprintf(stderr,
 	        "[perf] frame %.1f ms (%.1f fps) | tex %.2f tev %.2f xform %.2f submit %.2f copy %.2f present %.2f | "
-	        "other %.1f | %.0f batches %.0f verts/frame\n",
+	        "decode %.1f other %.1f | %.0f batches %.0f verts/frame\n",
 	        s_perfAvgMs[PERF_COUNT], 1000.0 / s_perfAvgMs[PERF_COUNT], s_perfAvgMs[PERF_TEX], s_perfAvgMs[PERF_TEV],
 	        s_perfAvgMs[PERF_XFORM], s_perfAvgMs[PERF_SUBMIT], s_perfAvgMs[PERF_COPY], s_perfAvgMs[PERF_PRESENT],
-	        s_perfAvgMs[PERF_COUNT + 1], s_perfAvgBatches, s_perfAvgVerts);
+	        s_perfAvgMs[PERF_DECODE], s_perfAvgMs[PERF_COUNT + 1], s_perfAvgBatches, s_perfAvgVerts);
+	char fb[256];
+	int at = 0;
+	for (int i = 0; i < FB_COUNT && at < int(sizeof fb) - 48; i++)
+		if (s_fbBatches[i])
+			at += snprintf(fb + at, sizeof fb - at, " %s %.1f/%.0fv", kFallbackName[i], s_fbBatches[i] / frames,
+			               s_fbVerts[i] / frames);
+	if (at) fprintf(stderr, "[perf]   cpu fallbacks per frame (batches/verts):%s\n", fb);
+	memset(s_fbBatches, 0, sizeof s_fbBatches);
+	memset(s_fbVerts, 0, sizeof s_fbVerts);
 	s_perfWindowStart = now;
 	memset(s_perfAcc, 0, sizeof s_perfAcc);
 	s_perfFrames = s_perfBatches = s_perfVerts = 0;
@@ -1487,10 +1577,13 @@ static bool s_gpuTransform = true;  // GX3DS_SetGpuTransform: off draws everythi
 static float s_posRows[PICA_GX_MTX_ROWS][4], s_nrmRows[PICA_GX_MTX_ROWS][4];
 static uint32_t s_gpuBatches, s_cpuBatches;
 
+
 static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevSetup& tev, bool debug,
                     PicaTex* const utex[PICA_MAX_TEX], const EfbCopy* const ucopy[PICA_MAX_TEX],
                     const int ucoord[PICA_MAX_TEX], const PicaState& st) {
-	if (s_tracing || g.xfReg[0x05] != 0 || n == 0 || n > 0xFFFF) return false;
+	if (s_tracing) return gpuFail(FB_TRACE, n);
+	if (g.xfReg[0x05] != 0) return gpuFail(FB_NOCLIP, n);
+	if (n == 0 || n > 0xFFFF) return gpuFail(FB_SIZE, n);
 	const bool hasMtx = (s_bfmt & VF_MTX) != 0, hasNrm = (s_bfmt & VF_NRM) != 0;
 	const uint32_t defPm = g.xfReg[XFR_MATIDX_A] & 63;
 	const uint32_t matA = g.xfReg[XFR_MATIDX_A], matB = g.xfReg[XFR_MATIDX_B];
@@ -1500,9 +1593,9 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	// Position matrix rows: the shader indexes rows idx..idx+2 of the 30 it holds.
 	if (hasMtx) {
 		for (uint32_t i = 0; i < n; i++)
-			if (s_vdata[size_t(i) * s_bstride + L.mtx] > PICA_GX_MTX_ROWS - 3) return false;
+			if (s_vdata[size_t(i) * s_bstride + L.mtx] > PICA_GX_MTX_ROWS - 3) return gpuFail(FB_PNMTX, n);
 	} else if (defPm > PICA_GX_MTX_ROWS - 3) {
-		return false;
+		return gpuFail(FB_PNMTX, n);
 	}
 
 	// Colour channel, as the CPU loop: rgb of channel ch, alpha of channel cha.
@@ -1511,7 +1604,7 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	               mat = g.xfReg[XFR_MAT0 + ch], amat = g.xfReg[XFR_MAT0 + cha];
 	const bool hasClr = (s_bfmt & (VF_CLR0 << ch)) != 0, hasAClr = (s_bfmt & (VF_CLR0 << cha)) != 0;
 	const bool clrFromVtx = !debug && (cctrl & 1) && hasClr, alphaFromVtx = (actrl & 1) && hasAClr;
-	if (clrFromVtx && alphaFromVtx && ch != cha) return false;  // one colour attribute
+	if (clrFromVtx && alphaFromVtx && ch != cha) return gpuFail(FB_TWOCOLOURS, n);  // one colour attribute
 	const int clrField = clrFromVtx ? ch : alphaFromVtx ? cha : -1;
 	const bool lit = (((cctrl >> 1) & 1) || debug) && hasNrm;
 
@@ -1534,43 +1627,52 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 		const int coord = ucoord[un];
 		const uint32_t tg = g.xfReg[XFR_TEXGEN + coord];
 		const uint32_t proj = (tg >> 1) & 1, form = (tg >> 2) & 1, type = (tg >> 4) & 7, row = (tg >> 7) & 31;
-		if (type != 0 || proj) return false;
+		if (proj && type == 0) return gpuFail(FB_TEXGEN_PROJ, n);
 		float* w0 = u.W[2 * un];
 		if (row == 0) {
 			w0[0] = 1;
-		} else if (row == 1) {
-			if (!hasNrm) return false;
+		} else if (row == 1 && hasNrm) {
 			w0[1] = 1;
 			needNrm = true;
 		} else if (row >= 5 && row <= 12 && (s_bfmt & (VF_TEX0 << (row - 5)))) {
 			const int a = int(row - 5);
 			int slot = 0;
 			while (slot < 3 && slotAttr[slot] >= 0 && slotAttr[slot] != a) slot++;
-			if (slot == 3) return false;
+			if (slot == 3) return gpuFail(FB_TEXGEN_SRC, n);
 			slotAttr[slot] = a;
 			if (slot < 2) w0[2 + slot] = 1;
 			else u.W[2 * un + 1][0] = 1;
-		} else {
-			return false;
+		} else if (type == 0) {
+			return gpuFail(FB_TEXGEN_SRC, n);  // a constant through the texture matrix: not expressible here
 		}
+		// (Emboss and colour texgens with any other source: the CPU path passes its default (0, 0)
+		// through, as zero weights do here.)
+		float R[2][4];
+		if (type != 0) {
+			// Emboss and colour texgens: the CPU path passes the source's (s, t) through (texCoord), so
+			// does this, with no texture or post matrix.
+			const float id[2][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}};
+			memcpy(R, id, sizeof R);
+			goto efbRect;
+		}
+		{
 		// Texture matrix: the default index, or the per-vertex one when it is the same everywhere.
 		uint32_t tm = defTex[coord];
 		if (hasMtx) {
 			tm = s_vdata[L.mtx + 1 + coord];
 			for (uint32_t i = 1; i < n; i++)
-				if (s_vdata[size_t(i) * s_bstride + L.mtx + 1 + coord] != tm) return false;
+				if (s_vdata[size_t(i) * s_bstride + L.mtx + 1 + coord] != tm) return gpuFail(FB_TEXMTX_VARIES, n);
 		}
 		const float* m = reinterpret_cast<const float*>(&g.xfMem[tm * 4]);
-		float R[2][4];
 		for (int r = 0; r < 2; r++) memcpy(R[r], m + 4 * r, 16);
 		if (row >= 5 || form == 0)  // the source's third component is 1 (AB11; texture attributes)
 			for (int r = 0; r < 2; r++) R[r][3] += R[r][2], R[r][2] = 0.f;
 		// (t0, t1, t2 = 1) through the post matrix
 		if (g.xfReg[XFR_DUALTEX] & 1) {
 			const uint32_t post = g.xfReg[XFR_POSTTEX + coord];
-			if ((post >> 8) & 1) return false;  // normalised before the post matrix
+			if ((post >> 8) & 1) return gpuFail(FB_POST_NORMALISE, n);  // normalised before the post matrix
 			const float* pm = reinterpret_cast<const float*>(&g.xfMem[0x500 + (post & 63) * 4]);
-			if (pm[8] != 0.f || pm[9] != 0.f) return false;  // a varying third component: divided per vertex
+			if (pm[8] != 0.f || pm[9] != 0.f) return gpuFail(FB_POST_PROJ, n);  // varying third component: divided per vertex
 			float c = pm[10] + pm[11];
 			float Q[2][4];
 			for (int r = 0; r < 2; r++)
@@ -1581,6 +1683,8 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 					for (int k = 0; k < 4; k++) Q[r][k] /= c;
 			memcpy(R, Q, sizeof R);
 		}
+		}
+	efbRect:
 		if (const EfbCopy* cp = ucopy[un]) {  // through the copy's source rectangle into the snapshot
 			float bs, bt, s1, t1;
 			pica_efb_uv(cp->x, cp->y, &bs, &bt);
@@ -1651,14 +1755,16 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	uint16_t* ib;
 	{
 		PerfScope ps(PERF_XFORM);
-		if (!pica_alloc_raw(n * s_bstride, nidx, &vb, &ib)) return true;  // ring full: dropped, as the CPU path
-		memcpy(vb, s_vdata.data(), size_t(n) * s_bstride);
+		const bool inPlace = s_vdata.inRing();  // decoded into the ring and claimed: drawn where it is
+		if (!pica_alloc_raw(inPlace ? 0 : n * s_bstride, nidx, &vb, &ib)) return true;  // ring full: dropped
+		if (inPlace) vb = s_vdata.data();
+		else memcpy(vb, s_vdata.data(), size_t(n) * s_bstride);
 		for (uint32_t i = 0; i < nidx; i++) ib[i] = uint16_t(s_idx[i]);
 	}
 	PerfScope ps(PERF_SUBMIT);
 	if (!pica_draw_gx(vb, n, &lay, ib, nidx, &u, dirty, s_posRows, s_nrmRows, &st)) {
 		s_xfDirty = s_xfDirty || dirty;
-		return false;
+		return gpuFail(FB_LAYOUT, n);
 	}
 	s_gpuBatches++;
 	return true;
@@ -1950,7 +2056,10 @@ static void drawBatch() {
 
 void flushBatch() {
 	if (!s_ready) return;
-	if (batchHasVertices()) drawBatch();
+	if (batchHasVertices()) {
+		s_vdata.claim();
+		drawBatch();
+	}
 	s_vdata.clear();
 	s_idx.clear();
 	s_bcount = 0;
@@ -1970,6 +2079,7 @@ uint8_t* primitiveBegin(uint8_t op, uint32_t n, uint32_t fmt, uint32_t stride) {
 	s_bstride = stride;
 	size_t at = size_t(s_bcount) * stride;
 	s_vdata.resize(at + size_t(n) * stride);
+	s_decodeT0 = svcGetSystemTick();  // the front half decodes the vertices until primitiveEnd
 	return s_vdata.data() + at;
 }
 
@@ -2021,6 +2131,10 @@ uint32_t primitiveIndices(uint8_t op, uint32_t n, uint32_t base, uint32_t* w) {
 }
 
 void primitiveEnd(uint8_t op, uint32_t n) {
+	if (s_decodeT0) {
+		s_perfAcc[PERF_DECODE] += svcGetSystemTick() - s_decodeT0;
+		s_decodeT0 = 0;
+	}
 	if (!s_ready || n == 0) return;
 	uint32_t base = s_bcount;
 	s_bcount += n;
@@ -2203,10 +2317,14 @@ void GXPC_InvalidateRange(const void* p, uint32_t n) { gx::memoryWritten(p, n); 
 
 // Averages over the last profiler window, in ms: tex, tev, xform, submit, copy, present, frame,
 // other; then batches and vertices per frame.
-void GX3DS_GetPerf(float out[10]) {
-	for (int i = 0; i < gx::PERF_COUNT + 2; i++) out[i] = gx::s_perfAvgMs[i];
-	out[gx::PERF_COUNT + 2] = gx::s_perfAvgBatches;
-	out[gx::PERF_COUNT + 3] = gx::s_perfAvgVerts;
+void GX3DS_GetPerf(float out[11]) {
+	// tex, tev, xform, submit, copy, present, frame, other, batches, verts, decode
+	for (int i = 0; i < 6; i++) out[i] = gx::s_perfAvgMs[i];
+	out[6] = gx::s_perfAvgMs[gx::PERF_COUNT];
+	out[7] = gx::s_perfAvgMs[gx::PERF_COUNT + 1];
+	out[8] = gx::s_perfAvgBatches;
+	out[9] = gx::s_perfAvgVerts;
+	out[10] = gx::s_perfAvgMs[gx::PERF_DECODE];
 }
 
 void GX3DS_SetDebugColors(int mode) {

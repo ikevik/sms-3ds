@@ -16,7 +16,7 @@
 
 /* A frame's vertices and indices live in one half of each ring; the other half belongs to the
  * frame the GPU may still be drawing. */
-#define VTX_RING_BYTES (3u << 20)
+#define VTX_RING_BYTES (5u << 20)
 #define IDX_RING_BYTES (1u << 20)
 #define CMDBUF_BYTES   (1u << 20)
 #define CMDBUF_LIMIT   0.92f /* leave room for the frame's end */
@@ -290,6 +290,22 @@ int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
 }
 
 static void apply_state(const PicaState* st);
+
+void* pica_ring_tail(uint32_t* avail)
+{
+	*avail = 0;
+	if (!pica_init()) return NULL;
+	if (!s_in_frame) frame_begin();
+	*avail = VTX_RING_BYTES - s_vused;
+	return s_vring[s_half] + s_vused;
+}
+
+int pica_ring_claim(const void* p, uint32_t bytes)
+{
+	if (!s_in_frame || p != s_vring[s_half] + s_vused || s_vused + bytes > VTX_RING_BYTES) return 0;
+	s_vused += (bytes + 15u) & ~15u;
+	return 1;
+}
 
 /* GX mode: the vertex shader's registers for each GX vertex field. */
 enum { REG_POS = 0, REG_NRM, REG_CLR, REG_TA, REG_TB, REG_TC, REG_IDX, NUM_GX_REGS };
