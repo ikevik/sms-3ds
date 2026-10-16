@@ -9,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 extern "C" {
 void port_init(int argc, char** argv);
@@ -26,7 +28,8 @@ void GX3DS_GetTexStats(uint32_t out[3]);
 void SMS_main(void);  // the decomp's main(), renamed by port_compat.h (C++ linkage)
 
 #define DISC_PATH "sdmc:/sms/GMSE01.iso"
-#define LOG_PATH  "sdmc:/sms/log.txt"
+#define SMS_DIR   "sdmc:/sms"
+#define LOG_PATH  SMS_DIR "/log.txt"
 
 static volatile int g_phase;  // 0 not started, 1 port_init, 2 SMS_main, 3 SMS_main returned
 
@@ -185,6 +188,14 @@ static void* game_thread(void*)
 	// and the game thread is never scheduled again (seen as a freeze on entering the title
 	// stage). Run silently until there is an ndsp backend and a cheaper mixer.
 	setenv("SMS_NO_AUDIO", "1", 0);
+	// Everything the game keeps lives under sdmc:/sms/, next to the disc image: the memory card
+	// (sms-pc-port's card.cpp: SMS_SAVE_DIR), settings.txt (port_runtime.cpp: SMS_SETTINGS), and,
+	// through the working directory, the relative lookups (mods/, mods/languages/,
+	// mods/hd-cutscenes/). Without this they went to a PC-style ./.local/share/sms-port path.
+	mkdir(SMS_DIR, 0777);
+	chdir(SMS_DIR "/");
+	setenv("SMS_SAVE_DIR", SMS_DIR "/card-a", 0);
+	setenv("SMS_SETTINGS", SMS_DIR "/settings.txt", 0);
 	g_phase = 1;
 	port_init(2, argv);
 	g_phase = 2;
@@ -215,7 +226,7 @@ int main()
 	printf("app mem free %lu MB\n", (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 20));
 	fprintf(stderr, "[3ds] %s 3DS, heap %lu MB, linear free %lu MB\n", isNew ? "New" : "Old",
 	        (unsigned long)(envGetHeapSize() >> 20), (unsigned long)(linearSpaceFree() >> 20));
-	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\n\n", LOG_PATH);
+	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\ntouch: top half = view, bottom = trace\n", LOG_PATH);
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
@@ -240,11 +251,17 @@ int main()
 			break;
 		if ((pressed & KEY_SELECT) && !(held & KEY_START))
 			GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);  // material, debug, opaque
-		// Touching the bottom screen cycles the top screen through the last frame's EFB copies.
-		if (pressed & KEY_L)  // log the next frame's draws (sdmc:/sms/log.txt)
-			GX3DS_TraceNextFrame();
-		if (pressed & KEY_TOUCH)
-			pica_cycle_view();
+		// Debug input stays on the touch screen, which the game does not use (its buttons all
+		// reach the game through pad_3ds.c): the top half cycles the top screen through the last
+		// frame's EFB copies, the bottom half logs the next frame's draws to sdmc:/sms/log.txt.
+		if (pressed & KEY_TOUCH) {
+			touchPosition tp;
+			hidTouchRead(&tp);
+			if (tp.py < 120)
+				pica_cycle_view();
+			else
+				GX3DS_TraceNextFrame();
+		}
 		uint32_t s[7];
 		GX3DS_GetStats(s);
 		printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
@@ -264,7 +281,7 @@ int main()
 		       (unsigned long)cs[1], (unsigned long)cs[2]);
 		uint32_t ts[3];
 		GX3DS_GetTexStats(ts);
-		printf("\x1b[22;0Htop shows: %s %d of %d  (touch: next)   \n", pica_view() ? "EFB copy" : "frame",
+		printf("\x1b[22;0Htop shows: %s %d of %d  (touch top: next)\n", pica_view() ? "EFB copy" : "frame",
 		       pica_view(), pica_view_count());
 		printf("\x1b[20;0Htextures: %lu uploads, %lu KB\nEFB-copy texture draws: %lu   \n", (unsigned long)ts[0],
 		       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);

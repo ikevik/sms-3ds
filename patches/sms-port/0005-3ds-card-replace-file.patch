@@ -1,0 +1,12 @@
+--- a/platform/card/card.cpp	2026-10-15 21:52:19
++++ b/platform/card/card.cpp	2026-10-15 21:52:19
+@@ -140,7 +140,8 @@
+ 		port_log("[card] could not write %s\n", path.c_str());
+ 		return false;
+ 	}
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__3DS__)
++	// Neither rename replaces an existing file (the 3DS's FS:RenameFile fails on one).
+ 	remove(path.c_str());
+ #endif
+ 	if (rename(tmp.c_str(), path.c_str()) != 0) {

@@ -109,6 +109,10 @@ DEPENDS := $(OFILES:.o=.d)
 $(OUTPUT).3dsx : $(OUTPUT).elf $(OUTPUT).smdh
 $(OUTPUT).elf  : $(OFILES)
 
+# Sources include generated shader headers (e.g. gx_pass_shbin.h): build those first, or a
+# parallel make can compile a source before its header exists.
+$(OFILES_SOURCES) : $(HFILES)
+
 # Compile .v.pica vertex shaders to embeddable .shbin objects
 %.shbin.o %_shbin.h : %.shbin
 	@echo $(notdir $<)
