@@ -155,17 +155,25 @@ static void release_dead(void)
 	s_ndead[0] = 0;
 }
 
-PicaTex* pica_tex_create(uint32_t w, uint32_t h)
+static PicaTex* tex_create(uint32_t w, uint32_t h, GPU_TEXCOLOR fmt, uint32_t bpp)
 {
 	if (!pica_init()) return NULL;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
 	if (!t) return NULL;
-	if (!C3D_TexInit(&t->tex, (u16)w, (u16)h, GPU_RGBA8)) {
+	if (!C3D_TexInit(&t->tex, (u16)w, (u16)h, fmt)) {
 		free(t);
 		return NULL;
 	}
-	t->bytes = w * h * 4;
+	t->bytes = w * h * bpp;
 	return t;
+}
+
+PicaTex* pica_tex_create(uint32_t w, uint32_t h) { return tex_create(w, h, GPU_RGBA8, 4); }
+PicaTex* pica_tex_create_la8(uint32_t w, uint32_t h) { return tex_create(w, h, GPU_LA8, 2); }
+void* pica_tex_data(PicaTex* t) { return t ? t->tex.data : NULL; }
+void pica_tex_written(PicaTex* t)
+{
+	if (t) GSPGPU_FlushDataCache(t->tex.data, t->bytes);
 }
 
 /* The PICA stores textures in 8x8 tiles, texels in Morton (Z) order inside a tile, tile rows

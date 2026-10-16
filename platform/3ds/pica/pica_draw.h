@@ -79,6 +79,12 @@ int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx);
 PicaTex* pica_tex_create(uint32_t w, uint32_t h);
 void pica_tex_upload(PicaTex* t, const uint8_t* rgba);
 void pica_tex_free(PicaTex* t);
+/* LA8 textures (16 bits per texel), written directly: pica_tex_data is the texture's memory in the
+ * PICA's tiled layout (8x8 tiles, Morton order, rows from the image's bottom); pica_tex_written
+ * makes the writes visible to the GPU. */
+PicaTex* pica_tex_create_la8(uint32_t w, uint32_t h);
+void* pica_tex_data(PicaTex* t);
+void pica_tex_written(PicaTex* t);
 uint32_t pica_tex_bytes(const PicaTex* t);
 
 /* EFB copies: a copy texture is a whole-EFB snapshot (texture copy of the EFB render target).

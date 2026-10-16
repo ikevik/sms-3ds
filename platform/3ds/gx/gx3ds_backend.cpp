@@ -395,6 +395,38 @@ static void evictTextures() {
 	}
 }
 
+// GX I8 (8x4 tiles of 8-bit intensity) straight into a PICA LA8 texture of pw x ph (nearest
+// resample), one pass, no RGBA step: the PICA's tiles are 8x8 in Morton order with rows from the
+// image's bottom (as pica_tex_upload stores them). L = A = I is how GX samples I8 (I, I, I, I).
+static inline uint32_t morton8(uint32_t x, uint32_t y) {
+	return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+}
+
+static void uploadI8(const uint8_t* src, uint32_t w, uint32_t h, PicaTex* t, uint32_t pw, uint32_t ph) {
+	uint16_t* dst = static_cast<uint16_t*>(pica_tex_data(t));
+	if (!dst) return;
+	const uint32_t tileCols = (w + 7) / 8;
+	static std::vector<uint32_t> colSrc, colDst;  // per output column: source offset within a tile row, destination
+	colSrc.resize(pw);
+	colDst.resize(pw);
+	for (uint32_t x = 0; x < pw; x++) {
+		const uint32_t sx = x * w / pw;
+		colSrc[x] = (sx >> 3) * 32 + (sx & 7);
+		colDst[x] = (x >> 3) * 64;
+	}
+	for (uint32_t ry = 0; ry < ph; ry++) {
+		const uint32_t sy = (ph - 1 - ry) * h / ph;  // stored row ry holds image row ph - 1 - ry
+		const uint8_t* srow = src + size_t(sy >> 2) * tileCols * 32 + (sy & 3) * 8;
+		uint16_t* drow = dst + size_t(ry >> 3) * (pw >> 3) * 64;
+		const uint32_t my = ry & 7;
+		for (uint32_t x = 0; x < pw; x++) {
+			const uint16_t i = srow[colSrc[x]];
+			drow[colDst[x] + morton8(x & 7, my)] = uint16_t(i | i << 8);
+		}
+	}
+	pica_tex_written(t);
+}
+
 // The PICA texture for GX texture map `map`, or null (no data, out of memory). *copy is set
 // when the map is an EFB copy.
 static PicaTex* textureForMap(int map, const EfbCopy** copy) {
@@ -424,22 +456,37 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	// nothing reported. TLUTs live in TMEM, rewritten by register loads: always hashed (small).
 	const uint64_t th = tlut ? hashBytes(tlut, tlutBytes) : 0;
 	e.checkedFrame = g_displayFrames;
-	if (e.tex && th == e.tlutHash && trustWriteStamps() && g_displayFrames - e.hashedFrame < kRecheckFrames &&
+	const bool stamps = trustWriteStamps();
+	if (e.tex && th == e.tlutHash && stamps && g_displayFrames - e.hashedFrame < kRecheckFrames &&
 	    unwrittenSince(ptr, bytes, e.hashedClock))
 		return e.tex;
+	// Data the write stamps say the game rewrote (streamed textures, such as THP movie frames every
+	// frame) is uploaded without hashing it first: it has almost always changed. Memory outside the
+	// stamped range (unwrittenSince(p, 0, 0) false) is always hashed.
+	const bool rewritten = e.tex && stamps && th == e.tlutHash && unwrittenSince(ptr, 0, 0) &&
+	                       !unwrittenSince(ptr, bytes, e.hashedClock);
 	e.hashedClock = writeClock();
 	e.hashedFrame = g_displayFrames;
-	const uint64_t dh = hashBytes(ptr, bytes);
-	if (e.tex && dh == e.dataHash && th == e.tlutHash) return e.tex;
+	const uint64_t dh = rewritten ? 0 : hashBytes(ptr, bytes);
+	if (!rewritten && e.tex && dh == e.dataHash && th == e.tlutHash) return e.tex;
 
 	const uint32_t pw = pow2Side(w), ph = pow2Side(h);
+	const bool la8 = fmt == 1;  // I8: decoded straight into an LA8 texture (I, I), as GX samples it
 	if (!e.tex) {
-		e.tex = pica_tex_create(pw, ph);
+		e.tex = la8 ? pica_tex_create_la8(pw, ph) : pica_tex_create(pw, ph);
 		if (!e.tex) {
 			s_texCache.erase(key);
 			return nullptr;
 		}
 		s_texBytes += pica_tex_bytes(e.tex);
+	}
+	if (la8) {
+		uploadI8(ptr, w, h, e.tex, pw, ph);
+		e.dataHash = dh;
+		e.tlutHash = th;
+		s_texUploads++;
+		evictTextures();
+		return e.tex;
 	}
 	s_decodeBuf.resize(size_t(w) * h * 4);
 	decodeTexture(ptr, fmt, w, h, tlut, key.tlutFmt, s_decodeBuf.data());
@@ -454,7 +501,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		src = s_scaleBuf.data();
 	}
 	pica_tex_upload(e.tex, src);
-	{  // average colour, for the draw trace
+	if (s_tracing || s_traceArm) {  // average colour, for the draw trace
 		uint64_t sum[4] = {0, 0, 0, 0};
 		const size_t px = size_t(pw) * ph;
 		for (size_t i = 0; i < px; i++)
