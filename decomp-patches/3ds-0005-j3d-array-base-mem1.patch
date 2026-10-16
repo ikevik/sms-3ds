@@ -1,0 +1,16 @@
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DTevs.cpp	2026-10-15 21:32:54
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DTevs.cpp	2026-10-15 21:32:54
+@@ -56,7 +56,13 @@
+ 	u32 a = attr == GX_VA_NBT ? 1 : attr - 9;
+ 	GXCmd1u8(8);
+ 	GXCmd1u8(a + 0xA0);
++#if defined(__3DS__)
++	/* MEM1 is not at 0x80000000 here: the CP wants the offset into the MEM1 block, which the
++	 * GameCube mask (cached -> physical) does not give. The vertex arrays came out unmapped. */
++	GXCmd1u32(OSCachedToPhysical(ptr));
++#else
+ 	GXCmd1u32((u32)ptr & 0x7fffffff);
++#endif
+ }
+ 
+ void J3DSetVtxAttrFmtv(GXVtxFmt vtxfmt, GXVtxAttrFmtList* list, bool param_3)
