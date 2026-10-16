@@ -1,13 +1,30 @@
-; GX pass-through vertex shader (platform/3ds/pica/pica_draw.c).
-; The CPU has already applied the GameCube's position matrix, projection and viewport:
-; v0 is a homogeneous position in EFB pixels with the GameCube depth in z, v1-v3 the texture
-; coordinates of texture units 0-2, v4 a 0..255 colour.
-; `projection` maps EFB pixels onto the rotated top screen and z onto the PICA's depth range.
+; GX vertex shader (platform/3ds/pica/pica_draw.c), two modes chosen by the `cpu` bool.
+;
+; cpu = true: the CPU has already applied the GameCube's position matrix, projection and
+;   viewport. v0 is a homogeneous position in EFB pixels with the GameCube depth in z, v1-v3 the
+;   texture coordinates of units 0-2, v4 a 0..255 colour. F is the EFB-pixels -> PICA projection.
+;
+; cpu = false: GameCube vertices as the GX front half decoded them, transformed here.
+;   v0 position (x, y, z), v1 normal, v2 the colour channel's colour (0..255), v3-v5 up to three
+;   texture coordinate attributes (s, t), v6 the position matrix row index (GX PNMTX: 0, 3, ..27).
+;   P: position matrix rows 0-29 (XF memory words 0-119), N: normal matrix rows 0-29 (3x3, w 0).
+;   F: view space -> clip (GX projection, viewport and the PICA projection, composed on the CPU).
+;   Texture unit u: source = W[2u].x pos + W[2u].y normal + W[2u].z v3 + W[2u].w v4 + W[2u+1].x v5,
+;   coordinate = (T[2u] . source, T[2u+1] . source) (texgen, texture/post matrix, EFB copy rect).
+;   Colour = v2 / 255 * CS + CM, rgb times the shade 1 + LD.w * (0.35 + 0.65 max(N.LD, 0) - 1).
 
-.fvec projection[4]
+.fvec F[4]
+.fvec P[30]
+.fvec N[30]
+.fvec T[6]
+.fvec W[6]
+.fvec CS
+.fvec CM
+.fvec LD
+.bool cpu
 
-.constf myconst(0.00392156862745098, 0.0, 0.0, 0.0)
-.alias  inv255 myconst.xxxx
+.constf k0(1.0, 0.0, 0.35, 0.65)
+.constf k1(0.00392156862745098, 1e-20, 0.0, 0.0)
 
 .out outpos position
 .out outtc0 texcoord0
@@ -15,22 +32,82 @@
 .out outtc2 texcoord2
 .out outclr color
 
-.alias inpos v0
-.alias intc0 v1
-.alias intc1 v2
-.alias intc2 v3
-.alias inclr v4
-
 .proc main
-	dp4 outpos.x, projection[0], inpos
-	dp4 outpos.y, projection[1], inpos
-	dp4 outpos.z, projection[2], inpos
-	dp4 outpos.w, projection[3], inpos
+	ifu cpu
+		dp4 outpos.x, F[0], v0
+		dp4 outpos.y, F[1], v0
+		dp4 outpos.z, F[2], v0
+		dp4 outpos.w, F[3], v0
+		mov outtc0, v1
+		mov outtc1, v2
+		mov outtc2, v3
+		mul outclr, k1.xxxx, v4
+	.else
+		; position: view = P[idx..idx+2] . (pos, 1); clip = F . view
+		mova a0.x, v6.x
+		mov r0.xyz, v0
+		mov r0.w, k0.x
+		dp4 r1.x, P[a0.x], r0
+		dp4 r1.y, P[a0.x+1], r0
+		dp4 r1.z, P[a0.x+2], r0
+		mov r1.w, k0.x
+		dp4 outpos.x, F[0], r1
+		dp4 outpos.y, F[1], r1
+		dp4 outpos.z, F[2], r1
+		dp4 outpos.w, F[3], r1
 
-	mov outtc0, intc0
-	mov outtc1, intc1
-	mov outtc2, intc2
-	mul outclr, inv255, inclr
+		; shade from the view-space normal (one fixed light, as the CPU path)
+		mov r2.xyz, v1
+		mov r2.w, k0.y
+		dp4 r3.x, N[a0.x], r2
+		dp4 r3.y, N[a0.x+1], r2
+		dp4 r3.z, N[a0.x+2], r2
+		dp3 r4.x, r3, r3
+		max r4.x, k1.yyyy, r4.x
+		rsq r4.x, r4.x
+		mul r3.xyz, r4.xxx, r3.xyz
+		dp3 r4.y, LD, r3
+		max r4.y, k0.yyyy, r4.y
+		mul r4.y, k0.wwww, r4.y
+		add r4.y, k0.zzzz, r4.y
+		add r4.y, -k0.xxxx, r4.y
+		mul r4.y, LD.wwww, r4.y
+		add r4.y, k0.xxxx, r4.y
 
+		; colour
+		mul r5, k1.xxxx, v2
+		mul r5, CS, r5
+		add r5, CM, r5
+		mul r5.xyz, r4.yyy, r5.xyz
+		mov outclr, r5
+
+		; texture sources: r0 = (pos, 1), r6 = (normal, 1)
+		mov r6.xyz, v1
+		mov r6.w, k0.x
+
+		mul r7, W[0].xxxx, r0
+		mad r7, r6, W[0].yyyy, r7
+		mad r7, v3, W[0].zzzz, r7
+		mad r7, v4, W[0].wwww, r7
+		mad r7, v5, W[1].xxxx, r7
+		dp4 outtc0.x, T[0], r7
+		dp4 outtc0.y, T[1], r7
+
+		mul r7, W[2].xxxx, r0
+		mad r7, r6, W[2].yyyy, r7
+		mad r7, v3, W[2].zzzz, r7
+		mad r7, v4, W[2].wwww, r7
+		mad r7, v5, W[3].xxxx, r7
+		dp4 outtc1.x, T[2], r7
+		dp4 outtc1.y, T[3], r7
+
+		mul r7, W[4].xxxx, r0
+		mad r7, r6, W[4].yyyy, r7
+		mad r7, v3, W[4].zzzz, r7
+		mad r7, v4, W[4].wwww, r7
+		mad r7, v5, W[5].xxxx, r7
+		dp4 outtc2.x, T[4], r7
+		dp4 outtc2.y, T[5], r7
+	.end
 	end
 .end

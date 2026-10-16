@@ -94,6 +94,39 @@ int pica_cycle_view(void);
 int pica_view(void);
 int pica_view_count(void);
 
+/* ---- GX mode: GameCube vertices transformed by the vertex shader -------------------------
+ * The vertices are the GX front half's packed format (position at 0; see gx_internal.h
+ * VtxFmtLayout); fields the draw does not use are skipped. Offsets are -1 for absent fields:
+ * those read fixed values (normal (0, 0, 1), matrix index fixed_idx). */
+#define PICA_GX_MTX_ROWS 30 /* XF position/normal matrix rows the shader can index (PNMTX0-9) */
+
+typedef struct {
+	uint16_t stride;
+	int16_t off_nrm, off_clr, off_tex[3], off_mtx;
+	int16_t fixed_idx;
+} PicaGxLayout;
+
+typedef struct {
+	float F[4][4];  /* view space -> clip: pica_gx_projection */
+	float T[6][4];  /* texture unit u: rows 2u, 2u+1 over its source vector */
+	float W[6][4];  /* unit u's source: W[2u] = (pos, normal, tex a, tex b), W[2u+1].x = tex c */
+	float CS[4];    /* colour = vertex colour * CS + CM (0..1) */
+	float CM[4];
+	float LD[4];    /* light direction, and w: how much of the shade applies (0 or 1) */
+} PicaGxUniforms;
+
+/* Room for raw vertex bytes and indices in this frame's ring (as pica_alloc). */
+int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx);
+/* F for GX-mode draws: the PICA projection applied after o (view space -> EFB pixels and
+ * GameCube depth, homogeneous; rows). */
+void pica_gx_projection(const float o[4][4], PicaGxUniforms* u);
+/* Draws GX-mode triangles. pos_rows/nrm_rows are XF matrix rows 0-29 (normal rows padded),
+ * uploaded when matrices_dirty. Returns 0 when the layout cannot be expressed (draw it in CPU
+ * mode instead). */
+int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
+                 const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
+                 const PicaState* st);
+
 /* Draws triangles from the last pica_alloc. */
 void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nidx, const PicaState* st);
 

@@ -33,7 +33,15 @@ static C3D_RenderTarget* s_efb;
 static C3D_Tex s_efbTex;
 static DVLB_s* s_dvlb;
 static shaderProgram_s s_prog;
-static int s_uProj;
+/* Vertex shader uniforms (shaders/gx_pass.v.pica) and the vertex mode they are set up for. */
+static int s_uF, s_uP, s_uN, s_uT, s_uW, s_uCS, s_uCM, s_uLD, s_bCpu;
+enum { MODE_NONE = -1, MODE_CPU = 0, MODE_GX = 1 };
+static int s_mode = MODE_NONE;
+static const C3D_Mtx* s_cpuProj; /* what F holds in CPU mode */
+static int s_fIsCpu;              /* F currently holds s_cpuProj */
+static PicaGxLayout s_gxLayout;   /* attribute setup of the last GX-mode draw */
+static int s_gxLayoutValid;
+static int s_gxMatricesLoaded;
 static C3D_Mtx s_projTop; /* EFB pixels onto the rotated top screen (the present quad) */
 static C3D_Mtx s_projEfb; /* EFB pixels onto the EFB texture (game draws) */
 
@@ -71,15 +79,18 @@ int pica_init(void)
 	shaderProgramInit(&s_prog);
 	shaderProgramSetVsh(&s_prog, &s_dvlb->DVLE[0]);
 	C3D_BindProgram(&s_prog);
-	s_uProj = shaderInstanceGetUniformLocation(s_prog.vertexShader, "projection");
-
-	C3D_AttrInfo* ai = C3D_GetAttrInfo();
-	AttrInfo_Init(ai);
-	AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4);          /* v0: position (EFB pixels, homogeneous) */
-	AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);          /* v1-v3: texture coordinates 0-2 */
-	AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 2);
-	AttrInfo_AddLoader(ai, 3, GPU_FLOAT, 2);
-	AttrInfo_AddLoader(ai, 4, GPU_UNSIGNED_BYTE, 4);  /* v4: colour 0..255 */
+	{
+		shaderInstance_s* vs = s_prog.vertexShader;
+		s_uF = shaderInstanceGetUniformLocation(vs, "F");
+		s_uP = shaderInstanceGetUniformLocation(vs, "P");
+		s_uN = shaderInstanceGetUniformLocation(vs, "N");
+		s_uT = shaderInstanceGetUniformLocation(vs, "T");
+		s_uW = shaderInstanceGetUniformLocation(vs, "W");
+		s_uCS = shaderInstanceGetUniformLocation(vs, "CS");
+		s_uCM = shaderInstanceGetUniformLocation(vs, "CM");
+		s_uLD = shaderInstanceGetUniformLocation(vs, "LD");
+		s_bCpu = shaderInstanceGetUniformLocation(vs, "cpu");
+	}
 
 	if (!C3D_TexInitVRAM(&s_efbTex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) goto fail;
 	s_efb = C3D_RenderTargetCreateFromTex(&s_efbTex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
@@ -195,6 +206,34 @@ void pica_tex_free(PicaTex* t)
 
 uint32_t pica_tex_bytes(const PicaTex* t) { return t ? t->bytes : 0; }
 
+/* ---- vertex modes ---------------------------------------------------------------------- */
+static void set_cpu_proj(const C3D_Mtx* m)
+{
+	s_cpuProj = m;
+	s_fIsCpu = 0;
+}
+
+/* CPU mode: PicaVtx vertices (v0 position, v1-v3 texture coordinates, v4 colour). */
+static void cpu_mode(void)
+{
+	if (s_mode != MODE_CPU) {
+		C3D_AttrInfo* ai = C3D_GetAttrInfo();
+		AttrInfo_Init(ai);
+		AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4);          /* v0: position (EFB pixels, homogeneous) */
+		AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2);          /* v1-v3: texture coordinates 0-2 */
+		AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 2);
+		AttrInfo_AddLoader(ai, 3, GPU_FLOAT, 2);
+		AttrInfo_AddLoader(ai, 4, GPU_UNSIGNED_BYTE, 4);  /* v4: colour 0..255 */
+		C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bCpu, true);
+		s_mode = MODE_CPU;
+		s_gxLayoutValid = 0;
+	}
+	if (!s_fIsCpu && s_cpuProj) {
+		C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uF, s_cpuProj);
+		s_fIsCpu = 1;
+	}
+}
+
 static void frame_begin(void)
 {
 	/* No C3D_FRAME_SYNCDRAW: that waits for the 3DS's vblank, and this runs on the game thread
@@ -212,7 +251,7 @@ static void frame_begin(void)
 		s_clear_pending = 0;
 	}
 	C3D_FrameDrawOn(s_efb);
-	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uProj, &s_projEfb);
+	set_cpu_proj(&s_projEfb);
 	s_in_frame = 1;
 }
 
@@ -232,6 +271,143 @@ int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx)
 	s_vused += (vbytes + 15u) & ~15u;
 	s_iused += ibytes;
 	return 1;
+}
+
+int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
+{
+	if (!pica_init()) return 0;
+	if (!s_in_frame) frame_begin();
+	uint32_t ibytes = (nidx * 2u + 3u) & ~3u;
+	if (s_vused + vbytes > VTX_RING_BYTES || s_iused + ibytes > IDX_RING_BYTES || C3D_GetCmdBufUsage() > CMDBUF_LIMIT) {
+		s_dropped++;
+		return 0;
+	}
+	*verts = s_vring[s_half] + s_vused;
+	*idx = (uint16_t*)(s_iring[s_half] + s_iused);
+	s_vused += (vbytes + 15u) & ~15u;
+	s_iused += ibytes;
+	return 1;
+}
+
+static void apply_state(const PicaState* st);
+
+/* GX mode: the vertex shader's registers for each GX vertex field. */
+enum { REG_POS = 0, REG_NRM, REG_CLR, REG_TA, REG_TB, REG_TC, REG_IDX, NUM_GX_REGS };
+
+/* Sets up the attribute loaders for a GX vertex layout: the fields the draw uses are read from the
+ * buffer in memory order, gaps skipped with padding entries (4-16 bytes each), absent fields given
+ * fixed values. Returns the buffer's attribute count and permutation, or 0 when the layout needs
+ * more entries than the PICA's 12. */
+static int gx_attribs(const PicaGxLayout* L, u64* perm)
+{
+	struct Field { int off, size, reg, fmt, count; } f[NUM_GX_REGS];
+	int nf = 0;
+	const int offs[NUM_GX_REGS] = {0, L->off_nrm, L->off_clr, L->off_tex[0], L->off_tex[1], L->off_tex[2], L->off_mtx};
+	static const int sizes[NUM_GX_REGS] = {12, 12, 4, 8, 8, 8, 1};
+	static const int fmts[NUM_GX_REGS] = {GPU_FLOAT, GPU_FLOAT, GPU_UNSIGNED_BYTE, GPU_FLOAT, GPU_FLOAT, GPU_FLOAT,
+	                                      GPU_UNSIGNED_BYTE};
+	static const int counts[NUM_GX_REGS] = {3, 3, 4, 2, 2, 2, 1};
+	for (int r = 0; r < NUM_GX_REGS; r++)
+		if (offs[r] >= 0) f[nf++] = (struct Field){offs[r], sizes[r], r, fmts[r], counts[r]};
+	/* memory order (insertion sort: at most 7 fields) */
+	for (int i = 1; i < nf; i++)
+		for (int j = i; j > 0 && f[j].off < f[j - 1].off; j--) {
+			struct Field t = f[j];
+			f[j] = f[j - 1];
+			f[j - 1] = t;
+		}
+	C3D_AttrInfo* ai = C3D_GetAttrInfo();
+	AttrInfo_Init(ai);
+	u64 p = 0;
+	int entries = 0, at = 0;
+	for (int i = 0; i < nf; i++) {
+		int gap = f[i].off - at;
+		while (gap > 0) {
+			int chunk = gap > 16 ? 16 : gap;
+			if (chunk & 3 || entries >= 12) return 0;
+			p |= (u64)(0xB + chunk / 4) << (4 * entries++); /* 0xC..0xF: 4..16 bytes of padding */
+			gap -= chunk;
+		}
+		int attr = AttrInfo_AddLoader(ai, f[i].reg, (GPU_FORMATS)f[i].fmt, f[i].count);
+		if (attr < 0 || entries >= 12) return 0;
+		p |= (u64)attr << (4 * entries++);
+		at = f[i].off + f[i].size;
+	}
+	for (int r = 0; r < NUM_GX_REGS; r++)
+		if (offs[r] < 0) {
+			int attr = AttrInfo_AddFixed(ai, r);
+			if (attr < 0) return 0;
+			if (r == REG_IDX)
+				C3D_FixedAttribSet(attr, (float)L->fixed_idx, 0.0f, 0.0f, 1.0f);
+			else if (r == REG_NRM)
+				C3D_FixedAttribSet(attr, 0.0f, 0.0f, 1.0f, 0.0f);
+			else
+				C3D_FixedAttribSet(attr, 0.0f, 0.0f, 0.0f, 1.0f);
+		}
+	*perm = p;
+	return entries;
+}
+
+static int s_gxEntries;
+static u64 s_gxPerm;
+
+int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
+                 const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
+                 const PicaState* st)
+{
+	(void)nverts;
+	if (!s_in_frame || nidx == 0) return 1;
+	if (s_mode != MODE_GX || !s_gxLayoutValid || memcmp(L, &s_gxLayout, sizeof *L) != 0) {
+		u64 perm;
+		int n = gx_attribs(L, &perm);
+		if (!n) {
+			s_gxLayoutValid = 0;
+			s_mode = MODE_NONE; /* the attribute setup was overwritten */
+			return 0;
+		}
+		s_gxEntries = n;
+		s_gxPerm = perm;
+		s_gxLayout = *L;
+		s_gxLayoutValid = 1;
+		if (s_mode != MODE_GX) {
+			C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bCpu, false);
+			s_mode = MODE_GX;
+		}
+		matrices_dirty = matrices_dirty || !s_gxMatricesLoaded;
+	}
+	apply_state(st);
+	if (matrices_dirty || !s_gxMatricesLoaded) {
+		for (int r = 0; r < PICA_GX_MTX_ROWS; r++) {
+			C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uP + r, pos_rows[r][0], pos_rows[r][1], pos_rows[r][2], pos_rows[r][3]);
+			C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uN + r, nrm_rows[r][0], nrm_rows[r][1], nrm_rows[r][2], 0.0f);
+		}
+		s_gxMatricesLoaded = 1;
+	}
+	for (int r = 0; r < 4; r++) C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uF + r, u->F[r][0], u->F[r][1], u->F[r][2], u->F[r][3]);
+	s_fIsCpu = 0;
+	for (int r = 0; r < 6; r++) {
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uT + r, u->T[r][0], u->T[r][1], u->T[r][2], u->T[r][3]);
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uW + r, u->W[r][0], u->W[r][1], u->W[r][2], u->W[r][3]);
+	}
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uLD, u->LD[0], u->LD[1], u->LD[2], u->LD[3]);
+	C3D_BufInfo* bi = C3D_GetBufInfo();
+	BufInfo_Init(bi);
+	BufInfo_Add(bi, verts, L->stride, s_gxEntries, s_gxPerm);
+	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
+	return 1;
+}
+
+void pica_gx_projection(const float o[4][4], PicaGxUniforms* u)
+{
+	/* F = PICA projection (EFB pixels -> clip) x O (view -> EFB pixels, homogeneous) */
+	const C3D_Mtx* m = &s_projEfb;
+	for (int i = 0; i < 4; i++) {
+		const float mi[4] = {m->r[i].x, m->r[i].y, m->r[i].z, m->r[i].w};
+		for (int j = 0; j < 4; j++)
+			u->F[i][j] = mi[0] * o[0][j] + mi[1] * o[1][j] + mi[2] * o[2][j] + mi[3] * o[3][j];
+	}
 }
 
 /* Stages from `first` on pass the previous stage through, and the combiner buffer is not
@@ -305,6 +481,7 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 {
 	if (!s_in_frame || nidx == 0) return;
 	apply_state(st);
+	cpu_mode();
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, verts, sizeof(PicaVtx), 5, 0x43210);
@@ -357,6 +534,7 @@ void pica_clear_rect(float x, float y, float w, float h, uint32_t rgba, uint32_t
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 	C3D_DepthTest(true, GPU_ALWAYS, GPU_WRITE_ALL);
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+	cpu_mode();
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, v, sizeof(PicaVtx), 5, 0x43210);
@@ -440,6 +618,7 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 	C3D_AlphaTest(false, GPU_ALWAYS, 0);
 	C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL & ~GPU_WRITE_DEPTH);
 	C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+	cpu_mode();
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, v, sizeof(PicaVtx), 5, 0x43210);
@@ -467,7 +646,7 @@ void pica_present(void)
 
 	/* The EFB texture as one quad over the whole top screen. */
 	C3D_FrameDrawOn(s_top);
-	C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uProj, &s_projTop);
+	set_cpu_proj(&s_projTop);
 	C3D_Tex* show = &s_efbTex;
 	if (s_view > 0 && s_view <= s_nLastFrameCopies) show = &s_lastFrameCopies[s_view - 1]->tex;
 	draw_efb_quad(1, show);

@@ -1475,6 +1475,195 @@ static uint64_t tevCacheKey(const bool pwhite[kMaxPairs], int nPairs, const Pica
 	return h;
 }
 
+// ---- GPU vertex transform ---------------------------------------------------------------------
+// The common case of drawTriangles' CPU loop, done by the vertex shader (shaders/gx_pass.v.pica,
+// GX mode): the batch's packed vertices go to the GPU as they are, with XF position/normal
+// matrix rows 0-29 as uniforms indexed per vertex, the GX projection and viewport composed into
+// one matrix, and each texture unit's texgen, texture matrix, post matrix and EFB-copy rectangle
+// composed into two rows. Batches it cannot express exactly (projected texture coordinates, a
+// texture matrix index that varies per vertex, clipping off, ...) stay on the CPU path.
+static bool s_xfDirty = true;
+static bool s_gpuTransform = true;  // GX3DS_SetGpuTransform: off draws everything on the CPU path
+static float s_posRows[PICA_GX_MTX_ROWS][4], s_nrmRows[PICA_GX_MTX_ROWS][4];
+static uint32_t s_gpuBatches, s_cpuBatches;
+
+static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevSetup& tev, bool debug,
+                    PicaTex* const utex[PICA_MAX_TEX], const EfbCopy* const ucopy[PICA_MAX_TEX],
+                    const int ucoord[PICA_MAX_TEX], const PicaState& st) {
+	if (s_tracing || g.xfReg[0x05] != 0 || n == 0 || n > 0xFFFF) return false;
+	const bool hasMtx = (s_bfmt & VF_MTX) != 0, hasNrm = (s_bfmt & VF_NRM) != 0;
+	const uint32_t defPm = g.xfReg[XFR_MATIDX_A] & 63;
+	const uint32_t matA = g.xfReg[XFR_MATIDX_A], matB = g.xfReg[XFR_MATIDX_B];
+	const uint8_t defTex[8] = {uint8_t((matA >> 6) & 63),  uint8_t((matA >> 12) & 63), uint8_t((matA >> 18) & 63),
+	                           uint8_t((matA >> 24) & 63), uint8_t(matB & 63),         uint8_t((matB >> 6) & 63),
+	                           uint8_t((matB >> 12) & 63), uint8_t((matB >> 18) & 63)};
+	// Position matrix rows: the shader indexes rows idx..idx+2 of the 30 it holds.
+	if (hasMtx) {
+		for (uint32_t i = 0; i < n; i++)
+			if (s_vdata[size_t(i) * s_bstride + L.mtx] > PICA_GX_MTX_ROWS - 3) return false;
+	} else if (defPm > PICA_GX_MTX_ROWS - 3) {
+		return false;
+	}
+
+	// Colour channel, as the CPU loop: rgb of channel ch, alpha of channel cha.
+	const int ch = debug ? 0 : tev.rasRgbChan, cha = debug ? 0 : tev.rasAChan;
+	const uint32_t cctrl = g.xfReg[XFR_COLOR0CTRL + ch], actrl = g.xfReg[XFR_ALPHA0CTRL + cha],
+	               mat = g.xfReg[XFR_MAT0 + ch], amat = g.xfReg[XFR_MAT0 + cha];
+	const bool hasClr = (s_bfmt & (VF_CLR0 << ch)) != 0, hasAClr = (s_bfmt & (VF_CLR0 << cha)) != 0;
+	const bool clrFromVtx = !debug && (cctrl & 1) && hasClr, alphaFromVtx = (actrl & 1) && hasAClr;
+	if (clrFromVtx && alphaFromVtx && ch != cha) return false;  // one colour attribute
+	const int clrField = clrFromVtx ? ch : alphaFromVtx ? cha : -1;
+	const bool lit = (((cctrl >> 1) & 1) || debug) && hasNrm;
+
+	PicaGxUniforms u;
+	memset(&u, 0, sizeof u);
+	PicaGxLayout lay;
+	memset(&lay, 0, sizeof lay);
+	lay.stride = uint16_t(s_bstride);
+	lay.off_nrm = lay.off_clr = lay.off_mtx = -1;
+	lay.off_tex[0] = lay.off_tex[1] = lay.off_tex[2] = -1;
+	lay.fixed_idx = int16_t(defPm);
+	if (hasMtx) lay.off_mtx = int16_t(L.mtx);
+	if (clrField >= 0) lay.off_clr = int16_t(L.clr[clrField]);
+	bool needNrm = lit;
+
+	// Texture units: source selection and the composed rows.
+	int slotAttr[3] = {-1, -1, -1};  // texture coordinate attribute (0-7) in source slots a, b, c
+	for (int un = 0; un < PICA_MAX_TEX; un++) {
+		if (!utex[un]) continue;
+		const int coord = ucoord[un];
+		const uint32_t tg = g.xfReg[XFR_TEXGEN + coord];
+		const uint32_t proj = (tg >> 1) & 1, form = (tg >> 2) & 1, type = (tg >> 4) & 7, row = (tg >> 7) & 31;
+		if (type != 0 || proj) return false;
+		float* w0 = u.W[2 * un];
+		if (row == 0) {
+			w0[0] = 1;
+		} else if (row == 1) {
+			if (!hasNrm) return false;
+			w0[1] = 1;
+			needNrm = true;
+		} else if (row >= 5 && row <= 12 && (s_bfmt & (VF_TEX0 << (row - 5)))) {
+			const int a = int(row - 5);
+			int slot = 0;
+			while (slot < 3 && slotAttr[slot] >= 0 && slotAttr[slot] != a) slot++;
+			if (slot == 3) return false;
+			slotAttr[slot] = a;
+			if (slot < 2) w0[2 + slot] = 1;
+			else u.W[2 * un + 1][0] = 1;
+		} else {
+			return false;
+		}
+		// Texture matrix: the default index, or the per-vertex one when it is the same everywhere.
+		uint32_t tm = defTex[coord];
+		if (hasMtx) {
+			tm = s_vdata[L.mtx + 1 + coord];
+			for (uint32_t i = 1; i < n; i++)
+				if (s_vdata[size_t(i) * s_bstride + L.mtx + 1 + coord] != tm) return false;
+		}
+		const float* m = reinterpret_cast<const float*>(&g.xfMem[tm * 4]);
+		float R[2][4];
+		for (int r = 0; r < 2; r++) memcpy(R[r], m + 4 * r, 16);
+		if (row >= 5 || form == 0)  // the source's third component is 1 (AB11; texture attributes)
+			for (int r = 0; r < 2; r++) R[r][3] += R[r][2], R[r][2] = 0.f;
+		// (t0, t1, t2 = 1) through the post matrix
+		if (g.xfReg[XFR_DUALTEX] & 1) {
+			const uint32_t post = g.xfReg[XFR_POSTTEX + coord];
+			if ((post >> 8) & 1) return false;  // normalised before the post matrix
+			const float* pm = reinterpret_cast<const float*>(&g.xfMem[0x500 + (post & 63) * 4]);
+			if (pm[8] != 0.f || pm[9] != 0.f) return false;  // a varying third component: divided per vertex
+			float c = pm[10] + pm[11];
+			float Q[2][4];
+			for (int r = 0; r < 2; r++)
+				for (int k = 0; k < 4; k++)
+					Q[r][k] = pm[4 * r] * R[0][k] + pm[4 * r + 1] * R[1][k] + (k == 3 ? pm[4 * r + 2] + pm[4 * r + 3] : 0.f);
+			if (c != 0.f && c != 1.f)
+				for (int r = 0; r < 2; r++)
+					for (int k = 0; k < 4; k++) Q[r][k] /= c;
+			memcpy(R, Q, sizeof R);
+		}
+		if (const EfbCopy* cp = ucopy[un]) {  // through the copy's source rectangle into the snapshot
+			float bs, bt, s1, t1;
+			pica_efb_uv(cp->x, cp->y, &bs, &bt);
+			pica_efb_uv(cp->x + cp->w, cp->y + cp->h, &s1, &t1);
+			const float as = s1 - bs, at = t1 - bt;
+			for (int k = 0; k < 4; k++) R[0][k] *= as, R[1][k] *= at;
+			R[0][3] += bs;
+			R[1][3] += bt;
+		}
+		memcpy(u.T[2 * un], R[0], 16);
+		memcpy(u.T[2 * un + 1], R[1], 16);
+	}
+	for (int sl = 0; sl < 3; sl++)
+		if (slotAttr[sl] >= 0) lay.off_tex[sl] = int16_t(L.tex[slotAttr[sl]]);
+	if (needNrm && hasNrm) lay.off_nrm = int16_t(L.nrm);
+
+	// Colour: vertex * CS + CM, shaded when lit.
+	uint8_t dbg[3] = {0, 0, 0};
+	if (debug) debugColor(hasMtx ? s_vdata[L.mtx] : defPm, s_vdata.data(), s_bstride, nidx, dbg);
+	const float k255 = 1.0f / 255.0f;
+	const float rgbMat[3] = {debug ? dbg[0] * k255 : float((mat >> 24) & 0xFF) * k255,
+	                         debug ? dbg[1] * k255 : float((mat >> 16) & 0xFF) * k255,
+	                         debug ? dbg[2] * k255 : float((mat >> 8) & 0xFF) * k255};
+	for (int c = 0; c < 3; c++) {
+		u.CS[c] = clrFromVtx ? 1.f : 0.f;
+		u.CM[c] = clrFromVtx ? 0.f : rgbMat[c];
+	}
+	u.CS[3] = alphaFromVtx ? 1.f : 0.f;
+	u.CM[3] = alphaFromVtx ? 0.f : float(amat & 0xFF) * k255;
+	u.LD[0] = 0.3f, u.LD[1] = 0.6f, u.LD[2] = 0.74f, u.LD[3] = lit ? 1.f : 0.f;
+
+	// View space -> EFB pixels and GameCube depth (homogeneous), as the CPU loop computes them.
+	const float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1), p2 = xff(XFR_PROJ + 2), p3 = xff(XFR_PROJ + 3),
+	            p4 = xff(XFR_PROJ + 4), p5 = xff(XFR_PROJ + 5);
+	const bool ortho = g.xfReg[XFR_PROJ + 6] & 1;
+	const float vsx = xff(XFR_VIEWPORT), vsy = xff(XFR_VIEWPORT + 1), vsz = xff(XFR_VIEWPORT + 2);
+	const float vcx = xff(XFR_VIEWPORT + 3) - 342.0f, vcy = xff(XFR_VIEWPORT + 4) - 342.0f, vcz = xff(XFR_VIEWPORT + 5);
+	const float kInvZ = 1.0f / 16777215.0f;
+	float C[4][4];
+	if (!ortho) {
+		const float c[4][4] = {{p0, 0, p1, 0}, {0, p2, p3, 0}, {0, 0, p4, p5}, {0, 0, -1, 0}};
+		memcpy(C, c, sizeof C);
+	} else {
+		const float c[4][4] = {{p0, 0, 0, p1}, {0, p2, 0, p3}, {0, 0, p4, p5}, {0, 0, 0, 1}};
+		memcpy(C, c, sizeof C);
+	}
+	float O[4][4];
+	for (int k = 0; k < 4; k++) {
+		O[0][k] = vsx * C[0][k] + vcx * C[3][k];
+		O[1][k] = vsy * C[1][k] + vcy * C[3][k];
+		O[2][k] = (vsz * C[2][k] + vcz * C[3][k]) * kInvZ;
+		O[3][k] = C[3][k];
+	}
+	pica_gx_projection(O, &u);
+
+	// Matrix rows, refreshed when XF memory changed (markXfMemDirty).
+	const bool dirty = s_xfDirty;
+	if (dirty) {
+		for (int r = 0; r < PICA_GX_MTX_ROWS; r++) {
+			memcpy(s_posRows[r], &g.xfMem[4 * r], 16);
+			memcpy(s_nrmRows[r], &g.xfMem[256 + 3 * r], 12);
+			s_nrmRows[r][3] = 0.f;
+		}
+		s_xfDirty = false;
+	}
+
+	void* vb;
+	uint16_t* ib;
+	{
+		PerfScope ps(PERF_XFORM);
+		if (!pica_alloc_raw(n * s_bstride, nidx, &vb, &ib)) return true;  // ring full: dropped, as the CPU path
+		memcpy(vb, s_vdata.data(), size_t(n) * s_bstride);
+		for (uint32_t i = 0; i < nidx; i++) ib[i] = uint16_t(s_idx[i]);
+	}
+	PerfScope ps(PERF_SUBMIT);
+	if (!pica_draw_gx(vb, n, &lay, ib, nidx, &u, dirty, s_posRows, s_nrmRows, &st)) {
+		s_xfDirty = s_xfDirty || dirty;
+		return false;
+	}
+	s_gpuBatches++;
+	return true;
+}
+
 static void drawTriangles() {
 	if (((g.bp[BP_GENMODE] >> 14) & 3) == 3) return;  // every face culled
 	if (s_afterTexCopy) s_drawsAfterCopy++;
@@ -1611,6 +1800,8 @@ static void drawTriangles() {
 	}
 
 	s_perfAcc[PERF_TEV] += svcGetSystemTick() - perfTev0;
+	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
+	s_cpuBatches++;
 	PicaVtx* out;
 	uint16_t* oidx;
 	if (!pica_alloc(n, nidx, &out, &oidx)) return;
@@ -1968,7 +2159,7 @@ void executeCopy(uint32_t ctrl) {
 	}
 }
 
-void markXfMemDirty() {}
+void markXfMemDirty() { s_xfDirty = true; }
 void textureInvalidateAll() {}
 void textureInvalidateRange(const void*, uint32_t) {}
 void textureCpuWrote(const void*, uint32_t) {}
@@ -1996,6 +2187,14 @@ int GXPC_InitAuto(int) {
 
 // 0: material, 1: debug colours, 2: opaque (material colours, no blending or alpha test).
 void GX3DS_TraceNextFrame(void) { gx::s_traceArm = true; }
+
+void GX3DS_SetGpuTransform(int on) { gx::s_gpuTransform = on != 0; }
+int GX3DS_GetGpuTransform(void) { return gx::s_gpuTransform ? 1 : 0; }
+// Batches drawn on the GPU and the CPU path so far.
+void GX3DS_GetPathStats(uint32_t out[2]) {
+	out[0] = gx::s_gpuBatches;
+	out[1] = gx::s_cpuBatches;
+}
 
 // os_core.cpp's cache operations (DCFlushRange, DCStoreRange, ...) report CPU writes here (a weak
 // reference sms-pc-port's GL renderer defines): stamp the pages, so the texture cache rehashes

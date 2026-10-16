@@ -24,6 +24,9 @@ void GX3DS_TraceNextFrame(void);
 int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
 void GX3DS_GetPerf(float out[10]);
+void GX3DS_SetGpuTransform(int on);
+int GX3DS_GetGpuTransform(void);
+void GX3DS_GetPathStats(uint32_t out[2]);
 void GX3DS_GetTexStats(uint32_t out[3]);
 }
 void SMS_main(void);  // the decomp's main(), renamed by port_compat.h (C++ linkage)
@@ -227,7 +230,7 @@ int main()
 	printf("app mem free %lu MB\n", (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 20));
 	fprintf(stderr, "[3ds] %s 3DS, heap %lu MB, linear free %lu MB\n", isNew ? "New" : "Old",
 	        (unsigned long)(envGetHeapSize() >> 20), (unsigned long)(linearSpaceFree() >> 20));
-	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\ntouch: top half = view, bottom = trace\n", LOG_PATH);
+	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\ntouch: top=view  BL=trace  BR=GPU\n", LOG_PATH);
 
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
@@ -260,8 +263,10 @@ int main()
 			hidTouchRead(&tp);
 			if (tp.py < 120)
 				pica_cycle_view();
-			else
+			else if (tp.px < 160)
 				GX3DS_TraceNextFrame();
+			else
+				GX3DS_SetGpuTransform(!GX3DS_GetGpuTransform());
 		}
 		uint32_t s[7];
 		GX3DS_GetStats(s);
@@ -293,6 +298,10 @@ int main()
 		       "tex %4.1f tev %4.1f xform %4.1f sub %4.1f\n"
 		       "copy %4.1f present %4.1f  %4.0f draws  \n",
 		       pf[6], pf[6] > 0 ? 1000.0f / pf[6] : 0.0f, pf[7], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], pf[8]);
+		uint32_t ps2[2];
+		GX3DS_GetPathStats(ps2);
+		printf("transform: %s  gpu %lu cpu %lu   \n", GX3DS_GetGpuTransform() ? "GPU" : "CPU", (unsigned long)ps2[0],
+		       (unsigned long)ps2[1]);
 		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 		// single-buffered, so writing back the CPU cache is enough.
 		gfxFlushBuffers();
