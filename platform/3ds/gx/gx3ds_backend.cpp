@@ -49,6 +49,55 @@ static PrimClass s_bclass = PRIM_TRIS;
 
 static inline bool batchHasVertices() { return !s_idx.empty(); }
 
+// ---- profiler -------------------------------------------------------------------------------
+// Per-frame time of each renderer phase, in ARM11 system ticks (268,111,856 Hz), averaged over
+// kPerfFrames frames for the status screen and logged as [perf] lines. "other" is the rest of the
+// frame: game logic, the GX front half (command parsing, vertex decoding) and waiting.
+extern "C" uint64_t svcGetSystemTick(void);
+enum PerfPhase { PERF_TEX, PERF_TEV, PERF_XFORM, PERF_SUBMIT, PERF_COPY, PERF_PRESENT, PERF_COUNT };
+static uint64_t s_perfAcc[PERF_COUNT], s_perfFrameStart, s_perfWindowStart;
+static uint32_t s_perfFrames, s_perfBatches, s_perfVerts;
+static float s_perfAvgMs[PERF_COUNT + 2];  // phases, then frame and other
+static float s_perfAvgBatches, s_perfAvgVerts;
+static const uint32_t kPerfFrames = 60;
+static const double kTicksPerMs = 268111.856;
+struct PerfScope {
+	PerfPhase ph;
+	uint64_t t0;
+	explicit PerfScope(PerfPhase p) : ph(p), t0(svcGetSystemTick()) {}
+	~PerfScope() { s_perfAcc[ph] += svcGetSystemTick() - t0; }
+};
+
+static void perfFrameEnd() {
+	const uint64_t now = svcGetSystemTick();
+	if (!s_perfWindowStart) {
+		s_perfWindowStart = now;
+		memset(s_perfAcc, 0, sizeof s_perfAcc);
+		s_perfFrames = s_perfBatches = s_perfVerts = 0;
+		return;
+	}
+	if (++s_perfFrames < kPerfFrames) return;
+	const double frames = s_perfFrames, total = double(now - s_perfWindowStart);
+	double ours = 0;
+	for (int i = 0; i < PERF_COUNT; i++) {
+		s_perfAvgMs[i] = float(double(s_perfAcc[i]) / frames / kTicksPerMs);
+		ours += s_perfAcc[i];
+	}
+	s_perfAvgMs[PERF_COUNT] = float(total / frames / kTicksPerMs);
+	s_perfAvgMs[PERF_COUNT + 1] = float((total - ours) / frames / kTicksPerMs);
+	s_perfAvgBatches = float(s_perfBatches / frames);
+	s_perfAvgVerts = float(s_perfVerts / frames);
+	fprintf(stderr,
+	        "[perf] frame %.1f ms (%.1f fps) | tex %.2f tev %.2f xform %.2f submit %.2f copy %.2f present %.2f | "
+	        "other %.1f | %.0f batches %.0f verts/frame\n",
+	        s_perfAvgMs[PERF_COUNT], 1000.0 / s_perfAvgMs[PERF_COUNT], s_perfAvgMs[PERF_TEX], s_perfAvgMs[PERF_TEV],
+	        s_perfAvgMs[PERF_XFORM], s_perfAvgMs[PERF_SUBMIT], s_perfAvgMs[PERF_COPY], s_perfAvgMs[PERF_PRESENT],
+	        s_perfAvgMs[PERF_COUNT + 1], s_perfAvgBatches, s_perfAvgVerts);
+	s_perfWindowStart = now;
+	memset(s_perfAcc, 0, sizeof s_perfAcc);
+	s_perfFrames = s_perfBatches = s_perfVerts = 0;
+}
+
 // ---- stage 1 renderer: CPU transform + flat colour ---------------------------------------
 static inline float xff(int r) {
 	float f;
@@ -195,6 +244,7 @@ struct TexEntry {
 	PicaTex* tex = nullptr;
 	uint64_t dataHash = 0, tlutHash = 0;
 	uint32_t checkedFrame = ~0u, usedFrame = 0;
+	uint32_t hashedFrame = 0, hashedClock = 0;  // when the data was last hashed (write-stamp clock)
 };
 static std::unordered_map<TexKey, TexEntry, TexKeyHash> s_texCache;
 static uint32_t s_texBytes;
@@ -279,8 +329,17 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	e.usedFrame = g_displayFrames;
 	if (e.tex && e.checkedFrame == g_displayFrames) return e.tex;
 	const uint32_t bytes = texLevelBytes(fmt, w, h);
-	const uint64_t dh = hashBytes(ptr, bytes), th = tlut ? hashBytes(tlut, tlutBytes) : 0;
+	// As sms-pc-port's cache: when no write stamp (GXPC_InvalidateRange below) touched the data
+	// since it was last hashed, trust it, but still hash every kRecheckFrames frames for writes
+	// nothing reported. TLUTs live in TMEM, rewritten by register loads: always hashed (small).
+	const uint64_t th = tlut ? hashBytes(tlut, tlutBytes) : 0;
 	e.checkedFrame = g_displayFrames;
+	if (e.tex && th == e.tlutHash && trustWriteStamps() && g_displayFrames - e.hashedFrame < kRecheckFrames &&
+	    unwrittenSince(ptr, bytes, e.hashedClock))
+		return e.tex;
+	e.hashedClock = writeClock();
+	e.hashedFrame = g_displayFrames;
+	const uint64_t dh = hashBytes(ptr, bytes);
 	if (e.tex && dh == e.dataHash && th == e.tlutHash) return e.tex;
 
 	const uint32_t pw = pow2Side(w), ph = pow2Side(h);
@@ -1375,6 +1434,47 @@ static void resetTev(PicaState& st, TevSetup& t) {
 	t.nUnits = 0;
 }
 
+// TEV translation cache. readTev/translateTev read only the registers hashed here (TEV envs,
+// orders, konst selection and swap tables, colour registers and konst colours, channel controls
+// and material colours), the vertex format, which texture pairs have a texture, and the PicaState
+// built before them (blend, depth, alpha test, scissor). Draws repeat the same few setups every
+// frame, so translating each setup once saves most of the per-draw TEV cost.
+struct TevCacheEntry {
+	TevSetup tev;
+	PicaState st;
+	bool translated;
+	unsigned dumpId;
+};
+static std::unordered_map<uint64_t, TevCacheEntry> s_tevCache;
+static const size_t kTevCacheMax = 1024;
+
+static uint64_t tevCacheKey(const bool pwhite[kMaxPairs], int nPairs, const PicaState& pre, bool debug) {
+	uint64_t h = 1469598103934665603ull;
+	auto mix = [&](uint64_t x) { h = (h ^ x) * 1099511628211ull; };
+	mix(g.bp[BP_GENMODE]);
+	for (int i = 0; i < 32; i++) mix(g.bp[BP_TEV_COLOR_ENV + i]);
+	for (int i = 0; i < 8; i++) mix(g.bp[BP_TREF + i]);
+	for (int i = 0; i < 8; i++) mix(g.bp[BP_TEV_KSEL + i]);
+	for (int i = 0; i < 8; i++) mix(g.bp[BP_TEV_REG + i]);
+	for (int i = 0; i < 8; i++) mix(g.kreg[i]);
+	for (int c = 0; c < 2; c++) {
+		mix(g.xfReg[XFR_COLOR0CTRL + c]);
+		mix(g.xfReg[XFR_ALPHA0CTRL + c]);
+		mix(g.xfReg[XFR_MAT0 + c]);
+	}
+	mix(s_bfmt);
+	uint32_t white = 0;
+	for (int p = 0; p < nPairs; p++) white |= uint32_t(pwhite[p]) << p;
+	mix(white | uint32_t(nPairs) << 16 | uint32_t(debug) << 24);
+	const uint8_t* b = reinterpret_cast<const uint8_t*>(&pre);
+	for (size_t i = 0; i < sizeof pre; i += 8) {
+		uint64_t w = 0;
+		memcpy(&w, b + i, sizeof pre - i < 8 ? sizeof pre - i : 8);
+		mix(w);
+	}
+	return h;
+}
+
 static void drawTriangles() {
 	if (((g.bp[BP_GENMODE] >> 14) & 3) == 3) return;  // every face culled
 	if (s_afterTexCopy) s_drawsAfterCopy++;
@@ -1382,27 +1482,45 @@ static void drawTriangles() {
 	const VtxFmtLayout& L = vtxFmtLayout(s_bfmt);
 	uint32_t n = s_bcount, nidx = uint32_t(s_idx.size());
 
+	s_perfBatches++;
+	s_perfVerts += n;
 	// The textures the TEV stages sample, per (map, coordinate) pair, and the combiner stages,
 	// which give PICA texture units to the pairs they use (none in debug-colour mode).
 	const bool debug = s_debugColors;
+	uint64_t perfTev0 = svcGetSystemTick();
 	TevSetup tev;
 	readTev(tev);
+	s_perfAcc[PERF_TEV] += svcGetSystemTick() - perfTev0;
 	PicaTex* ptex[kMaxPairs] = {};
 	const EfbCopy* pcopy[kMaxPairs] = {};
 	bool pwhite[kMaxPairs];
 	for (int p = 0; p < kMaxPairs; p++) pwhite[p] = true;
-	if (!debug)
+	if (!debug) {
+		PerfScope ps(PERF_TEX);
 		for (int p = 0; p < tev.nPairs; p++) {
 			ptex[p] = textureForMap(tev.pairMap[p], &pcopy[p]);
 			pwhite[p] = ptex[p] == nullptr;
 		}
+	}
+	perfTev0 = svcGetSystemTick();
 
 	PicaState st;
 	memset(&st, 0, sizeof st);  // the PICA side compares states bytewise
 	currentPicaState(st);
 	alphaTest(st);
 	bool translated = true;
-	if (debug) {
+	unsigned dumpId = 0;
+	const uint64_t tevKey = tevCacheKey(pwhite, tev.nPairs, st, debug);
+	auto tevHit = s_tevCache.find(tevKey);
+	const bool cached = tevHit != s_tevCache.end();
+	if (cached) {
+		tev = tevHit->second.tev;
+		st = tevHit->second.st;
+		translated = tevHit->second.translated;
+		dumpId = tevHit->second.dumpId;
+	}
+	if (cached) {
+	} else if (debug) {
 		tev.nUnits = 0;
 	} else if (isThpSetup(tev) && ptex[tev.stagePair[0]] && ptex[tev.stagePair[1]] && ptex[tev.stagePair[2]]) {
 		translateThp(tev, st);
@@ -1430,7 +1548,7 @@ static void drawTriangles() {
 			memcpy(tev.alphaEnv, full.alphaEnv, sizeof tev.alphaEnv);
 		}
 	}
-	if (!debug && !translated) {
+	if (!cached && !debug && !translated) {
 		resetTev(st, tev);
 		for (uint32_t s = 0; s < tev.numStages; s++) {
 			const int pr = tev.stagePair[s];
@@ -1444,6 +1562,14 @@ static void drawTriangles() {
 			tev.unitPair[0] = pr;
 			break;
 		}
+	}
+	if (!cached) {
+		if (s_tevCache.size() >= kTevCacheMax) s_tevCache.clear();
+		TevCacheEntry& e = s_tevCache[tevKey];
+		e.tev = tev;
+		e.st = st;
+		e.translated = translated;
+		e.dumpId = 0;
 	}
 	static const uint8_t kWrap[4] = {0, 2, 3, 2};  // clamp, repeat, mirror -> GPU_TEXTURE_WRAP_PARAM
 	PicaTex* utex[PICA_MAX_TEX] = {};
@@ -1461,8 +1587,7 @@ static void drawTriangles() {
 		st.wrap_t[u] = kWrap[(mode0 >> 2) & 3];
 		st.linear[u] = (mode0 >> 4) & 1;
 	}
-	unsigned dumpId = 0;
-	if (!debug) {
+	if (!debug && !cached) {
 		// Blend (BP 0x41), depth (0x40), alpha compare (0xF3), channel controls and the first
 		// vertex's colours, for the dump.
 		const VtxFmtLayout& L0 = vtxFmtLayout(s_bfmt);
@@ -1477,6 +1602,7 @@ static void drawTriangles() {
 		         g.xfReg[XFR_COLOR0CTRL + 1] & 0x7FFF, g.xfReg[XFR_ALPHA0CTRL + 1] & 0x7FFF, g.xfReg[XFR_MAT0],
 		         g.xfReg[XFR_MAT0 + 1], __builtin_bswap32(c0), __builtin_bswap32(c1), s_bfmt);
 		dumpId = tevDump(tev, st, translated, ptex, pcopy, extra);
+		s_tevCache[tevKey].dumpId = dumpId;
 	}
 	if (s_opaque) {
 		st.blend = 0;
@@ -1484,9 +1610,11 @@ static void drawTriangles() {
 		st.alpha_func = 1;  // GPU_ALWAYS
 	}
 
+	s_perfAcc[PERF_TEV] += svcGetSystemTick() - perfTev0;
 	PicaVtx* out;
 	uint16_t* oidx;
 	if (!pica_alloc(n, nidx, &out, &oidx)) return;
+	const uint64_t perfXform0 = svcGetSystemTick();
 
 	// Projection (GXSetProjection) and viewport (GXSetViewport), as the GX shader reads them.
 	const float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1), p2 = xff(XFR_PROJ + 2), p3 = xff(XFR_PROJ + 3),
@@ -1610,7 +1738,11 @@ static void drawTriangles() {
 		        hasMtx ? s_vdata[L.mtx] : defPm, m0[0], m0[1], m0[2], m0[3], m0[4], m0[5], m0[6], m0[7], m0[8], m0[9], m0[10],
 		        m0[11], p0, p1, p2, p3, p4, p5, ortho ? "ortho" : "persp", vsx, vsy, vsz, vcx, vcy, vcz, s_bfmt);
 	}
-	pica_draw_triangles(out, oidx, nidx, &st);
+	s_perfAcc[PERF_XFORM] += svcGetSystemTick() - perfXform0;
+	{
+		PerfScope ps(PERF_SUBMIT);
+		pica_draw_triangles(out, oidx, nidx, &st);
+	}
 }
 
 // The PICA200 draw: s_vdata/s_idx hold the batch, g the register state.
@@ -1791,7 +1923,10 @@ void executeCopy(uint32_t ctrl) {
 			// copy) or the copy's texture format has none (RGB565: a GX texture of it decodes alpha 1).
 			const uint32_t pix = g.bp[BP_PE_CONTROL] & 7;
 			const uint32_t cfmt = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7);
-			pica_efb_copy_to(c->tex, pix != 1 || cfmt == 4);
+			{
+				PerfScope ps(PERF_COPY);
+				pica_efb_copy_to(c->tex, pix != 1 || cfmt == 4);
+			}
 			logCopyKind(c, ctrl, pix);
 		}
 	}
@@ -1799,7 +1934,13 @@ void executeCopy(uint32_t ctrl) {
 		// BP 0x4F: A<<8|R, 0x50: G<<8|B, 0x51: 24-bit Z.
 		uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB];
 		uint32_t rgba = ((ar & 0xFF) << 24) | (((gb >> 8) & 0xFF) << 16) | ((gb & 0xFF) << 8) | ((ar >> 8) & 0xFF);
-		if (disp) pica_present();
+		if (disp) {
+			{
+				PerfScope ps(PERF_PRESENT);
+				pica_present();
+			}
+			perfFrameEnd();
+		}
 		// The display copy's clear applies to the next frame.
 		if (clear && disp) {
 			pica_clear(rgba, g.bp[BP_CLEAR_Z] & 0xFFFFFF);
@@ -1855,6 +1996,19 @@ int GXPC_InitAuto(int) {
 
 // 0: material, 1: debug colours, 2: opaque (material colours, no blending or alpha test).
 void GX3DS_TraceNextFrame(void) { gx::s_traceArm = true; }
+
+// os_core.cpp's cache operations (DCFlushRange, DCStoreRange, ...) report CPU writes here (a weak
+// reference sms-pc-port's GL renderer defines): stamp the pages, so the texture cache rehashes
+// only what the game rewrote.
+void GXPC_InvalidateRange(const void* p, uint32_t n) { gx::memoryWritten(p, n); }
+
+// Averages over the last profiler window, in ms: tex, tev, xform, submit, copy, present, frame,
+// other; then batches and vertices per frame.
+void GX3DS_GetPerf(float out[10]) {
+	for (int i = 0; i < gx::PERF_COUNT + 2; i++) out[i] = gx::s_perfAvgMs[i];
+	out[gx::PERF_COUNT + 2] = gx::s_perfAvgBatches;
+	out[gx::PERF_COUNT + 3] = gx::s_perfAvgVerts;
+}
 
 void GX3DS_SetDebugColors(int mode) {
 	gx::s_debugColors = mode == 1;
