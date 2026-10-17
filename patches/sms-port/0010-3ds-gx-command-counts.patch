@@ -1,0 +1,80 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 14:54:50
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 14:54:50
+@@ -959,6 +959,17 @@
+ #define GXPC_DL_TIMER(name, id)
+ #define GXPC_DL_TO(name, id)
+ #define GXPC_DL_COUNT(stmt)
++#endif
++
++#if defined(__3DS__)
++// Commands the parser ran, by kind, for the [perf] lines: primitives (and those decoded while a
++// display list ran uncached), XF writes, indexed XF loads, BP and CP writes, nested list calls.
++extern "C" uint32_t GXPC_CmdCount[7];
++uint32_t GXPC_CmdCount[7];
++static int s_uncachedDepth;  // > 0 while callDisplayList runs a list uncached
++#define CMD_COUNT(i) (GXPC_CmdCount[i]++)
++#else
++#define CMD_COUNT(i) ((void)0)
+ #endif
+ 
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
+@@ -977,8 +988,10 @@
+         if (op == 0x08) {
+             len = 6;
+             if (avail < len) break;
++            CMD_COUNT(5);
+             writeCP(p[1], be32(p + 2));
+         } else if (op == 0x10) {
++            CMD_COUNT(2);
+             if (avail < 5) { len = 5; break; }
+             uint32_t hdr = be32(p + 1);
+             uint32_t cnt = (hdr >> 16) + 1;
+@@ -995,12 +1008,14 @@
+         } else if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
+             len = 5;
+             if (avail < len) break;
++            CMD_COUNT(3);
+             loadIndexedXF(op, be16(p + 1), be16(p + 3));
+         } else if (op == 0x40) {
+             len = 9;
+             if (avail < len) break;
+             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
+             uint32_t sz = be32(p + 5);
++            CMD_COUNT(6);
+             if (s_dlDepth < 4 && dl) {
+                 s_dlDepth++;
+                 runCommands(dl, sz);
+@@ -1009,8 +1024,13 @@
+         } else if (op == 0x61) {
+             len = 5;
+             if (avail < len) break;
++            CMD_COUNT(4);
+             writeBP(be32(p + 1));
+         } else if (op >= 0x80 && op < 0xC0) {
++            CMD_COUNT(0);
++#if defined(__3DS__)
++            if (s_uncachedDepth) CMD_COUNT(1);
++#endif
+             if (avail < 3) { len = 3; break; }
+             const VtxLayout& L = layoutFor(op & 7);
+             uint32_t cnt = be16(p + 1);
+@@ -1330,7 +1350,9 @@
+     GXPC_DL_COUNT(GXPC_DlCalls++);
+     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
+         GXPC_DL_COUNT(GXPC_DlUncached++);
++        GXPC_DL_COUNT(s_uncachedDepth++);
+         runCommands(data, size);
++        GXPC_DL_COUNT(s_uncachedDepth--);
+         return;
+     }
+     GXPC_DL_TO(dlt, 0);
+@@ -1339,7 +1361,9 @@
+         GXPC_DL_TO(dlt, 3);
+         GXPC_DL_COUNT(GXPC_DlUncached++);
+         e.skip--;
++        GXPC_DL_COUNT(s_uncachedDepth++);
+         runCommands(data, size);
++        GXPC_DL_COUNT(s_uncachedDepth--);
+         return;
+     }
+     if (dlReusable(e, data, size)) {

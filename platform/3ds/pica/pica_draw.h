@@ -153,6 +153,36 @@ void pica_present(void);
 
 /* Draws and drops made because the ring or command buffer was full (for the status screen). */
 uint32_t pica_dropped(void);
+/* The most vertex-ring bytes a frame used since the last call, and one frame's capacity. */
+uint32_t pica_ring_peak(void);
+uint32_t pica_ring_capacity(void);
+/* Kernel threads this process holds now, or -1 if unknown (the limit is 32: [perf] watches for leaks). */
+int pica_kernel_threads(void);
+/* Draws dropped so far because a vertex/index ring or the GPU command buffer was full. */
+void pica_drop_reasons(uint32_t* ring, uint32_t* cmdbuf);
+/* Most GPU command bytes a frame used since the last call (reset by it), and the buffer's size. */
+uint32_t pica_cmd_peak(void);
+uint32_t pica_cmd_capacity(void);
+/* Linear (GPU-visible) memory still free, in bytes. */
+uint32_t pica_linear_free(void);
+/* Mid-frame submissions of the command list so far (the GPU starts on a frame's first parts). */
+uint32_t pica_splits(void);
+/* The GX queue's entry counters, for stall reports. */
+const char* pica_queue_state(void);
+/* Mid-frame submission on (default) or off. */
+void pica_set_split(int on);
+/* Overlapped frames: the CPU builds the next frame while the GPU draws the last (pica_draw.c). */
+void pica_set_overlap(int on);
+int pica_overlap(void);
+/* GPU completions the frame-start watchdog had to supply (the hardware never reported them). */
+uint32_t pica_lost_completions(void);
+/* System ticks spent waiting in C3D_FrameBegin for the GPU to finish the previous frame. */
+uint64_t pica_wait_ticks(void);
+/* Sum of citro3d's GPU drawing time (ms) over the frames begun so far. */
+double pica_gpu_ms_sum(void);
+/* Cycles the GPU test mode (0 normal, 1 game draws scissored to 8x8 pixels); returns the new mode. */
+int pica_cycle_gpu_test(void);
+int pica_gpu_test(void);
 /* For a hang report: what the renderer is doing on the game thread, and draws in this frame. */
 const char* pica_where(void);
 uint32_t pica_frame_draws(void);
@@ -162,6 +192,8 @@ int pica_selftest(void);
 /* On: every draw is submitted and waited for on its own, and one the GPU never finishes is logged
  * ([gpucheck] lines) with its layout, textures and combiner stages. Very slow. */
 void pica_set_gpu_check(int on);
+/* Quitting: no more GPU work is submitted from any thread after this. */
+void pica_request_stop(void);
 
 #ifdef __cplusplus
 }

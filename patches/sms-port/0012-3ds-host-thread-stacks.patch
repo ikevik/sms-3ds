@@ -1,0 +1,149 @@
+--- a/platform/os/os_thread.cpp	2026-10-16 15:44:49
++++ b/platform/os/os_thread.cpp	2026-10-16 15:55:57
+@@ -20,6 +20,18 @@
+ #include <dolphin/os/OSMessage.h>
+ #include <dolphin/os/OSMutex.h>
+ #include <pthread.h>
++#if defined(__3DS__)
++#include <malloc.h>
++// libctru's resource-limit calls, declared here: this file is built with the GameCube ABI flags
++// and without libctru's headers. ResourceLimitType is 32 bits wide (RESLIMIT_BIT).
++extern "C" {
++int svcGetResourceLimit(unsigned long* resourceLimit, unsigned long process);
++int svcGetResourceLimitLimitValues(long long* values, unsigned long resourceLimit, unsigned long* names, long nameCount);
++int svcGetResourceLimitCurrentValues(long long* values, unsigned long resourceLimit, unsigned long* names, long nameCount);
++int svcCloseHandle(unsigned long handle);
++}
++extern "C" unsigned long __ctru_heap_size; // libctru: the process heap's size
++#endif
+ #include <atomic>
+ #include <deque>
+ #include <map>
+@@ -42,8 +54,18 @@
+ 	u64 last_ran;
+ 	unsigned spin_misses; // switches in a row whose spin ran out before the turn came
+ 	unsigned spin_skips;  // switches that did not spin since the last that did
++#if defined(__3DS__)
++	u32 gc_stack; // the stack size the game gave OSCreateThread (3DS: sizes the host stack)
++#endif
+ };
+ 
++#if defined(__3DS__)
++// Host threads running (3DS: for the pthread_create failure report and [perf]).
++int g_live_hosts;
++#define LIVE_HOST_END() __atomic_sub_fetch(&g_live_hosts, 1, __ATOMIC_RELAXED)
++#else
++#define LIVE_HOST_END() ((void)0)
++#endif
+ pthread_mutex_t g_cpu = PTHREAD_MUTEX_INITIALIZER;
+ pthread_cond_t g_idle_cv = PTHREAD_COND_INITIALIZER;
+ OSThread* g_cur;
+@@ -268,7 +290,20 @@
+ 		pthread_attr_setstack(&a, ls->base, kLowStackSize);
+ #endif
+ #else
++#if defined(__3DS__)
++		// 3DS port: a host stack of 4x the game's own (ARM frames are no bigger than PowerPC
++		// ones), 128 KiB to 1 MiB, instead of 1 MiB for every thread: the movie decoder's threads
++		// are created again for each movie, and with a level loaded the 1 MiB stacks ran the
++		// heap out at a cutscene (pthread_create failed).
++		{
++			size_t st = size_t(hn->gc_stack) * 4;
++			if (st < (128u << 10)) st = 128u << 10;
++			if (st > (1u << 20)) st = 1u << 20;
++			pthread_attr_setstacksize(&a, st);
++		}
++#else
+ 		pthread_attr_setstacksize(&a, 1 << 20);
++#endif
+ 		pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+ #endif
+ #ifdef _WIN64
+@@ -277,7 +312,33 @@
+ 		int create_result = pthread_create(&hn->th, &a, host_entry, next);
+ #endif
+ 		if (create_result != 0) {
++#if defined(__3DS__)
++			{
++				struct mallinfo mi = mallinfo();
++				port_log("[os] pthread_create failed: error %d, %d host threads live, game stack %u bytes | heap "
++				         "%lu KB in use, %lu KB free in the arena, arena %lu KB of %lu KB\n",
++				         create_result, g_live_hosts, (unsigned)hn->gc_stack, (unsigned long)mi.uordblks >> 10,
++				         (unsigned long)mi.fordblks >> 10, (unsigned long)mi.arena >> 10, __ctru_heap_size >> 10);
++			}
++			{
++				// Kernel thread count and limit for this process (RESLIMIT_THREAD), and whether the
++				// stack itself can be allocated right now: tells the 3DS's thread limit from memory.
++				unsigned long rl = 0;
++				long long cur = -1, lim = -1;
++				unsigned long what = 2; // RESLIMIT_THREAD
++				if (svcGetResourceLimit(&rl, 0xFFFF8001ul /* CUR_PROCESS_HANDLE */) >= 0) {
++					svcGetResourceLimitCurrentValues(&cur, rl, &what, 1);
++					svcGetResourceLimitLimitValues(&lim, rl, &what, 1);
++					svcCloseHandle(rl);
++				}
++				void* probe = malloc(size_t(hn->gc_stack) * 4 < (128u << 10) ? (128u << 10) : size_t(hn->gc_stack) * 4);
++				port_log("[os]   kernel threads %lld of %lld; a stack-sized malloc %s\n", (long long)cur, (long long)lim,
++				         probe ? "succeeds" : "fails");
++				free(probe);
++			}
++#else
+ 			port_log("[os] pthread_create failed\n");
++#endif
+ 			abort();
+ 		}
+ #if UINTPTR_MAX > 0xFFFFFFFFu
+@@ -292,6 +353,7 @@
+ #ifdef _WIN64
+ 		port_win64_thread_exit();
+ #else
++		LIVE_HOST_END();
+ 		pthread_exit(NULL);
+ #endif
+ 	}
+@@ -312,6 +374,7 @@
+ #ifdef _WIN64
+ 			port_win64_thread_exit();
+ #else
++			LIVE_HOST_END();
+ 			pthread_exit(NULL);
+ #endif
+ 		}
+@@ -396,6 +459,9 @@
+ 
+ void* host_entry(void* p)
+ {
++#if defined(__3DS__)
++	__atomic_add_fetch(&g_live_hosts, 1, __ATOMIC_RELAXED);
++#endif
+ 	port_crash_thread_init();
+ 	OSThread* self = (OSThread*)p;
+ 	pthread_mutex_lock(&g_cpu);
+@@ -404,6 +470,7 @@
+ 		pthread_cond_wait(&h->cv, &g_cpu);
+ 		if (h->cancelled) { // cancelled before it ever ran
+ 			pthread_mutex_unlock(&g_cpu);
++			LIVE_HOST_END();
+ 			return NULL;
+ 		}
+ 	}
+@@ -617,6 +684,9 @@
+ 	}
+ 	h->func      = func;
+ 	h->arg       = param;
++#if defined(__3DS__)
++	h->gc_stack  = stackSize;
++#endif
+ 	h->started   = false;
+ 	h->cancelled = false;
+ 	return TRUE;
+@@ -872,6 +942,9 @@
+ 
+ extern "C" double port_idle_seconds(void) { return g_idle_seconds; }
+ #if defined(__3DS__)
++extern "C" int port_os_live_hosts(void) { return g_live_hosts; }
++#endif
++#if defined(__3DS__)
+ // 3DS port: emulated thread switches so far, for the renderer's [perf] lines.
+ extern "C" unsigned long long port_os_switches(void) { return g_switch_seq; }
+ #endif

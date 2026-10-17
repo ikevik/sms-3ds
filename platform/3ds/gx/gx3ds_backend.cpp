@@ -15,6 +15,7 @@
 // Interface is sms-pc-port's (MIT), the implementation is independent.
 #include "gx_internal.h"
 #include "../pica/pica_draw.h"
+#include <malloc.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -44,6 +45,9 @@ static bool s_ready;
 // into the free tail of the PICA vertex ring, so the GPU path draws them in place: flushBatch claims
 // the bytes before drawing, and the CPU path's output and the indices go after them. A batch that
 // outgrows the ring moves to an ordinary heap buffer (then the GPU path copies it, as before).
+// The batch leaving the vertex ring for the heap (BatchBuf::toHeap): times and bytes copied.
+static uint32_t s_batchToHeap, s_perfBatchToHeap0;
+static uint64_t s_batchToHeapBytes, s_perfBatchToHeapBytes0;
 class BatchBuf {
 public:
 	uint8_t* data() { return p_; }
@@ -88,6 +92,8 @@ private:
 		open_ = true;
 	}
 	void toHeap(size_t need) {
+		s_batchToHeap++;
+		s_batchToHeapBytes += ring_ ? n_ : 0;
 		if (heap_.size() < need) heap_.resize(need + need / 2 + 4096);
 		if (ring_ && n_) memcpy(heap_.data(), p_, n_);
 		ring_ = false;
@@ -127,7 +133,37 @@ extern "C" volatile uint64_t GX3DS_MainBusyTicks;
 volatile uint64_t GX3DS_MainBusyTicks;
 static uint64_t s_perfCmd0, s_perfMain0;
 static double s_perfIdle0;
-enum PerfPhase { PERF_TEX, PERF_TEV, PERF_XFORM, PERF_SUBMIT, PERF_COPY, PERF_PRESENT, PERF_DECODE, PERF_COUNT };
+// PERF_BATCH: flushBatch's own work (the draw-time setup the phases above do not cover); PERF_APPEND:
+// copying a cached display list's vertices and indices into the batch (appendDecoded).
+enum PerfPhase {
+	PERF_TEX, PERF_TEV, PERF_XFORM, PERF_SUBMIT, PERF_COPY, PERF_PRESENT, PERF_DECODE, PERF_BATCH, PERF_APPEND, PERF_COUNT
+};
+// Running total of every phase, for the front half's display-list timers (patch 0007) to leave out.
+extern "C" uint64_t GX3DS_OursTicks;
+uint64_t GX3DS_OursTicks;
+extern "C" uint64_t GXPC_DlTicks[4];
+extern "C" uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
+extern "C" uint64_t GXPC_DlHashed;
+extern "C" uint32_t GXPC_CullRuns, GXPC_CullVerts;  // patch 0014
+extern "C" int GXPC_CullOff;
+static uint32_t s_perfCullRuns0, s_perfCullVerts0;
+extern "C" size_t GXPC_DlCacheBytes(void);
+extern "C" uint32_t GXPC_DlEntryCount(void);
+extern "C" uint32_t GXPC_DlFail[7];  // patch 0009: why cached lists could not be reused
+static uint32_t s_perfDlFail0[7];
+extern "C" uint32_t GXPC_CmdCount[7];  // patch 0010: commands parsed, by kind
+static uint32_t s_perfCmdCount0[7];
+extern "C" uint32_t GXPC_DrawSyncCalls;          // patch 0011
+extern "C" uint64_t GXPC_DrawSyncTicks;
+extern "C" unsigned long long port_os_switches(void);
+static uint32_t s_perfDsCalls0;
+static uint64_t s_perfDsTicks0;
+static unsigned long long s_perfSwitches0;
+static uint64_t s_perfWait0;
+extern "C" int port_os_live_hosts(void);  // patch 0012
+extern "C" unsigned long __ctru_heap_size; // libctru: the process heap's size
+static uint64_t s_perfDl0[4], s_perfDlHashed0;
+static uint32_t s_perfDlCalls0, s_perfDlHits0, s_perfDlVerts0, s_perfDlRecords0, s_perfDlNew0, s_perfDlUncached0;
 static uint64_t s_perfAcc[PERF_COUNT], s_perfFrameStart, s_perfWindowStart;
 static uint32_t s_perfFrames, s_perfBatches, s_perfVerts;
 static float s_perfAvgMs[PERF_COUNT + 2];  // phases, then frame and other
@@ -135,11 +171,22 @@ static float s_perfAvgBatches, s_perfAvgVerts;
 static const uint32_t kPerfFrames = 60;
 static uint64_t s_decodeT0;  // primitiveBegin -> primitiveEnd: the GX front half decoding vertices
 static const double kTicksPerMs = 268111.856;
+static inline void perfAdd(PerfPhase ph, uint64_t ticks) {
+	s_perfAcc[ph] += ticks;
+	GX3DS_OursTicks += ticks;
+}
 struct PerfScope {
 	PerfPhase ph;
 	uint64_t t0;
 	explicit PerfScope(PerfPhase p) : ph(p), t0(svcGetSystemTick()) {}
-	~PerfScope() { s_perfAcc[ph] += svcGetSystemTick() - t0; }
+	~PerfScope() { perfAdd(ph, svcGetSystemTick() - t0); }
+};
+// A phase without the phases nested in it.
+struct PerfScopeExcl {
+	PerfPhase ph;
+	uint64_t t0, o0;
+	explicit PerfScopeExcl(PerfPhase p) : ph(p), t0(svcGetSystemTick()), o0(GX3DS_OursTicks) {}
+	~PerfScopeExcl() { perfAdd(ph, (svcGetSystemTick() - t0) - (GX3DS_OursTicks - o0)); }
 };
 
 // Why batches fell back to the CPU path: batches and vertices per reason over the profiler window,
@@ -158,6 +205,8 @@ static bool gpuFail(GpuFallback why, uint32_t n) {
 	s_fbVerts[why] += n;
 	return false;
 }
+
+static int debugColorMode();  // SELECT's mode: 0 material, 1 debug colours, 2 opaque
 
 static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
@@ -181,12 +230,25 @@ static void perfFrameEnd() {
 	s_perfAvgMs[PERF_COUNT + 1] = float((total - ours) / frames / kTicksPerMs);
 	s_perfAvgBatches = float(s_perfBatches / frames);
 	s_perfAvgVerts = float(s_perfVerts / frames);
+	const double waitMs = double(pica_wait_ticks() - s_perfWait0) / frames / kTicksPerMs;
+	s_perfWait0 = pica_wait_ticks();
+	static double s_gpuMs0;
+	static uint32_t s_splits0;
+	const double splits = (pica_splits() - s_splits0) / frames;
+	s_splits0 = pica_splits();
+	const double gpuMs = (pica_gpu_ms_sum() - s_gpuMs0) / frames;
+	s_gpuMs0 = pica_gpu_ms_sum();
+	fprintf(stderr, "[perf]   gpu wait (%s): %.1f ms/frame, counted in the renderer's own time | GPU drawing "
+	        "%.1f ms/frame after the last part | %.1f parts sent mid-frame, %lu lost completions so far | test: %s, "
+	        "colours %s\n", pica_overlap() ? "frame end, frames overlapped" : "C3D_FrameBegin", waitMs, gpuMs, splits, (unsigned long)pica_lost_completions(), pica_gpu_test() ? "pixels cut to 8x8" : "off",
+	        debugColorMode() == 1 ? "debug (no textures)" : debugColorMode() == 2 ? "opaque (no blending)" : "material");
 	fprintf(stderr,
 	        "[perf] frame %.1f ms (%.1f fps) | tex %.2f tev %.2f xform %.2f submit %.2f copy %.2f present %.2f | "
-	        "decode %.1f other %.1f | %.0f batches %.0f verts/frame\n",
+	        "decode %.1f batch %.2f append %.2f other %.1f | %.0f batches %.0f verts/frame\n",
 	        s_perfAvgMs[PERF_COUNT], 1000.0 / s_perfAvgMs[PERF_COUNT], s_perfAvgMs[PERF_TEX], s_perfAvgMs[PERF_TEV],
 	        s_perfAvgMs[PERF_XFORM], s_perfAvgMs[PERF_SUBMIT], s_perfAvgMs[PERF_COPY], s_perfAvgMs[PERF_PRESENT],
-	        s_perfAvgMs[PERF_DECODE], s_perfAvgMs[PERF_COUNT + 1], s_perfAvgBatches, s_perfAvgVerts);
+	        s_perfAvgMs[PERF_DECODE], s_perfAvgMs[PERF_BATCH], s_perfAvgMs[PERF_APPEND], s_perfAvgMs[PERF_COUNT + 1],
+	        s_perfAvgBatches, s_perfAvgVerts);
 	char fb[256];
 	int at = 0;
 	for (int i = 0; i < FB_COUNT && at < int(sizeof fb) - 48; i++)
@@ -207,6 +269,76 @@ static void perfFrameEnd() {
 		        "[perf]   other %.1f = idle %.1f + gx commands %.1f + game %.1f ms/frame (gx commands incl. our draw "
 		        "work: %.1f; status screen redraw, main thread: %.1f)\n",
 		        otherMs, idleMs, cmdOnly, otherMs - idleMs - cmdOnly, cmd * perMs, mainMs);
+		// gx commands = display lists (validate a cached one, replay it, record one, run one uncached)
+		// + everything else the parser runs (the game's direct GX commands)
+		double dl[4], dlSum = 0;
+		for (int i = 0; i < 4; i++) {
+			dl[i] = double(GXPC_DlTicks[i] - s_perfDl0[i]) * perMs;
+			dlSum += dl[i];
+			s_perfDl0[i] = GXPC_DlTicks[i];
+		}
+		fprintf(stderr,
+		        "[perf]   gx commands %.1f = display lists: validate %.1f + replay %.1f + record %.1f + uncached %.1f; "
+		        "direct %.1f ms/frame\n",
+		        cmdOnly, dl[0], dl[1], dl[2], dl[3], cmdOnly - dlSum);
+		fprintf(stderr,
+		        "[perf]   display lists per frame: %.0f calls, %.0f cached (%.0f verts), %.1f recorded (%.1f new), %.1f "
+		        "uncached, %.0f KB hashed | cache %u entries, %u KB\n",
+		        (GXPC_DlCalls - s_perfDlCalls0) / frames, (GXPC_DlHits - s_perfDlHits0) / frames,
+		        (GXPC_DlVerts - s_perfDlVerts0) / frames, (GXPC_DlRecords - s_perfDlRecords0) / frames,
+		        (GXPC_DlNew - s_perfDlNew0) / frames, (GXPC_DlUncached - s_perfDlUncached0) / frames,
+		        double(GXPC_DlHashed - s_perfDlHashed0) / frames / 1024.0, unsigned(GXPC_DlEntryCount()),
+		        unsigned(GXPC_DlCacheBytes() >> 10));
+		fprintf(stderr, "[perf]   off-screen culling: %.1f display-list draws (%.0f verts) skipped per frame%s\n",
+		        (GXPC_CullRuns - s_perfCullRuns0) / frames, (GXPC_CullVerts - s_perfCullVerts0) / frames,
+		        GXPC_CullOff ? " (off: L held at launch)" : "");
+		static const char* const kFail[7] = {"not-valid", "size", "vcd", "vat", "mtx", "array", "changed"};
+		char fl[160];
+		int fat = 0;
+		for (int i = 0; i < 7; i++) {
+			const uint32_t n = GXPC_DlFail[i] - s_perfDlFail0[i];
+			s_perfDlFail0[i] = GXPC_DlFail[i];
+			if (n) fat += snprintf(fl + fat, sizeof fl - fat, " %s %.1f", kFail[i], n / frames);
+		}
+		if (fat) fprintf(stderr, "[perf]   display lists not reusable per frame:%s\n", fl);
+		double cc[7];
+		for (int i = 0; i < 7; i++) {
+			cc[i] = (GXPC_CmdCount[i] - s_perfCmdCount0[i]) / frames;
+			s_perfCmdCount0[i] = GXPC_CmdCount[i];
+		}
+		fprintf(stderr,
+		        "[perf]   commands parsed per frame: %.0f primitives (%.0f in uncached lists), %.0f XF writes, %.0f "
+		        "indexed XF loads, %.0f BP, %.0f CP, %.0f nested list calls\n",
+		        cc[0], cc[1], cc[2], cc[3], cc[4], cc[5], cc[6]);
+		fprintf(stderr, "[perf]   draw-sync callbacks: %.1f per frame, %.1f ms inside (wall clock) | emulated thread "
+		        "switches: %.1f per frame | %d host threads, %d kernel threads | heap %lu KB in use, arena %lu of %lu KB\n",
+		        (GXPC_DrawSyncCalls - s_perfDsCalls0) / frames, double(GXPC_DrawSyncTicks - s_perfDsTicks0) * perMs,
+		        double(port_os_switches() - s_perfSwitches0) / frames, port_os_live_hosts(), pica_kernel_threads(),
+		        (unsigned long)mallinfo().uordblks >> 10, (unsigned long)mallinfo().arena >> 10, __ctru_heap_size >> 10);
+		s_perfDsCalls0 = GXPC_DrawSyncCalls;
+		s_perfDsTicks0 = GXPC_DrawSyncTicks;
+		s_perfSwitches0 = port_os_switches();
+		uint32_t ringPeak = pica_ring_peak();
+		uint32_t dropRing, dropCmd;
+		pica_drop_reasons(&dropRing, &dropCmd);
+		fprintf(stderr, "[perf]   vertex ring: peak %u KB of %u KB per frame | GPU commands: peak %u KB of %u KB | batch "
+		        "moved to the heap %.1f times, %.0f KB copied per frame | %lu draws dropped so far (ring full %lu, "
+		        "command buffer full %lu) | linear free %u KB\n",
+		        unsigned(ringPeak >> 10), unsigned(pica_ring_capacity() >> 10), unsigned(pica_cmd_peak() >> 10),
+		        unsigned(pica_cmd_capacity() >> 10), (s_batchToHeap - s_perfBatchToHeap0) / frames,
+		        double(s_batchToHeapBytes - s_perfBatchToHeapBytes0) / frames / 1024.0, (unsigned long)pica_dropped(),
+		        (unsigned long)dropRing, (unsigned long)dropCmd, unsigned(pica_linear_free() >> 10));
+		s_perfBatchToHeap0 = s_batchToHeap;
+		s_perfBatchToHeapBytes0 = s_batchToHeapBytes;
+		s_perfDlCalls0 = GXPC_DlCalls;
+		s_perfDlHits0 = GXPC_DlHits;
+		s_perfDlVerts0 = GXPC_DlVerts;
+		s_perfDlRecords0 = GXPC_DlRecords;
+		s_perfDlNew0 = GXPC_DlNew;
+		s_perfDlUncached0 = GXPC_DlUncached;
+		s_perfDlHashed0 = GXPC_DlHashed;
+		s_perfCullRuns0 = GXPC_CullRuns;
+		s_perfCullVerts0 = GXPC_CullVerts;
 		s_perfCmd0 = GXPC_CmdTicks;
 		s_perfMain0 = GX3DS_MainBusyTicks;
 		s_perfIdle0 = port_idle_seconds();
@@ -312,6 +444,7 @@ static volatile bool s_debugColors;
 // Opaque mode (GX3DS_SetDebugColors 2): blending and the alpha test off, to tell what a draw's
 // colour is from how it is blended.
 static volatile bool s_opaque;
+static int debugColorMode() { return s_debugColors ? 1 : s_opaque ? 2 : 0; }
 // One-frame trace (GX3DS_TraceNextFrame, L on the 3DS side): every draw, copy and clear of the
 // next frame, in order, to the log.
 static volatile bool s_traceArm;
@@ -1867,7 +2000,7 @@ static void drawTriangles() {
 	uint64_t perfTev0 = svcGetSystemTick();
 	TevSetup tev;
 	readTev(tev);
-	s_perfAcc[PERF_TEV] += svcGetSystemTick() - perfTev0;
+	perfAdd(PERF_TEV, svcGetSystemTick() - perfTev0);
 	PicaTex* ptex[kMaxPairs] = {};
 	const EfbCopy* pcopy[kMaxPairs] = {};
 	bool pwhite[kMaxPairs];
@@ -1987,7 +2120,7 @@ static void drawTriangles() {
 		st.alpha_func = 1;  // GPU_ALWAYS
 	}
 
-	s_perfAcc[PERF_TEV] += svcGetSystemTick() - perfTev0;
+	perfAdd(PERF_TEV, svcGetSystemTick() - perfTev0);
 	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
 	s_cpuBatches++;
 	PicaVtx* out;
@@ -2117,7 +2250,7 @@ static void drawTriangles() {
 		        hasMtx ? s_vdata[L.mtx] : defPm, m0[0], m0[1], m0[2], m0[3], m0[4], m0[5], m0[6], m0[7], m0[8], m0[9], m0[10],
 		        m0[11], p0, p1, p2, p3, p4, p5, ortho ? "ortho" : "persp", vsx, vsy, vsz, vcx, vcy, vcz, s_bfmt);
 	}
-	s_perfAcc[PERF_XFORM] += svcGetSystemTick() - perfXform0;
+	perfAdd(PERF_XFORM, svcGetSystemTick() - perfXform0);
 	{
 		PerfScope ps(PERF_SUBMIT);
 		pica_draw_triangles(out, oidx, nidx, &st);
@@ -2138,6 +2271,7 @@ static void drawBatch() {
 
 void flushBatch() {
 	if (!s_ready) return;
+	PerfScopeExcl ps(PERF_BATCH);
 	if (batchHasVertices()) {
 		s_vdata.claim();
 		drawBatch();
@@ -2214,7 +2348,7 @@ uint32_t primitiveIndices(uint8_t op, uint32_t n, uint32_t base, uint32_t* w) {
 
 void primitiveEnd(uint8_t op, uint32_t n) {
 	if (s_decodeT0) {
-		s_perfAcc[PERF_DECODE] += svcGetSystemTick() - s_decodeT0;
+		perfAdd(PERF_DECODE, svcGetSystemTick() - s_decodeT0);
 		s_decodeT0 = 0;
 	}
 	if (!s_ready || n == 0) return;
@@ -2229,6 +2363,7 @@ void primitiveEnd(uint8_t op, uint32_t n) {
 
 void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* verts, uint32_t n, const uint32_t* idx,
                    uint32_t nidx) {
+	PerfScopeExcl ps(PERF_APPEND);
 	if (batchHasVertices() && (cls != s_bclass || fmt != s_bfmt)) flushBatch();
 	s_bclass = cls;
 	s_bfmt = fmt;

@@ -1,0 +1,59 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 14:49:32
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 14:49:32
+@@ -1211,16 +1211,26 @@
+ namespace gx {
+ #endif
+ 
++#if defined(__3DS__)
++// Why a cached list could not be reused: not valid yet, size, vertex descriptor, attribute
++// table, matrix indices, array base/stride, contents (hash) changed. For the [perf] lines.
++extern "C" uint32_t GXPC_DlFail[7];
++uint32_t GXPC_DlFail[7];
++#define DL_FAIL(i) (GXPC_DlFail[i]++, false)
++#else
++#define DL_FAIL(i) false
++#endif
+ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
+-    if (!e.valid || e.size != size) return false;
+-    if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return false;
++    if (!e.valid) return DL_FAIL(0);
++    if (e.size != size) return DL_FAIL(1);
++    if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return DL_FAIL(2);
+     for (int v = 0; v < 8; v++)
+         if ((e.vatMask >> v) & 1)
+-            if (e.vat[v][0] != g.cpVatA[v] || e.vat[v][1] != g.cpVatB[v] || e.vat[v][2] != g.cpVatC[v]) return false;
+-    if (e.usesMtx && (e.matA != g.xfReg[XFR_MATIDX_A] || e.matB != g.xfReg[XFR_MATIDX_B])) return false;
++            if (e.vat[v][0] != g.cpVatA[v] || e.vat[v][1] != g.cpVatB[v] || e.vat[v][2] != g.cpVatC[v]) return DL_FAIL(3);
++    if (e.usesMtx && (e.matA != g.xfReg[XFR_MATIDX_A] || e.matB != g.xfReg[XFR_MATIDX_B])) return DL_FAIL(4);
+     for (const DlArray& a : e.arrays)
+         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
+-            return false;
++            return DL_FAIL(5);
+     bool unwritten = trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
+     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
+         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
+@@ -1231,7 +1241,7 @@
+         same = GXPC_HASH(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo) == e.arrays[i].hash;
+     if (!same) {
+         if (unwritten) e.hashAlways = true;  // changed behind the write stamps' back
+-        return false;
++        return DL_FAIL(6);
+     }
+     e.checkedClock = clock;
+     e.checkedFrame = g_displayFrames;
+@@ -1368,7 +1378,15 @@
+     e = DlEntry();
+     e.misses = misses;
+     e.hashAlways = hashAlways;
++#if defined(__3DS__)
++    // 3DS port: recording a list costs a few ms on a New 3DS (several times running it
++    // uncached), so a list that had to be re-recorded runs uncached for 32 frames, then 64, up
++    // to 1024. Upstream's three free misses, reset by every successful reuse, let lists that
++    // change every frame or two be recorded again and again (35-40 ms a frame on Delfino Airstrip).
++    if (misses >= 1) e.skip = 32u << (misses - 1 < 5 ? misses - 1 : 5);
++#else
+     if (misses >= 3) e.skip = 4u << (misses - 3 < 8 ? misses - 3 : 8);
++#endif
+     if (s_dlCacheBytes > (size_t(96) << 20)) {  // keep the cache bounded: start over
+         dlClear();
+         runCommands(data, size);

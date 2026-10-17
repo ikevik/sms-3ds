@@ -1,0 +1,45 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 15:08:11
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 15:08:31
+@@ -15,6 +15,15 @@
+ #include <deque>
+ #include <map>
+ #include <unordered_map>
++
++#if defined(__3DS__)
++// 3DS port: draw-sync callbacks (writeBP) for the renderer's [perf] lines.
++extern "C" {
++uint32_t GXPC_DrawSyncCalls;
++uint64_t GXPC_DrawSyncTicks;
++uint64_t svcGetSystemTick(void);
++}
++#endif
+ 
+ namespace gx {
+ 
+@@ -251,7 +260,16 @@
+         g.drawSyncToken = uint16_t(data & 0xFFFF);
+         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
+             flushBatch();
++#if defined(__3DS__)
++            // 3DS port: draw-sync callbacks run game code (and may switch emulated threads) in
++            // the middle of command parsing; counted and timed (wall clock) for [perf].
++            GXPC_DrawSyncCalls++;
++            const uint64_t ds0 = svcGetSystemTick();
+             drawSyncCallback(g.drawSyncToken);
++            GXPC_DrawSyncTicks += svcGetSystemTick() - ds0;
++#else
++            drawSyncCallback(g.drawSyncToken);
++#endif
+         }
+         return;
+     case BP_DRAWDONE:
+--- a/platform/os/os_thread.cpp	2026-10-16 15:08:11
++++ b/platform/os/os_thread.cpp	2026-10-16 15:08:11
+@@ -871,3 +871,7 @@
+ extern "C" void OSSignalCond(OSCond* c) { OSWakeupThread(&c->queue); }
+ 
+ extern "C" double port_idle_seconds(void) { return g_idle_seconds; }
++#if defined(__3DS__)
++// 3DS port: emulated thread switches so far, for the renderer's [perf] lines.
++extern "C" unsigned long long port_os_switches(void) { return g_switch_seq; }
++#endif

@@ -1,0 +1,24 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 14:48:41
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 14:48:41
+@@ -106,9 +106,21 @@
+ static uint32_t s_memSize = 0x01800000;
+ 
+ void* physToPtr(uint32_t phys) {
++#if defined(__3DS__)
++    // 3DS port: MEM1 is a heap block, not the GameCube's own address range, so a pointer
++    // outside it (the game's static data in the program image, other heaps) round-trips
++    // through ptrToPhys as a wrapped 32-bit offset. Masking that to 30 bits sent arrays the
++    // game set while building a display list (GXSetArray during GXBeginDisplayList) to
++    // unmapped memory near 0x40000000: a crash in the pollution counter's colours on Delfino
++    // Airstrip. Offsets inside MEM1 keep the GameCube's masking (cached/uncached tags).
++    if (!phys) return nullptr;
++    if ((phys & 0x3FFFFFFF) < s_memSize) return s_memBase + (phys & 0x3FFFFFFF);
++    return s_memBase + phys;
++#else
+     phys &= 0x3FFFFFFF;
+     if (!phys) return nullptr;
+     return s_memBase + phys;
++#endif
+ }
+ 
+ uint32_t ptrToPhys(const void* p) {

@@ -1,0 +1,17 @@
+--- a/platform/os/os_thread.cpp	2026-10-16 16:03:47
++++ b/platform/os/os_thread.cpp	2026-10-16 16:03:47
+@@ -341,6 +341,14 @@
+ #endif
+ 			abort();
+ 		}
++#if defined(__3DS__)
++		// devkitARM's pthread_create ignores PTHREAD_CREATE_DETACHED (libctru's threadCreate is
++		// always called with detached = false), so a host thread that exits keeps its kernel
++		// thread and its stack until joined, and nothing joins it. Every movie's decoder threads
++		// leaked that way until the process's 32 kernel threads ran out (FLUDD's cutscene).
++		// Detach it here, while g_cpu is held: the new thread cannot have exited yet.
++		pthread_detach(hn->th);
++#endif
+ #if UINTPTR_MAX > 0xFFFFFFFFu
+ 		ls->th = hn->th;
+ #endif

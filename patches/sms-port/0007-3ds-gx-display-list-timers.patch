@@ -1,0 +1,126 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 14:33:18
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 14:41:06
+@@ -911,8 +911,42 @@
+ int CmdTimer::depth;
+ }
+ #define GXPC_CMD_TIMER CmdTimer cmdTimer_
++// Display-list calls split four ways (validating a cached list, replaying it, recording it,
++// running it uncached), each without the back end's own timed work (GX3DS_OursTicks), with
++// counts of records, new cache entries, uncached runs and bytes hashed.
++extern "C" {
++uint64_t GXPC_DlTicks[4];
++uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
++uint64_t GXPC_DlHashed;
++size_t GXPC_DlCacheBytes(void);
++uint32_t GXPC_DlEntryCount(void);
++extern uint64_t GX3DS_OursTicks;
++}
++namespace {
++struct DlTimer {
++    int id;
++    uint64_t t0, o0;
++    explicit DlTimer(int i) : id(i), t0(svcGetSystemTick()), o0(GX3DS_OursTicks) {}
++    void to(int i) {
++        const uint64_t now = svcGetSystemTick(), o = GX3DS_OursTicks;
++        GXPC_DlTicks[id] += (now - t0) - (o - o0);
++        id = i;
++        t0 = now;
++        o0 = o;
++    }
++    ~DlTimer() { to(id); }
++};
++}
++#define GXPC_DL_TIMER(name, id) DlTimer name(id)
++#define GXPC_DL_TO(name, id) name.to(id)
++#define GXPC_DL_COUNT(stmt) stmt
++#define GXPC_HASH(d, n) (GXPC_DlHashed += (n), hashBytes(d, n))
+ #else
++#define GXPC_HASH(d, n) hashBytes(d, n)
+ #define GXPC_CMD_TIMER
++#define GXPC_DL_TIMER(name, id)
++#define GXPC_DL_TO(name, id)
++#define GXPC_DL_COUNT(stmt)
+ #endif
+ 
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
+@@ -1158,6 +1192,13 @@
+     }
+ }
+ 
++#if defined(__3DS__)
++}  // namespace gx
++extern "C" size_t GXPC_DlCacheBytes(void) { return gx::s_dlCacheBytes; }
++extern "C" uint32_t GXPC_DlEntryCount(void) { return uint32_t(gx::s_dlEntries.size()); }
++namespace gx {
++#endif
++
+ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
+     if (!e.valid || e.size != size) return false;
+     if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return false;
+@@ -1173,9 +1214,9 @@
+         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
+     if (unwritten && g_displayFrames - e.checkedFrame < kDlRecheckFrames) return true;
+     uint32_t clock = writeClock();
+-    bool same = hashBytes(data, size) == e.hash;
++    bool same = GXPC_HASH(data, size) == e.hash;
+     for (size_t i = 0; same && i < e.arrays.size(); i++)
+-        same = hashBytes(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo) == e.arrays[i].hash;
++        same = GXPC_HASH(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo) == e.arrays[i].hash;
+     if (!same) {
+         if (unwritten) e.hashAlways = true;  // changed behind the write stamps' back
+         return false;
+@@ -1263,17 +1304,26 @@
+ 
+ void callDisplayList(const uint8_t* data, uint32_t size) {
+     GXPC_CMD_TIMER;
++    GXPC_DL_TIMER(dlt, 3);
++    GXPC_DL_COUNT(GXPC_DlCalls++);
+     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
++        GXPC_DL_COUNT(GXPC_DlUncached++);
+         runCommands(data, size);
+         return;
+     }
++    GXPC_DL_TO(dlt, 0);
+     DlEntry& e = dlLookup(data);
+     if (e.skip) {
++        GXPC_DL_TO(dlt, 3);
++        GXPC_DL_COUNT(GXPC_DlUncached++);
+         e.skip--;
+         runCommands(data, size);
+         return;
+     }
+     if (dlReusable(e, data, size)) {
++        GXPC_DL_TO(dlt, 1);
++        GXPC_DL_COUNT(GXPC_DlHits++);
++        GXPC_DL_COUNT(GXPC_DlVerts += e.verts);
+         if (e.stateOnly) {
+             dlReplayState(e);
+             e.misses = 0;
+@@ -1295,6 +1345,9 @@
+         return;
+     }
+     // (re)record; a list that keeps changing is left alone for a while
++    GXPC_DL_TO(dlt, 2);
++    GXPC_DL_COUNT(GXPC_DlRecords++);
++    GXPC_DL_COUNT(if (!e.valid && !e.size && !e.misses) GXPC_DlNew++);
+     if (e.valid || e.size) e.misses++;
+     if (batchUsesArena()) flushBatch();  // the batch may still read the runs about to be dropped
+     s_dlCacheBytes -= e.bytes;
+@@ -1341,7 +1394,7 @@
+         e.stateOnly = true;
+         for (int i = 0; i < 16; i++) s_dlElem[i] = 0;  // arrays read by lists it called: not its own
+     }
+-    e.hash = hashBytes(data, size);
++    e.hash = GXPC_HASH(data, size);
+     for (int i = 0; i < 16; i++) {
+         if (!s_dlElem[i]) continue;
+         DlArray a;
+@@ -1349,7 +1402,7 @@
+         a.stride = g.arrayStride[i];
+         a.lo = s_dlLo[i] * a.stride;
+         a.hi = s_dlHi[i] * a.stride + s_dlElem[i];
+-        a.hash = hashBytes(a.base + a.lo, a.hi - a.lo);
++        a.hash = GXPC_HASH(a.base + a.lo, a.hi - a.lo);
+         a.slot = uint8_t(i);
+         a.be = g.arrayBigEndian[i];
+         e.arrays.push_back(a);

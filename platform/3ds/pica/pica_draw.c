@@ -19,7 +19,8 @@
 #define VTX_RING_BYTES (5u << 20)
 #define IDX_RING_BYTES (1u << 20)
 #define CMDBUF_BYTES   (1u << 20)
-#define CMDBUF_LIMIT   0.92f /* leave room for the frame's end */
+/* Command-buffer words a draw may not eat into: the rest of the frame's state and its end. */
+#define CMDBUF_RESERVE_WORDS (32u << 10 >> 2)
 
 /* The frame is drawn into an offscreen "EFB" texture (unrotated, covering the GameCube's
  * 640x448 EFB), so EFB copies can be GPU texture copies of it; a display copy draws it onto
@@ -50,6 +51,23 @@ static uint8_t* s_iring[2];
 static uint32_t s_half, s_vused, s_iused;
 static uint32_t s_vflushed, s_iflushed; /* ring bytes already written back for the GPU */
 static uint32_t s_dropped, s_copies;
+static uint32_t s_dropRing, s_dropCmd; /* why draws were dropped (pica_drop_reasons) */
+static u32* s_cmdFrameStart;           /* where this frame's commands begin */
+static uint32_t s_cmdPeakWords;        /* most command words a frame used (pica_cmd_peak) */
+/* Mid-frame GPU submission (maybe_split). */
+extern u8 __C3D_Context[];
+void gxCmdQueueInterrupt(GSPGPU_Event irq); /* libctru gxqueue.c: GSP interrupt handler, not in its headers */
+static gxCmdQueue_s* s_queue;    /* citro3d's GX queue, or NULL: no mid-frame submission */
+static uint32_t s_splitAtWords;  /* cmd_words_used() at this frame's last split */
+static uint32_t s_splits;        /* mid-frame submissions so far (pica_splits) */
+static u16 s_partEntries; /* queue entries up to and including this frame's last part */
+static uint32_t s_lostCompletions; /* GPU completions the watchdog supplied (pica_lost_completions) */
+/* Off by default: with parts in flight, GSP stopped reporting GPU completions altogether after
+ * a while (levels loading in Delfino Plaza; every later command "sent, 0 done"). R at launch. */
+static int s_splitOff = 1; /* pica_set_split(0): whole frames only, as citro3d does */
+void pica_set_split(int on) { s_splitOff = !on; }
+
+static uint32_t s_ringPeak, s_ringPeakNow; /* vertex ring bytes used: most in a frame (pica_ring_peak) */
 
 /* Copy viewer (pica_set_view): 0 shows the EFB as usual, n shows the n-th EFB copy made in the
  * previous frame instead, to inspect render-to-texture passes. */
@@ -65,8 +83,14 @@ static int s_clear_pending = 1;
 static PicaState s_last;
 static int s_last_valid;
 
+/* pica_request_stop: quitting. Every entry point goes through pica_init, so nothing new reaches
+ * the GPU after this, and what is in flight finishes before the screens are shut down. */
+static volatile int s_stopping;
+void pica_request_stop(void) { s_stopping = 1; }
+
 int pica_init(void)
 {
+	if (s_stopping) return 0;
 	if (s_ready) return 1;
 	if (s_failed) return 0;
 	if (!C3D_Init(CMDBUF_BYTES)) goto fail;
@@ -119,6 +143,12 @@ int pica_init(void)
 		if (!s_vring[i] || !s_iring[i]) goto fail;
 	}
 	s_ready = 1;
+	{
+		/* Only with the queue layout this was written for (32 entries, set by C3D_Init). */
+		gxCmdQueue_s* q = (gxCmdQueue_s*)__C3D_Context;
+		s_queue = q->entries && q->maxEntries == 32 && q->numEntries <= q->maxEntries ? q : NULL;
+		if (!s_queue) fprintf(stderr, "[pica] citro3d queue not as expected: no mid-frame GPU submission\n");
+	}
 	fprintf(stderr, "[pica] citro3d ready: EFB %dx%d drawn into a %dx%d texture -> top screen 400x240, "
 	        "rings %u+%u KB x2\n", PICA_EFB_WIDTH, PICA_EFB_HEIGHT, EFB_TEX_W, EFB_TEX_H, VTX_RING_BYTES >> 10,
 	        IDX_RING_BYTES >> 10);
@@ -141,10 +171,14 @@ struct PicaTex {
 static PicaTex* s_dead[2][MAX_DEFERRED];
 static int s_ndead[2];
 
+static int s_dead_due = 1; /* a frame has started since release_dead last ran */
+
 static void release_dead(void)
 {
-	/* After C3D_FrameBegin the GPU has finished the previous frame (citro3d waits for it): the
-	 * textures freed before that frame was submitted can go. */
+	/* Runs just before C3D_FrameBegin, outside a frame (citro3d panics on C3D_RenderTargetDelete
+	 * inside one: the EFB-copy textures freed at FLUDD's prompt). s_dead[1] holds the textures
+	 * freed two frames ago; the C3D_FrameBegin of the last frame waited for the GPU to finish
+	 * the frame that could still draw with them, so they can go. */
 	for (int i = 0; i < s_ndead[1]; i++) {
 		if (s_dead[1][i]->rt) C3D_RenderTargetDelete(s_dead[1][i]->rt);
 		C3D_TexDelete(&s_dead[1][i]->tex);
@@ -242,6 +276,24 @@ static void cpu_mode(void)
 	}
 }
 
+extern uint64_t GX3DS_OursTicks; /* gx3ds_backend.cpp: all timed renderer work */
+static uint64_t s_waitTicks;      /* C3D_FrameBegin waits (pica_wait_ticks) */
+uint64_t pica_wait_ticks(void) { return s_waitTicks; }
+static double s_gpuMsSum;          /* citro3d's GPU time of each finished frame (pica_gpu_ms_sum) */
+double pica_gpu_ms_sum(void) { return s_gpuMsSum; }
+
+/* GPU test (pica_cycle_gpu_test): 1 scissors every game draw to 8x8 pixels, so the GPU still
+ * transforms every vertex but shades almost no pixels. Comparing its GPU time with the normal
+ * mode's tells vertex work from pixel work. */
+static int s_gpuTest;
+int pica_cycle_gpu_test(void)
+{
+	s_gpuTest = (s_gpuTest + 1) % 2;
+	s_last_valid = 0;
+	return s_gpuTest;
+}
+int pica_gpu_test(void) { return s_gpuTest; }
+
 /* Where the game thread is in the renderer, for the main thread's hang report (pica_where). */
 static const char* volatile s_where = "not started";
 static volatile uint32_t s_frameDraws;
@@ -257,6 +309,151 @@ static void s_checkFramesInc(void)
 }
 uint32_t pica_frame_draws(void) { return s_frameDraws; }
 
+/* Overlapped frames (pica_set_overlap). citro3d's C3D_FrameBegin waits for the GPU to finish the
+ * previous frame before the CPU may build the next, so CPU and GPU took turns (each about 50-60
+ * ms a frame in Delfino Plaza). Instead, two command buffers and two GX queues alternate: frame
+ * N is built into one while the GPU runs frame N-1 from the other, and the wait for N-1 moves to
+ * the end of frame N, just before N is queued. Each queue is filled while stopped and run whole,
+ * once the other has finished, as citro3d does; nothing is added to a running queue (the
+ * mid-frame parts above did that, and GSP then lost completions). libctru's queue code (2.x):
+ * one queue runs at a time, gxCmdQueueWait waits for whichever runs, gxCmdQueueAdd on a queue
+ * that is not running only stores the command. citro3d's frame calls are replaced here: its
+ * C3D_FrameBegin would wait, and C3D_FrameDrawOn/C3D_FrameSplit need its own in-frame flag. */
+bool C3Di_SplitFrame(u32** pBuf, u32* pSize); /* citro3d internal (base.c), exported */
+#define OVL_ENTRIES 32
+static int s_ovlWanted;           /* pica_set_overlap */
+static int s_ovl;                 /* frames are overlapped from the next frame start on */
+static gxCmdQueue_s s_ovq[2];
+static gxCmdEntry_s s_ovEntries[2][OVL_ENTRIES];
+static u32* s_ovCmd[2];
+static u32 s_ovCmdWords;
+static int s_ovb;                         /* queue and command buffer of the frame being built */
+static gxCmdQueue_s* s_ovRunning;         /* queued last; the GPU may still be running it */
+static volatile int s_ovSwap[2];          /* the queue ends with a transfer to the top screen */
+static volatile u64 s_ovRunT0, s_ovDoneT; /* when the last queue started and finished */
+static u32* s_c3dCmdBuf;                  /* citro3d's command buffer (seen at its frame starts) */
+static u32 s_c3dCmdWords;
+void pica_set_overlap(int on) { s_ovlWanted = on; }
+int pica_overlap(void) { return s_ovl; }
+
+static void ovl_done(gxCmdQueue_s* q)
+{
+	/* GSP interrupt (libctru's queue callback): the frame is drawn and on its way to the screen. */
+	s_ovDoneT = svcGetSystemTick();
+	const int i = q == &s_ovq[1];
+	if (s_ovSwap[i]) {
+		s_ovSwap[i] = 0;
+		gfxScreenSwapBuffers(GFX_TOP, false);
+	}
+}
+
+/* Switches over from citro3d's own frames, between two frames (the GPU self-test runs on those). */
+static int ovl_start(void)
+{
+	if (!s_queue || !s_c3dCmdBuf) return 0;
+	s_ovCmd[0] = s_c3dCmdBuf;
+	s_ovCmdWords = s_c3dCmdWords;
+	s_ovCmd[1] = (u32*)linearAlloc(s_ovCmdWords * 4u);
+	if (!s_ovCmd[1]) {
+		fprintf(stderr, "[pica] no linear memory for a second command buffer: frames not overlapped\n");
+		s_ovlWanted = 0;
+		return 0;
+	}
+	gxCmdQueueWait(s_queue, -1); /* citro3d's last frame */
+	gxCmdQueueStop(s_queue);
+	gxCmdQueueClear(s_queue);
+	for (int i = 0; i < 2; i++) {
+		memset(&s_ovq[i], 0, sizeof s_ovq[i]);
+		s_ovq[i].entries = s_ovEntries[i];
+		s_ovq[i].maxEntries = OVL_ENTRIES;
+		gxCmdQueueSetCallback(&s_ovq[i], ovl_done, NULL);
+	}
+	s_ovb = 0;
+	s_ovRunning = NULL;
+	s_ovl = 1;
+	fprintf(stderr, "[pica] frames overlapped: the CPU builds the next frame while the GPU draws (%lu KB command "
+	        "buffers x2)\n", (unsigned long)(s_ovCmdWords >> 8));
+	return 1;
+}
+
+/* Waits for the queue the GPU runs, with the watchdog of frame_begin_ex. */
+static void ovl_wait_running(void)
+{
+	if (!s_ovRunning) return;
+	const u64 w0 = svcGetSystemTick();
+	u64 since = w0;
+	while (!gxCmdQueueWait(s_ovRunning, 0)) {
+		svcSleepThread(200000); /* 0.2 ms */
+		if (svcGetSystemTick() - since > SYSCLOCK_ARM11 / 2) {
+			fprintf(stderr, "[pica] GPU completion missing for 500 ms (%s): supplied it\n", pica_queue_state());
+			gxCmdQueueInterrupt(GSPGPU_EVENT_P3D);
+			s_lostCompletions++;
+			since = svcGetSystemTick();
+		}
+	}
+	const u64 w = svcGetSystemTick() - w0;
+	s_waitTicks += w;
+	GX3DS_OursTicks += w;
+	gxCmdQueueStop(s_ovRunning);
+	if (s_ovDoneT > s_ovRunT0) s_gpuMsSum += (double)(s_ovDoneT - s_ovRunT0) / (SYSCLOCK_ARM11 / 1000.0);
+	s_ovRunning = NULL;
+}
+
+static void ovl_frame_begin(void)
+{
+	/* This frame's queue last ran two frames ago, and the last frame's end waited for it. */
+	gxCmdQueue_s* q = &s_ovq[s_ovb];
+	gxCmdQueueClear(q);
+	GX_BindQueue(q);
+	GPUCMD_SetBuffer(s_ovCmd[s_ovb], s_ovCmdWords, 0);
+}
+
+static void ovl_frame_end(void)
+{
+	gxCmdQueue_s* q = &s_ovq[s_ovb];
+	u32* buf;
+	u32 size;
+	if (C3Di_SplitFrame(&buf, &size)) GX_ProcessCommandList(buf, size * 4, GX_CMDLIST_FLUSH);
+	GPUCMD_SetBuffer(NULL, 0, 0);
+	{
+		/* As C3D_FrameEnd(0): write back the whole linear heap. */
+		extern u32 __ctru_linear_heap, __ctru_linear_heap_size;
+		GSPGPU_FlushDataCache((void*)__ctru_linear_heap, __ctru_linear_heap_size);
+	}
+	s_where = "waiting for the GPU to finish the previous frame";
+	ovl_wait_running();
+	/* The previous frame has swapped the screens: this transfer targets the new back buffer. */
+	if (s_top->used) {
+		s_top->used = false;
+		C3D_FrameBufTransfer(&s_top->frameBuf, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
+		s_ovSwap[s_ovb] = 1;
+	}
+	s_ovRunT0 = svcGetSystemTick();
+	gxCmdQueueRun(q);
+	s_ovRunning = q;
+	s_ovb ^= 1;
+}
+
+const char* pica_queue_state(void);
+
+/* C3D_FrameDrawOn, without citro3d's in-frame check in overlapped frames. */
+static void draw_on(C3D_RenderTarget* t)
+{
+	if (!s_ovl) {
+		C3D_FrameDrawOn(t);
+		return;
+	}
+	t->used = true;
+	C3D_SetFrameBuf(&t->frameBuf);
+	C3D_SetViewport(0, 0, t->frameBuf.width, t->frameBuf.height);
+}
+
+static void frame_end(void)
+{
+	if (s_ovl) ovl_frame_end();
+	else C3D_FrameEnd(0);
+}
+
 /* flags: C3D_FRAME_NONBLOCK returns 0 instead of waiting while the GPU is busy. */
 static int frame_begin_ex(u8 flags)
 {
@@ -265,10 +462,54 @@ static int frame_begin_ex(u8 flags)
 	 * its emulated VI retrace; blocking here as well left the retrace already due whenever the
 	 * game waited for it, so the main thread never slept and lower-priority threads (stage
 	 * setup, priority 17) were starved. citro3d still waits for the previous frame's GPU work. */
+	if (s_dead_due) { /* once per started frame, even when a non-blocking begin fails */
+		release_dead();
+		s_dead_due = 0;
+	}
+	if (!s_ovl && s_ovlWanted && s_splitOff && !s_check) ovl_start();
+	if (s_ovl) {
+		ovl_frame_begin(); /* no wait: the GPU may still be drawing the last frame */
+	} else {
 	s_where = "C3D_FrameBegin (waiting for the GPU to finish the last frame)";
-	if (!C3D_FrameBegin(flags)) return 0;
+	{
+		/* Time spent waiting here is the GPU (or the screen) holding the game back: counted as
+		 * its own [perf] figure and left out of the front half's timers (GX3DS_OursTicks). */
+		const u64 w0 = svcGetSystemTick();
+		int ok;
+		if (flags & C3D_FRAME_NONBLOCK) {
+			ok = C3D_FrameBegin(flags);
+		} else {
+			/* Waiting for the GPU, with a watchdog: now and then the hardware never reports a GX
+			 * command done (libctru then waits forever; seen with mid-frame parts and with the EFB
+			 * clear run on its own). No frame takes the GPU 500 ms (80 ms at most so far), so
+			 * after that the missing completion is supplied: a hitch instead of a freeze. */
+			u64 since = w0;
+			while (!(ok = C3D_FrameBegin(flags | C3D_FRAME_NONBLOCK))) {
+				svcSleepThread(200000); /* 0.2 ms */
+				if (s_queue && svcGetSystemTick() - since > SYSCLOCK_ARM11 / 2) {
+					fprintf(stderr, "[pica] GPU completion missing for 500 ms (%s): supplied it\n",
+					        pica_queue_state());
+					gxCmdQueueInterrupt(GSPGPU_EVENT_P3D);
+					s_lostCompletions++;
+					since = svcGetSystemTick();
+				}
+			}
+		}
+		const u64 w = svcGetSystemTick() - w0;
+		s_waitTicks += w;
+		GX3DS_OursTicks += w;
+		if (!ok) return 0;
+		s_gpuMsSum += C3D_GetDrawingTime(); /* the frame just waited for */
+	}
+	s_c3dCmdBuf = gpuCmdBuf; /* citro3d's buffer, reused by overlapped frames */
+	s_c3dCmdWords = gpuCmdBufSize;
+	}
 	s_where = "in a frame (game code or drawing)";
-	release_dead();
+	s_dead_due = 1;
+	s_cmdFrameStart = gpuCmdBuf;
+	s_splitAtWords = 0;
+	s_partEntries = 0;
+	if (s_vused > s_ringPeakNow) s_ringPeakNow = s_vused;
 	s_half ^= 1;
 	s_vused = s_iused = s_vflushed = s_iflushed = 0;
 	s_last_valid = 0;
@@ -276,7 +517,7 @@ static int frame_begin_ex(u8 flags)
 		C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
 		s_clear_pending = 0;
 	}
-	C3D_FrameDrawOn(s_efb);
+	draw_on(s_efb);
 	set_cpu_proj(&s_projEfb);
 	s_in_frame = 1;
 	return 1;
@@ -284,15 +525,104 @@ static int frame_begin_ex(u8 flags)
 
 static void frame_begin(void) { frame_begin_ex(0); }
 
+/* Command-buffer room left in this frame. Not C3D_GetCmdBufUsage(): citro3d updates that only
+ * when it splits the command list and never resets it at a frame's start, so after one frame ran
+ * the buffer past the limit it kept reporting it full and every later draw was dropped (the
+ * screen froze at the goop after FLUDD). libctru's own offset and size are always current. */
+static int cmd_room(void) { return gpuCmdBufSize - gpuCmdBufOffset > CMDBUF_RESERVE_WORDS; }
+
+static void flush_rings(void);
+
+/* Handing the GPU the frame in parts. citro3d runs a frame's command list only at C3D_FrameEnd,
+ * and SMS issues its draws right after the previous frame's display copy, so the next
+ * C3D_FrameBegin waited for the GPU's whole frame (its drawing time and the wait matched to
+ * 0.5 ms in Delfino Plaza, about 60 ms): CPU and GPU never worked at once. Every SPLIT_WORDS of
+ * commands the list so far is queued and the queue started, and the GPU draws while the CPU
+ * makes the rest. citro3d's queue (its context's first member, citro3d 1.7.1) holds 32 entries
+ * a frame; the frame's end needs two (its last part and the screen transfer). */
+#define SPLIT_WORDS (48u << 10 >> 2)
+#define SPLIT_SPARE_ENTRIES 6
+
+static uint32_t cmd_words_used(void);
+
+
+/* The last part queued has completed (lastEntry counts completions). Only our own parts count:
+ * the EFB clear at a frame's start queues a memory fill that waits until the queue first runs.
+ * Running that fill early instead left the frame's command list never reported done (17:15
+ * build, frame 2); see frame_begin_ex's watchdog for completions the hardware never reports. */
+static int queue_idle(void)
+{
+	return *(volatile u16*)&s_queue->lastEntry >= s_partEntries;
+}
+
+/* Before C3D_FrameEnd queues the frame's last part: wait for the parts already running, so the
+ * last list is again the only one in flight (see maybe_split). */
+static void drain_parts(void)
+{
+	if (!s_queue || s_splitAtWords == 0) return;
+	const u64 t0 = svcGetSystemTick();
+	while (!queue_idle()) {
+		svcSleepThread(100000); /* 0.1 ms */
+		if (svcGetSystemTick() - t0 > SYSCLOCK_ARM11 / 4) break; /* 250 ms: the stall report says why */
+	}
+	const u64 w = svcGetSystemTick() - t0;
+	s_waitTicks += w;
+	GX3DS_OursTicks += w;
+}
+
+const char* pica_queue_state(void)
+{
+	static char buf[96];
+	const gxCmdQueue_s* q = s_ovl ? (s_ovRunning ? s_ovRunning : &s_ovq[s_ovb]) : s_queue;
+	if (!q) return "queue unknown";
+	snprintf(buf, sizeof buf, "GX queue%s %u entries, %u sent, %u done", s_ovl ? " (overlapped)" : "",
+	         (unsigned)q->numEntries, (unsigned)q->curEntry, (unsigned)q->lastEntry);
+	return buf;
+}
+
+static void maybe_split(void)
+{
+	if (!s_queue || !s_in_frame || s_splitOff) return; /* the GPU check mode ends a frame after each draw */
+	const uint32_t used = cmd_words_used();
+	if (used - s_splitAtWords < SPLIT_WORDS || s_queue->numEntries + SPLIT_SPARE_ENTRIES > s_queue->maxEntries)
+		return;
+	/* Only once the GPU has finished every part queued so far. libctru keeps up to three GX
+	 * commands in flight and counts their completions by interrupt; two command lists finishing
+	 * back to back left it a completion short (GSP merges a repeated interrupt, it seems), and
+	 * the next C3D_FrameBegin waited forever (Delfino Plaza, frame 791). One list in flight at a
+	 * time cannot lose one. */
+	if (!queue_idle()) return;
+	flush_rings(); /* the vertices and indices the queued part draws */
+	C3D_FrameSplit(GX_CMDLIST_FLUSH);
+	s_partEntries = s_queue->numEntries;
+	gxCmdQueueRun(s_queue); /* no-op once running; later parts start as they are added */
+	s_splitAtWords = cmd_words_used();
+	s_splits++;
+}
+
+uint32_t pica_splits(void) { return s_splits; }
+uint32_t pica_lost_completions(void) { return s_lostCompletions; }
+
+static uint32_t cmd_words_used(void)
+{
+	return s_cmdFrameStart ? (uint32_t)(gpuCmdBuf - s_cmdFrameStart) + gpuCmdBufOffset : 0;
+}
+
+static void count_drop(int ring_full)
+{
+	s_dropped++;
+	if (ring_full) s_dropRing++;
+	else s_dropCmd++;
+}
+
 int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx)
 {
 	if (!pica_init()) return 0;
 	if (!s_in_frame) frame_begin();
 	uint32_t vbytes = nverts * (uint32_t)sizeof(PicaVtx);
 	uint32_t ibytes = (nidx * 2u + 3u) & ~3u;
-	if (nverts > 0xFFFF || s_vused + vbytes > VTX_RING_BYTES || s_iused + ibytes > IDX_RING_BYTES ||
-	    C3D_GetCmdBufUsage() > CMDBUF_LIMIT) {
-		s_dropped++;
+	if (nverts > 0xFFFF || s_vused + vbytes > VTX_RING_BYTES || s_iused + ibytes > IDX_RING_BYTES || !cmd_room()) {
+		count_drop(cmd_room());
 		return 0;
 	}
 	*verts = (PicaVtx*)(s_vring[s_half] + s_vused);
@@ -307,8 +637,8 @@ int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
 	if (!pica_init()) return 0;
 	if (!s_in_frame) frame_begin();
 	uint32_t ibytes = (nidx * 2u + 3u) & ~3u;
-	if (s_vused + vbytes > VTX_RING_BYTES || s_iused + ibytes > IDX_RING_BYTES || C3D_GetCmdBufUsage() > CMDBUF_LIMIT) {
-		s_dropped++;
+	if (s_vused + vbytes > VTX_RING_BYTES || s_iused + ibytes > IDX_RING_BYTES || !cmd_room()) {
+		count_drop(cmd_room());
 		return 0;
 	}
 	*verts = s_vring[s_half] + s_vused;
@@ -406,6 +736,15 @@ static int gx_attribs(const PicaGxLayout* L, u64* perm)
 static int s_gxEntries;
 static u64 s_gxPerm;
 
+/* Sets a vertex shader uniform only if it changed: citro3d uploads every vector marked dirty, and
+ * a draw used to rewrite all 60 matrix rows and 19 other vectors (about 1.3 KB of GPU commands)
+ * though usually one matrix had moved. C3D_FVUnif holds the values last set. */
+static inline void vunif(int id, float x, float y, float z, float w)
+{
+	const C3D_FVec* v = &C3D_FVUnif[GPU_VERTEX_SHADER][id];
+	if (v->x != x || v->y != y || v->z != z || v->w != w) C3D_FVUnifSet(GPU_VERTEX_SHADER, id, x, y, z, w);
+}
+
 int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
                  const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
                  const PicaState* st)
@@ -433,26 +772,27 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	apply_state(st);
 	if (matrices_dirty || !s_gxMatricesLoaded) {
 		for (int r = 0; r < PICA_GX_MTX_ROWS; r++) {
-			C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uP + r, pos_rows[r][0], pos_rows[r][1], pos_rows[r][2], pos_rows[r][3]);
-			C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uN + r, nrm_rows[r][0], nrm_rows[r][1], nrm_rows[r][2], 0.0f);
+			vunif(s_uP + r, pos_rows[r][0], pos_rows[r][1], pos_rows[r][2], pos_rows[r][3]);
+			vunif(s_uN + r, nrm_rows[r][0], nrm_rows[r][1], nrm_rows[r][2], 0.0f);
 		}
 		s_gxMatricesLoaded = 1;
 	}
-	for (int r = 0; r < 4; r++) C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uF + r, u->F[r][0], u->F[r][1], u->F[r][2], u->F[r][3]);
+	for (int r = 0; r < 4; r++) vunif(s_uF + r, u->F[r][0], u->F[r][1], u->F[r][2], u->F[r][3]);
 	s_fIsCpu = 0;
 	for (int r = 0; r < 6; r++) {
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uT + r, u->T[r][0], u->T[r][1], u->T[r][2], u->T[r][3]);
-		C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uW + r, u->W[r][0], u->W[r][1], u->W[r][2], u->W[r][3]);
+		vunif(s_uT + r, u->T[r][0], u->T[r][1], u->T[r][2], u->T[r][3]);
+		vunif(s_uW + r, u->W[r][0], u->W[r][1], u->W[r][2], u->W[r][3]);
 	}
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uLD, u->LD[0], u->LD[1], u->LD[2], u->LD[3]);
+	vunif(s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
+	vunif(s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
+	vunif(s_uLD, u->LD[0], u->LD[1], u->LD[2], u->LD[3]);
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, verts, L->stride, s_gxEntries, s_gxPerm);
 	s_frameDraws++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 	gpu_check("GPU-transform draw", L, nidx, st);
+	maybe_split();
 	return 1;
 }
 
@@ -512,7 +852,9 @@ static void apply_state(const PicaState* st)
 	}
 	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
 	C3D_CullFace((GPU_CULLMODE)st->cull);
-	if (st->scissor) {
+	if (s_gpuTest == 1) {
+		C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 8, 8);
+	} else if (st->scissor) {
 		/* The EFB texture holds the EFB with its bottom row first (pica_efb_uv); scissor
 		 * coordinates are its pixels. */
 		u32 l = st->sc_x0 * EFB_TEX_W / PICA_EFB_WIDTH, r = (st->sc_x1 * EFB_TEX_W + PICA_EFB_WIDTH - 1) / PICA_EFB_WIDTH;
@@ -545,6 +887,7 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 	s_frameDraws++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 	gpu_check("CPU-path draw", NULL, nidx, st);
+	maybe_split();
 }
 
 void pica_clear(uint32_t rgba, uint32_t depth24)
@@ -553,7 +896,7 @@ void pica_clear(uint32_t rgba, uint32_t depth24)
 	s_clear_depth = depth24 & 0xFFFFFF;
 	if (s_in_frame) {
 		C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
-		C3D_FrameDrawOn(s_efb);
+		draw_on(s_efb);
 		s_last_valid = 0;
 		gpu_check("EFB clear", NULL, 0, NULL);
 	} else {
@@ -693,9 +1036,9 @@ void pica_efb_copy_to(PicaTex* dst, int alpha_one)
 	if (!s_in_frame) frame_begin();
 	/* A draw pass, not a texture copy: it stays in the frame's command list (no CPU wait) and
 	 * can fix alpha, as the GameCube's copy does for EFB formats without alpha. */
-	C3D_FrameDrawOn(dst->rt);
+	draw_on(dst->rt);
 	draw_efb_quad(alpha_one, &s_efbTex);
-	C3D_FrameDrawOn(s_efb);
+	draw_on(s_efb);
 	{
 		char what[96];
 		snprintf(what, sizeof what, "EFB copy into texture %p (%ux%u, fmt %d)", (void*)dst, dst->tex.width,
@@ -712,7 +1055,7 @@ void pica_present(void)
 	if (!s_in_frame) frame_begin();
 
 	/* The EFB texture as one quad over the whole top screen. */
-	C3D_FrameDrawOn(s_top);
+	draw_on(s_top);
 	set_cpu_proj(&s_projTop);
 	C3D_Tex* show = &s_efbTex;
 	if (s_view > 0 && s_view <= s_nLastFrameCopies) show = &s_lastFrameCopies[s_view - 1]->tex;
@@ -721,8 +1064,14 @@ void pica_present(void)
 	memcpy(s_lastFrameCopies, s_frameCopies, sizeof s_frameCopies);
 	s_nLastFrameCopies = s_nFrameCopies;
 	s_nFrameCopies = 0;
+	{
+		const uint32_t used = cmd_words_used();
+		if (used > s_cmdPeakWords) s_cmdPeakWords = used;
+	}
+	s_where = "waiting for the GPU to finish the frame's earlier parts";
+	drain_parts();
 	s_where = "C3D_FrameEnd (submitting the frame)";
-	C3D_FrameEnd(0);
+	frame_end();
 	s_where = "between frames (game code)";
 	s_frameDraws = 0;
 	s_checkFramesInc();
@@ -743,6 +1092,23 @@ int pica_view(void) { return s_view; }
 int pica_view_count(void) { return s_nLastFrameCopies; }
 
 uint32_t pica_dropped(void) { return s_dropped; }
+
+void pica_drop_reasons(uint32_t* ring, uint32_t* cmdbuf)
+{
+	*ring = s_dropRing;
+	*cmdbuf = s_dropCmd;
+}
+
+uint32_t pica_cmd_peak(void)
+{
+	const uint32_t p = s_cmdPeakWords * 4u;
+	s_cmdPeakWords = 0;
+	return p;
+}
+
+uint32_t pica_cmd_capacity(void) { return CMDBUF_BYTES; }
+
+uint32_t pica_linear_free(void) { return (uint32_t)linearSpaceFree(); }
 
 /* ---- hardware self-test ------------------------------------------------------------------ */
 /* Runs the pieces of a game frame one frame at a time and logs each: a piece the GPU never
@@ -767,7 +1133,7 @@ static int selftest_wait(const char* after)
 static void selftest_end(void)
 {
 	flush_rings();
-	C3D_FrameEnd(0);
+	frame_end();
 	s_in_frame = 0;
 	s_last_valid = 0;
 }
@@ -962,7 +1328,7 @@ static void gpu_check(const char* kind, const PicaGxLayout* L, uint32_t nidx, co
 	if (!s_check || !s_in_frame) return;
 	s_checkDraws++;
 	flush_rings();
-	C3D_FrameEnd(0);
+	frame_end();
 	s_in_frame = 0;
 	s_last_valid = 0;
 	u64 t0 = osGetTime();
@@ -982,4 +1348,26 @@ static void gpu_check(const char* kind, const PicaGxLayout* L, uint32_t nidx, co
 		}
 		svcSleepThread(200000);
 	}
+}
+
+/* Most vertex-ring bytes one frame used since the last call (one ring half's capacity:
+ * pica_ring_capacity). */
+uint32_t pica_ring_peak(void)
+{
+	s_ringPeak = s_ringPeakNow;
+	s_ringPeakNow = 0;
+	return s_ringPeak;
+}
+uint32_t pica_ring_capacity(void) { return VTX_RING_BYTES; }
+
+int pica_kernel_threads(void)
+{
+	Handle rl;
+	ResourceLimitType what = RESLIMIT_THREAD;
+	s64 cur = -1;
+	if (R_FAILED(svcGetResourceLimit(&rl, CUR_PROCESS_HANDLE)))
+		return -1;
+	svcGetResourceLimitCurrentValues(&cur, rl, &what, 1);
+	svcCloseHandle(rl);
+	return (int)cur;
 }
