@@ -32,7 +32,8 @@ extern "C" void PADControlAllMotors(const u32*) {}
 
 extern "C" u32 PADRead(PADStatus* status)
 {
-	hidScanInput();
+	// Quitting: the game thread stops here, before the services it uses are shut down.
+	while (pad3ds_quit) svcSleepThread(1000000000LL);
 	Pad3DSStatus in;
 	pad3ds_read(&in);
 

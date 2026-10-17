@@ -28,8 +28,11 @@ typedef struct {
 	int8_t   err;                  // 0 = OK
 } Pad3DSStatus;
 
-// Call once per frame after hidScanInput().
+// Main thread, after each hidScanInput(): takes a reading. Game thread: the latest reading.
+void pad3ds_poll(void);
 void pad3ds_read(Pad3DSStatus* out);
+// Set by the main thread when quitting: the game thread stops at its next PADRead.
+extern volatile int pad3ds_quit;
 
 // Mapping:
 //   Circle Pad -> main stick        C-stick (New 3DS) -> C-stick

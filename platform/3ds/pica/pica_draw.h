@@ -173,6 +173,17 @@ const char* pica_queue_state(void);
 void pica_set_split(int on);
 /* Overlapped frames: the CPU builds the next frame while the GPU draws the last (pica_draw.c). */
 void pica_set_overlap(int on);
+/* Linear memory for resident vertices, written back for the GPU with pica_flush; pica_gpu_idle
+ * waits for every frame handed to the GPU. */
+void* pica_linear_alloc(uint32_t bytes);
+void pica_linear_free_block(void* p);
+void pica_flush(const void* p, uint32_t bytes);
+void pica_gpu_idle(void);
+/* Starts fn(arg) on another CPU core (2, else 1), detached; returns the core, or -1. Two one-shot
+ * events (0, 1) for it and the thread that started it to wake each other. */
+int pica_thread_start(void (*fn)(void*), void* arg);
+void pica_event_wait(int i);
+void pica_event_signal(int i);
 int pica_overlap(void);
 /* GPU completions the frame-start watchdog had to supply (the hardware never reported them). */
 uint32_t pica_lost_completions(void);

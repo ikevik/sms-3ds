@@ -4,6 +4,7 @@
 // progress on the bottom screen. Graphics are counted, not drawn yet (gx3ds_backend.cpp).
 // Everything the port logs (port_log -> stderr) goes to sdmc:/sms/log.txt.
 #include <3ds.h>
+#include "pad_3ds.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +34,8 @@ int pica_selftest(void);
 void pica_set_gpu_check(int on);
 void pica_set_split(int on);
 void pica_set_overlap(int on);
+void GX3DS_SetArena(int on);
+void GX3DS_SetRenderThread(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
@@ -331,6 +334,19 @@ int main()
 		printf("L held: off-screen culling off\n");
 		fprintf(stderr, "[3ds] L held at launch: off-screen culling off\n");
 	}
+	// Holding D-pad up at launch copies cached geometry into every frame again (resident
+	// vertices off, to compare).
+	if (launchHeld & KEY_DUP) {
+		GX3DS_SetArena(0);
+		printf("Up held: resident vertices off\n");
+		fprintf(stderr, "[3ds] Up held at launch: cached geometry copied every frame (no resident vertices)\n");
+	}
+	// Holding D-pad left at launch draws on the game thread, as before the render thread (to compare).
+	if (launchHeld & KEY_DLEFT) {
+		GX3DS_SetRenderThread(0);
+		printf("Left held: no render thread\n");
+		fprintf(stderr, "[3ds] Left held at launch: renderer on the game thread (no render thread)\n");
+	}
 	if (launchHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
 		printf("B held: CPU vertex path\n");
@@ -372,10 +388,11 @@ int main()
 
 	static const char* const phase[] = {"waiting", "port_init", "SMS_main (running)", "SMS_main returned"};
 	while (aptMainLoop()) {
-		// The game thread scans HID too (pad_sdk.cpp), so a press can be consumed there before
-		// hidKeysDown() sees it here: detect edges on the held state instead. START alone is the
-		// game's Start button, so quitting needs START+SELECT.
+		// Edges are detected on the held state (the game's PADRead once scanned HID too, consuming
+		// presses before hidKeysDown() saw them). START alone is the game's Start button, so quitting
+		// needs START+SELECT.
 		hidScanInput();
+		pad3ds_poll();  // the game's PADRead takes this reading (pad_3ds.c)
 		static u32 prevHeld;
 		u32 held = hidKeysHeld(), pressed = held & ~prevHeld;
 		prevHeld = held;
@@ -461,6 +478,10 @@ int main()
 	// The game thread may be mid-frame: stop it submitting GPU work and let what is in flight
 	// finish, so gfxExit does not free the screens under a running display transfer (a quit
 	// that sometimes did not return cleanly).
+	// Park the game thread at its next PADRead (once a frame; a slow frame is ~200 ms), so it is not
+	// running game or GX code while the services and the heap go away.
+	pad3ds_quit = 1;
+	svcSleepThread(400000000LL);
 	pica_request_stop();
 	svcSleepThread(100000000LL);
 	// _exit, not a return from main: exit's atexit handlers and static destructors can wait on

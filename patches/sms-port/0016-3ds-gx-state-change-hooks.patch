@@ -1,0 +1,70 @@
+--- a/platform/gx/src/gx_internal.h	2026-10-16 21:12:32
++++ b/platform/gx/src/gx_internal.h	2026-10-16 21:12:32
+@@ -201,6 +201,12 @@
+ void onStateChange();  // called before any register write that changes state
+ void executeCopy(uint32_t execReg);
+ void markXfMemDirty();
++// 3DS port: register changes, for the renderer's copy of the state (its render thread): BP register
++// reg written, XF address addr changed, TLUT bytes loaded, everything reset.
++void bpTouched(uint32_t reg);
++void xfTouched(uint32_t addr);
++void tlutTouched(uint32_t off, uint32_t bytes);
++void stateReset();
+ uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
+ uint32_t peekZ(int x, int y);      // 24-bit
+ void pixMetricClear();
+--- a/platform/gx/src/gx_api.cpp	2026-10-16 21:12:32
++++ b/platform/gx/src/gx_api.cpp	2026-10-16 21:12:32
+@@ -1364,6 +1364,7 @@
+     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
+     onStateChange();
+     if (t->data) memcpy(g.tlutMem + off, t->data, bytes);
++    tlutTouched(off, bytes);
+ }
+ void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
+     TexRegionInt* r = reinterpret_cast<TexRegionInt*>(region);
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 21:12:32
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 21:12:32
+@@ -228,9 +228,18 @@
+         memcpy(&g.xfMem[0x500 + 61 * 4 + i], &ident[i], 4);
+     }
+     (void)be;
++    stateReset();  // 3DS port: the renderer's copy of the registers starts over
+ }
+ 
++// 3DS port: writeBP tells the renderer which register it wrote (bpTouched), so its render thread
++// gets only the registers that changed.
++static void writeBPImpl(uint32_t value);
+ void writeBP(uint32_t value) {
++    writeBPImpl(value);
++    bpTouched(value >> 24);
++}
++
++static void writeBPImpl(uint32_t value) {
+     uint32_t reg = value >> 24;
+     uint32_t data = value & 0xFFFFFF;
+     if (reg == BP_MASK) {
+@@ -284,6 +293,7 @@
+         if (tmemOff + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - tmemOff;
+         onStateChange();
+         if (src && bytes) memcpy(g.tlutMem + tmemOff, src, bytes);
++        tlutTouched(tmemOff, bytes);
+         return;
+     }
+     case BP_TEXINVALIDATE:
+@@ -351,13 +361,14 @@
+             if (g.xfMem[addr] != v) {
+                 onStateChange();
+                 g.xfMem[addr] = v;
+-                markXfMemDirty();
++                xfTouched(addr);
+             }
+         } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
+             uint32_t r = addr - XF_REG_BASE;
+             if (g.xfReg[r] != v) {
+                 onStateChange();
+                 g.xfReg[r] = v;
++                xfTouched(addr);
+             }
+         }
+     }

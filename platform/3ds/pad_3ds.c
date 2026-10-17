@@ -11,7 +11,7 @@ static int8_t scale_axis(int16_t v)
 	return (int8_t)s;
 }
 
-void pad3ds_read(Pad3DSStatus* out)
+static void read_now(Pad3DSStatus* out)
 {
 	memset(out, 0, sizeof(*out));
 	u32 held = hidKeysHeld();
@@ -39,4 +39,27 @@ void pad3ds_read(Pad3DSStatus* out)
 	irrstCstickRead(&cs);   // New 3DS C-stick (needs irrstInit)
 	out->substickX = scale_axis(cs.dx);
 	out->substickY = scale_axis(cs.dy);
+}
+
+/* The main thread reads the buttons (pad3ds_poll, after its hidScanInput) and the game thread takes
+ * the latest reading (pad3ds_read): HID is touched by one thread only, and never after the main
+ * thread starts shutting the services down. */
+static Pad3DSStatus s_latest;
+static LightLock s_lock = 1; /* 1: unlocked */
+volatile int pad3ds_quit;
+
+void pad3ds_poll(void)
+{
+	Pad3DSStatus st;
+	read_now(&st);
+	LightLock_Lock(&s_lock);
+	s_latest = st;
+	LightLock_Unlock(&s_lock);
+}
+
+void pad3ds_read(Pad3DSStatus* out)
+{
+	LightLock_Lock(&s_lock);
+	*out = s_latest;
+	LightLock_Unlock(&s_lock);
 }

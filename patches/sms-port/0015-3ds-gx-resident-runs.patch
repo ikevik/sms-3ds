@@ -1,0 +1,16 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-16 20:36:30
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-16 20:36:30
+@@ -1472,7 +1472,13 @@
+             if (dlRunOffscreen(r)) continue;
+ #endif
+             const uint32_t nidx = uint32_t(r.idx.size());
++#if defined(__3DS__)
++            // 3DS port: only triangles without per-vertex matrices are kept resident (the back
++            // end draws them in place; its per-vertex matrix checks read the batch's own copy).
++            if (arena && nidx && r.cls == PRIM_TRIS && !(r.fmt & VF_MTX) &&
++#else
+             if (arena && nidx &&
++#endif
+                 (r.arena.gen == arenaGeneration() ||
+                  arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena)))
+                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());

@@ -16,7 +16,7 @@
 
 /* A frame's vertices and indices live in one half of each ring; the other half belongs to the
  * frame the GPU may still be drawing. */
-#define VTX_RING_BYTES (5u << 20)
+#define VTX_RING_BYTES (3584u << 10) /* per frame; Delfino Plaza peaks near 2.4 MB (the rest of linear memory goes to resident vertices) */
 #define IDX_RING_BYTES (1u << 20)
 #define CMDBUF_BYTES   (1u << 20)
 /* Command-buffer words a draw may not eat into: the rest of the frame's state and its end. */
@@ -88,6 +88,13 @@ static int s_last_valid;
 static volatile int s_stopping;
 void pica_request_stop(void) { s_stopping = 1; }
 
+/* libctru's linear heap has no lock of its own: with the GX back end's render thread
+ * (gx3ds_backend.cpp) the game thread (resident vertices) and the render thread (textures, frames)
+ * both allocate from it. Every linear allocation and free here takes this. */
+static LightLock s_linLock = 1; /* 1: unlocked */
+#define LIN_LOCK() LightLock_Lock(&s_linLock)
+#define LIN_UNLOCK() LightLock_Unlock(&s_linLock)
+
 int pica_init(void)
 {
 	if (s_stopping) return 0;
@@ -138,8 +145,10 @@ int pica_init(void)
 	C3D_CullFace(GPU_CULL_NONE);
 
 	for (int i = 0; i < 2; i++) {
+		LIN_LOCK();
 		s_vring[i] = (uint8_t*)linearAlloc(VTX_RING_BYTES);
 		s_iring[i] = (uint8_t*)linearAlloc(IDX_RING_BYTES);
+		LIN_UNLOCK();
 		if (!s_vring[i] || !s_iring[i]) goto fail;
 	}
 	s_ready = 1;
@@ -181,7 +190,9 @@ static void release_dead(void)
 	 * the frame that could still draw with them, so they can go. */
 	for (int i = 0; i < s_ndead[1]; i++) {
 		if (s_dead[1][i]->rt) C3D_RenderTargetDelete(s_dead[1][i]->rt);
+		LIN_LOCK();
 		C3D_TexDelete(&s_dead[1][i]->tex);
+		LIN_UNLOCK();
 		free(s_dead[1][i]);
 	}
 	memcpy(s_dead[1], s_dead[0], sizeof(PicaTex*) * (size_t)s_ndead[0]);
@@ -194,7 +205,10 @@ static PicaTex* tex_create(uint32_t w, uint32_t h, GPU_TEXCOLOR fmt, uint32_t bp
 	if (!pica_init()) return NULL;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
 	if (!t) return NULL;
-	if (!C3D_TexInit(&t->tex, (u16)w, (u16)h, fmt)) {
+	LIN_LOCK();
+	const bool ok = C3D_TexInit(&t->tex, (u16)w, (u16)h, fmt);
+	LIN_UNLOCK();
+	if (!ok) {
 		free(t);
 		return NULL;
 	}
@@ -353,7 +367,9 @@ static int ovl_start(void)
 	if (!s_queue || !s_c3dCmdBuf) return 0;
 	s_ovCmd[0] = s_c3dCmdBuf;
 	s_ovCmdWords = s_c3dCmdWords;
+	LIN_LOCK();
 	s_ovCmd[1] = (u32*)linearAlloc(s_ovCmdWords * 4u);
+	LIN_UNLOCK();
 	if (!s_ovCmd[1]) {
 		fprintf(stderr, "[pica] no linear memory for a second command buffer: frames not overlapped\n");
 		s_ovlWanted = 0;
@@ -435,6 +451,28 @@ static void ovl_frame_end(void)
 }
 
 const char* pica_queue_state(void);
+
+/* Linear memory for the GX back end's resident vertices (gx3ds_backend.cpp, display-list arena). */
+void* pica_linear_alloc(uint32_t bytes)
+{
+	LIN_LOCK();
+	void* p = linearAlloc(bytes);
+	LIN_UNLOCK();
+	return p;
+}
+void pica_linear_free_block(void* p)
+{
+	LIN_LOCK();
+	linearFree(p);
+	LIN_UNLOCK();
+}
+void pica_flush(const void* p, uint32_t bytes) { GSPGPU_FlushDataCache(p, bytes); }
+/* Waits until the GPU has finished every frame handed to it. */
+void pica_gpu_idle(void)
+{
+	if (s_ovl) ovl_wait_running();
+	else if (s_queue) gxCmdQueueWait(s_queue, -1);
+}
 
 /* C3D_FrameDrawOn, without citro3d's in-frame check in overlapped frames. */
 static void draw_on(C3D_RenderTarget* t)
@@ -1108,7 +1146,32 @@ uint32_t pica_cmd_peak(void)
 
 uint32_t pica_cmd_capacity(void) { return CMDBUF_BYTES; }
 
-uint32_t pica_linear_free(void) { return (uint32_t)linearSpaceFree(); }
+uint32_t pica_linear_free(void)
+{
+	LIN_LOCK();
+	const uint32_t n = (uint32_t)linearSpaceFree();
+	LIN_UNLOCK();
+	return n;
+}
+
+/* ---- the GX back end's render thread ------------------------------------------------------ */
+static LightEvent s_evt[2];
+
+int pica_thread_start(void (*fn)(void*), void* arg)
+{
+	LightEvent_Init(&s_evt[0], RESET_ONESHOT);
+	LightEvent_Init(&s_evt[1], RESET_ONESHOT);
+	s32 prio = 0x30;
+	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+	if (prio > 0x19) prio--; /* just above the thread that starts it (the game thread) */
+	/* Core 2: the New 3DS's second application core, otherwise idle. Then core 1 (the system
+	 * core), with up to 80% of its time given to the application. */
+	if (threadCreate(fn, arg, 256u << 10, prio, 2, true)) return 2;
+	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)) && threadCreate(fn, arg, 256u << 10, prio, 1, true)) return 1;
+	return -1;
+}
+void pica_event_wait(int i) { LightEvent_Wait(&s_evt[i]); }
+void pica_event_signal(int i) { LightEvent_Signal(&s_evt[i]); }
 
 /* ---- hardware self-test ------------------------------------------------------------------ */
 /* Runs the pieces of a game frame one frame at a time and logs each: a piece the GPU never
