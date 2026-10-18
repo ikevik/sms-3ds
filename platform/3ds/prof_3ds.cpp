@@ -20,6 +20,13 @@
 
 extern "C" {
 extern uint32_t GX3DS_GameVerts;
+// GX command stream (gx3ds_backend.cpp, patch 0017): bytes written so far, slow-path writes
+uint64_t GX3DS_StreamWritten(void);
+extern uint32_t GXPC_StreamPuts;
+extern uint8_t* GXPC_PipeBuf;
+extern uint32_t GXPC_PipeLen, GXPC_PipeFast;
+void GXPC_Write8(uint8_t v);
+void GXPC_Write32(uint32_t v);
 double pica_gpu_ms_sum(void);
 void pica_set_gpu_test(int mode);
 int SMS3DS_ProfOn;
@@ -49,8 +56,8 @@ const char* const kPhaseName[PHASES] = {
 struct Entry {
 	const void* vt;
 	const char* name;  // draw buffers (one class, many jobs) are told apart by name
-	uint64_t ticks;
-	uint32_t calls, verts;
+	uint64_t ticks, bytes;
+	uint32_t calls, verts, puts;
 	int phase;
 };
 const int kTable = 2048;  // power of two
@@ -59,13 +66,18 @@ int s_tableUsed;
 
 struct Open {
 	Entry* e;
-	uint64_t start, child;
-	uint32_t v0, childVerts;
+	uint64_t start, child, b0, childBytes;
+	uint32_t v0, childVerts, p0, childPuts;
 };
 Open s_stack[64];
 int s_depth;
 
-uint64_t s_phaseTicks[PHASES], s_phaseLast;
+uint64_t s_phaseTicks[PHASES], s_phaseLast, s_phaseBytes[PHASES], s_phaseB0;
+uint32_t s_phasePuts[PHASES], s_phaseP0;
+// What one write to the GX stream costs the game thread, measured at the start of the CPU part
+// (calibrate): a slow-path call (GXPC_Write8, as the register writers make two or three of) and
+// a byte through the inline path (GXPC_Put8, the vertex writers).
+double s_putUs, s_byteUs;
 uint32_t s_phaseEntries[PHASES];
 int s_phase;
 uint64_t s_calls;
@@ -102,8 +114,28 @@ void resetCpu() {
 	s_tableUsed = 0;
 	memset(s_phaseTicks, 0, sizeof s_phaseTicks);
 	memset(s_phaseEntries, 0, sizeof s_phaseEntries);
+	memset(s_phaseBytes, 0, sizeof s_phaseBytes);
+	memset(s_phasePuts, 0, sizeof s_phasePuts);
+	s_phaseB0 = GX3DS_StreamWritten();
+	s_phaseP0 = GXPC_StreamPuts;
 	s_calls = 0;
 	s_depth = 0;
+}
+
+// Writes 4096 NOPs (GX opcode 0x00) to the stream each way and times them. Called with the stream
+// at a command boundary (the top of a frame): the GX thread skips NOPs.
+void calibrate() {
+	const int n = 4096;
+	uint64_t t0 = svcGetSystemTick();
+	for (int i = 0; i < n; i++) GXPC_Write8(0);
+	const uint64_t t1 = svcGetSystemTick();
+	for (int i = 0; i < n; i++) {
+		if (GXPC_PipeLen + 1 <= GXPC_PipeFast) GXPC_PipeBuf[GXPC_PipeLen++] = 0;
+		else GXPC_Write8(0);
+	}
+	const uint64_t t2 = svcGetSystemTick();
+	s_putUs = double(t1 - t0) / n / kTicksPerMs * 1000.0;
+	s_byteUs = double(t2 - t1) / n / kTicksPerMs * 1000.0;
 }
 
 // What the profiler's own two tick reads cost per object, measured: subtracted from the totals.
@@ -135,6 +167,21 @@ void reportCpu(double frames, double frameMs) {
 		}
 	}
 	if (at) fprintf(stderr, "[prof]   phases (ms/frame):%s\n", line);
+	// GX stream writes by phase, and what they cost at the calibrated rates.
+	fprintf(stderr, "[prof]   GX stream: a slow-path write %.3f us, an inline byte %.4f us (measured now)\n", s_putUs,
+	        s_byteUs);
+	at = 0;
+	for (int i = 0; i < PHASES; i++) {
+		const double kb = s_phaseBytes[i] / frames / 1024.0, puts = s_phasePuts[i] / frames;
+		if (kb < 0.5 && puts < 50) continue;
+		at += snprintf(line + at, sizeof line - at, "%s %s %.0f KB %.0f slow (%.1f ms)", at ? " |" : "", kPhaseName[i],
+		               kb, puts, (puts * s_putUs + kb * 1024.0 * s_byteUs) / 1000.0);
+		if (at > 400) {
+			fprintf(stderr, "[prof]   GX stream writes by phase, per frame:%s\n", line);
+			at = 0;
+		}
+	}
+	if (at) fprintf(stderr, "[prof]   GX stream writes by phase, per frame:%s\n", line);
 	// Top classes by exclusive time.
 	static Entry* order[kTable];
 	int n = 0;
@@ -147,8 +194,8 @@ void reportCpu(double frames, double frameMs) {
 	double listed = 0, all = 0;
 	for (int i = 0; i < n; i++) all += order[i]->ticks * per;
 	fprintf(stderr,
-	        "[prof]   objects (exclusive ms/frame, performs/frame, vertices sent/frame, phase, vtable, a name); %.1f "
-	        "ms/frame in all %d\n",
+	        "[prof]   objects (exclusive ms/frame, performs/frame, vertices sent/frame, GX stream KB and slow-path "
+	        "writes/frame and their estimated ms, phase, vtable, a name); %.1f ms/frame in all %d\n",
 	        all, n);
 	for (int i = 0; i < n && i < 40; i++) {
 		const Entry* e = order[i];
@@ -159,7 +206,9 @@ void reportCpu(double frames, double frameMs) {
 		snprintf(name, sizeof name, "%s", e->name ? e->name : "");
 		for (char* c = name; *c; c++)
 			if ((unsigned char)*c < 0x20 || (unsigned char)*c >= 0x7f) *c = '?';  // Shift-JIS names
-		fprintf(stderr, "[prof]   %6.2f ms %6.1f %7.0fv %-15s vt %08lx \"%s\"\n", ms, e->calls / frames, e->verts / frames,
+		const double kb = e->bytes / frames / 1024.0, puts = e->puts / frames;
+		fprintf(stderr, "[prof]   %6.2f ms %6.1f %7.0fv %5.1f KB %6.0f slow (%4.2f ms) %-15s vt %08lx \"%s\"\n", ms,
+		        e->calls / frames, e->verts / frames, kb, puts, (puts * s_putUs + kb * 1024.0 * s_byteUs) / 1000.0,
 		        kPhaseName[e->phase], (unsigned long)uintptr_t(e->vt), name);
 	}
 	fprintf(stderr, "[prof]   (listed %.1f of %.1f ms/frame)\n", listed, all);
@@ -274,6 +323,12 @@ void SMS3DS_ProfPhase(int phase) {
 	const uint64_t now = svcGetSystemTick();
 	s_phaseTicks[s_phase] += now - s_phaseLast;
 	s_phaseLast = now;
+	const uint64_t b = GX3DS_StreamWritten();
+	const uint32_t p = GXPC_StreamPuts;
+	s_phaseBytes[s_phase] += b - s_phaseB0;
+	s_phasePuts[s_phase] += p - s_phaseP0;
+	s_phaseB0 = b;
+	s_phaseP0 = p;
 	if (phase >= 0 && phase < PHASES) {
 		s_phase = phase;
 		s_phaseEntries[phase]++;
@@ -289,7 +344,7 @@ void SMS3DS_ProfObjBegin(const void* vtable, const char* name) {
 	}
 	Entry* e = lookup(vtable, s_phase, name);
 	if (e && !e->name) e->name = name;
-	s_stack[s_depth++] = {e, now, 0, GX3DS_GameVerts, 0};
+	s_stack[s_depth++] = {e, now, 0, GX3DS_StreamWritten(), 0, GX3DS_GameVerts, 0, GXPC_StreamPuts, 0};
 }
 
 void SMS3DS_ProfObjEnd(void) {
@@ -299,14 +354,20 @@ void SMS3DS_ProfObjEnd(void) {
 	const Open& o = s_stack[s_depth];
 	const uint64_t dur = now - o.start;
 	const uint32_t verts = GX3DS_GameVerts - o.v0;
+	const uint64_t bytes = GX3DS_StreamWritten() - o.b0;
+	const uint32_t puts = GXPC_StreamPuts - o.p0;
 	if (o.e) {
 		o.e->ticks += dur > o.child ? dur - o.child : 0;
 		o.e->verts += verts > o.childVerts ? verts - o.childVerts : 0;
+		o.e->bytes += bytes > o.childBytes ? bytes - o.childBytes : 0;
+		o.e->puts += puts > o.childPuts ? puts - o.childPuts : 0;
 		o.e->calls++;
 	}
 	if (s_depth > 0) {
 		s_stack[s_depth - 1].child += dur;
 		s_stack[s_depth - 1].childVerts += verts;
+		s_stack[s_depth - 1].childBytes += bytes;
+		s_stack[s_depth - 1].childPuts += puts;
 	}
 }
 
@@ -327,6 +388,7 @@ void SMS3DS_ProfFrame(void) {
 		return;
 	case 2:  // CPU part
 		if (++s_frame == kSettle) {
+			calibrate();
 			resetCpu();
 			s_winStart = s_phaseLast = now;
 			s_phase = 0;

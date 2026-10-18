@@ -256,6 +256,9 @@ void pica_set_draw_cut(int cut);
 void pica_set_vram_textures(int on);
 /* Checks VRAM texture copies against their originals now and then ([vram] log lines). */
 void pica_set_vram_check(int on);
+/* Unchanged GPU settings skipped piece by piece (on by default); off: a draw whose state differs
+ * at all sends all of it again, as before. */
+void pica_set_state_skip(int on);
 /* Writes the goop map readbacks as sdmc:/sms/goop-*.pgm files at readbacks 0, 1, 30 and 300. */
 void pica_set_readback_dumps(int on);
 uint32_t pica_vram_copies(void);
@@ -268,6 +271,9 @@ uint32_t pica_frame_draws(void);
 /* Runs a frame's pieces one at a time and logs which, if any, the GPU never finishes ([gputest]
  * lines); returns 0 at the first that hangs. Call before the game thread starts. */
 int pica_selftest(void);
+/* Times the GPU's per-vertex cost under several vertex setups ([vbench] lines, about a second).
+ * Call after pica_selftest, before frames overlap. Touch held at launch (main.cpp). */
+void pica_vertex_bench(void);
 /* On: every draw is submitted and waited for on its own, and one the GPU never finishes is logged
  * ([gpucheck] lines) with its layout, textures and combiner stages. Very slow. */
 void pica_set_gpu_check(int on);

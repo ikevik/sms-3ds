@@ -3868,9 +3868,18 @@ static void streamWait(std::atomic<uint64_t>& acc, F ready) {
 
 // The write-gather pipe's hand-over (gx_fifo.cpp): publishes the full chunk and returns the next,
 // once the GX thread is done with what it held last.
+// Bytes the game thread has written to the stream (handed over, plus the current buffer's), and
+// the writes that took the slow path (GXPC_StreamPuts, patch 0017): a profile run reports them
+// per object (prof_3ds.cpp).
+static uint64_t s_sBytesSent;
+extern "C" uint32_t GXPC_StreamPuts, GXPC_PipeLen;
+uint32_t GXPC_StreamPuts;
+extern "C" uint64_t GX3DS_StreamWritten(void) { return s_sBytesSent + GXPC_PipeLen; }
+
 static uint8_t* streamSwap(uint8_t* buf, uint32_t len, uint32_t* cap) {
 	*cap = kStreamChunk;
 	if (buf) {
+		s_sBytesSent += len;
 		s_sLen[s_sHead.load(std::memory_order_relaxed) % kStreamChunks] = len;
 		s_sHead.fetch_add(1, std::memory_order_release);
 		pica_event_signal(EV_GX);
@@ -3888,9 +3897,19 @@ static uint8_t* streamSwap(uint8_t* buf, uint32_t len, uint32_t* cap) {
 // is safe through the frame's GXDrawDone (THPPlayerDrawDone, before the copy); here each call
 // through the stream stamps the 32-byte blocks of MEM1 it covers with the chunk that carries it,
 // and before the game starts writing a list (GDInitGDLObj) it waits while the GX thread has not
-// finished that chunk.
+// finished that chunk. Those waits cost the game thread 4-5 ms a frame on Delfino Plaza, so a list
+// written through GDInitGDLObj in the last kDlCopyFrames frames is sent as a copy
+// (kStreamOpCallDLCopy, up to kDlCopyMax bytes): the GX thread reads the copy and the game
+// rewrites the list without waiting. A list written once (at setup) goes by address again after
+// that, as copies are hashed on every call while a list by address is trusted to its write stamps
+// (copying every list ever written doubled the bytes hashed on Delfino Plaza). Calls by address
+// are stamped as before.
 static uint32_t* s_dlMark;  // per 32-byte block of MEM1: 1 + the chunk of its last call (0: none)
-static uint32_t s_dlBlocks, s_dlWaits;
+static uint8_t* s_dlRw;     // per 32-byte block of MEM1: rwStamp of its last GDInitGDLObj (0: never)
+static uint32_t s_dlBlocks, s_dlWaits, s_dlCopies, s_dlCopyBytes;
+static const uint32_t kDlCopyMax = 16u << 10, kDlCopyFrames = 4;
+static bool s_dlCopyOn = true;  // off (SELECT held at launch): every rewrite waits, as before copies
+static uint8_t rwStamp(uint32_t frame) { return uint8_t(frame % 255u + 1u); }
 
 static bool mem1Blocks(const void* p, uint32_t n, uint32_t& b0, uint32_t& b1) {
 	const uintptr_t a = reinterpret_cast<uintptr_t>(p), base = reinterpret_cast<uintptr_t>(port_mem1_base);
@@ -3918,6 +3937,29 @@ static void streamBeforeWrite(const void* p, uint32_t n) {
 	if (mark - 1 == s_sHead.load(std::memory_order_relaxed)) GXPC_StreamFlush();  // still being filled
 	s_dlWaits++;
 	streamWait(s_sWait[3], [mark] { return int32_t(mark - s_sTail.load(std::memory_order_acquire)) <= 0; });
+}
+// Game thread, as GDInitGDLObj starts on [p, p + n): calls of it go as copies for a while.
+static void streamNoteRewrite(const void* p, uint32_t n) {
+	uint32_t b0, b1;
+	if (!s_streamOn || !mem1Blocks(p, n, b0, b1)) return;
+	memset(s_dlRw + b0, rwStamp(s_sFramesSent), b1 - b0 + 1);
+}
+// Game thread, GXCallDisplayList: true when the call should carry the list's bytes.
+static bool streamCopyList(const void* list, uint32_t n) {
+	uint32_t b0, b1;
+	if (!s_dlCopyOn || n > kDlCopyMax || !mem1Blocks(list, n, b0, b1)) return false;
+	const int now = rwStamp(s_sFramesSent);
+	for (uint32_t b = b0; b <= b1; b++) {
+		if (!s_dlRw[b]) continue;
+		int age = now - int(s_dlRw[b]);
+		if (age < 0) age += 255;
+		if (uint32_t(age) <= kDlCopyFrames) {
+			s_dlCopies++;
+			s_dlCopyBytes += n;
+			return true;
+		}
+	}
+	return false;
 }
 
 // Draw-sync tokens, GX thread -> game thread.
@@ -3998,7 +4040,8 @@ static void streamStart() {
 	}
 	s_dlBlocks = port_mem1_size >> 5;
 	s_dlMark = static_cast<uint32_t*>(calloc(s_dlBlocks, sizeof(uint32_t)));
-	if (!s_dlMark) {
+	s_dlRw = static_cast<uint8_t*>(calloc(s_dlBlocks, 1));
+	if (!s_dlMark || !s_dlRw) {
 		fprintf(stderr, "[gx3ds] no memory for the GX thread's display-list marks: GX on the game thread\n");
 		return;
 	}
@@ -4020,21 +4063,25 @@ static bool streamOn() { return s_streamOn; }
 // wait for it, then, with print, the line (which starts the next window).
 static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 	static uint64_t w0[4], busy0, idle0;
-	static uint32_t dlWaits0;
+	static uint32_t dlWaits0, dlCopies0, dlCopyBytes0;
 	uint64_t w[4];
 	for (int i = 0; i < 4; i++) w[i] = s_sWait[i].load() - w0[i];
 	gameWait = w[0] + w[1] + w[2] + w[3];
 	if (!print) return;
 	const uint64_t busy = s_sBusy.load(), idle = s_sIdle.load();
+	const double perFrame = perMs * kTicksPerMs;  // 1 / frames
 	fprintf(stderr,
 	        "[perf]   GX thread (core 1): busy %.1f, idle %.1f ms/frame | game thread waited for it %.1f ms/frame "
 	        "(buffers full %.1f, a frame ahead %.1f, GXInit %.1f, rewriting a list it had yet to read %.1f, %u times) "
-	        "| %u chunks queued\n",
+	        "| %u chunks queued | lists sent as copies %.1f per frame, %.1f KB\n",
 	        double(busy - busy0) * perMs, double(idle - idle0) * perMs, double(gameWait) * perMs, double(w[0]) * perMs,
 	        double(w[1]) * perMs, double(w[2]) * perMs, double(w[3]) * perMs, unsigned(s_dlWaits - dlWaits0),
-	        unsigned(s_sHead.load() - s_sTail.load()));
+	        unsigned(s_sHead.load() - s_sTail.load()), (s_dlCopies - dlCopies0) * perFrame,
+	        (s_dlCopyBytes - dlCopyBytes0) * perFrame / 1024.0);
 	for (int i = 0; i < 4; i++) w0[i] += w[i];
 	dlWaits0 = s_dlWaits;
+	dlCopies0 = s_dlCopies;
+	dlCopyBytes0 = s_dlCopyBytes;
 	busy0 = busy;
 	idle0 = idle;
 }
@@ -4261,13 +4308,16 @@ void GXPC_StreamFrameEnd(void) {
 	const uint32_t sent = ++gx::s_sFramesSent;
 	gx::streamWait(gx::s_sWait[1], [sent] { return sent - gx::s_sFramesDone.load(std::memory_order_acquire) <= 1; });
 }
-// ... a display list was called through the stream (GXCallDisplayList).
+// ... a display list was called through the stream by address (GXCallDisplayList).
 void GXPC_StreamNoteDL(const void* list, uint32_t nbytes) { gx::streamNoteDL(list, nbytes); }
+// ... GXCallDisplayList: 1 when the call should carry a copy of the list (one the game rewrites).
+int GXPC_StreamCopyDL(const void* list, uint32_t nbytes) { return gx::streamCopyList(list, nbytes); }
 // The game is about to write a display list (GD; linked with --wrap=GDInitGDLObj): waits while
-// the GX thread has yet to read a call of it.
+// the GX thread has yet to read a call of it by address; its calls go as copies from then on.
 void __real_GDInitGDLObj(void* dl, void* start, uint32_t length);
 void __wrap_GDInitGDLObj(void* dl, void* start, uint32_t length) {
 	gx::streamBeforeWrite(start, length);
+	gx::streamNoteRewrite(start, length);
 	__real_GDInitGDLObj(dl, start, length);
 }
 // ... waits until the GX thread has run every command sent (GXInit: the registers start over).
@@ -4279,6 +4329,7 @@ void GXPC_StreamDrain(void) {
 }
 // Off before the first frame: GX runs on the game thread (no GX thread).
 void GX3DS_SetGxThread(int on) { gx::s_gxWanted = on != 0; }
+void GX3DS_SetListCopies(int on) { gx::s_dlCopyOn = on != 0; }
 
 // 0: material, 1: debug colours, 2: opaque (material colours, no blending or alpha test).
 void GX3DS_TraceNextFrame(void) {

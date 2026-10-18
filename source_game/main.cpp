@@ -32,10 +32,12 @@ const char* pica_where(void);
 const char* pica_queue_state(void);
 uint32_t pica_frame_draws(void);
 int pica_selftest(void);
+void pica_vertex_bench(void);
 void pica_set_gpu_check(int on);
 void pica_set_split(int on);
 void pica_set_vram_textures(int on);
 void pica_set_vram_check(int on);
+void pica_set_state_skip(int on);
 void pica_set_readback_dumps(int on);
 void pica_set_overlap(int on);
 void pica_set_big_ring(int on);
@@ -44,6 +46,7 @@ extern "C" int SMS3DS_ProfState(void);
 void GX3DS_SetArena(int on);
 void GX3DS_SetRenderThread(int on);
 void GX3DS_SetGxThread(int on);
+void GX3DS_SetListCopies(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 // Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
 // 0008); -1 in the normal build.
@@ -498,6 +501,20 @@ int main()
 		printf("ZR held: VRAM copy self-check\n");
 		fprintf(stderr, "[3ds] ZR held at launch: VRAM texture copies checked against their originals\n");
 	}
+	// Holding START at launch sends every GPU setting again whenever a draw's state differs at
+	// all, as before unchanged settings were skipped piece by piece (to compare).
+	if (launchHeld & KEY_START) {
+		pica_set_state_skip(0);
+		printf("START held: GPU settings sent in full\n");
+		fprintf(stderr, "[3ds] START held at launch: unchanged GPU settings sent again (no skipping)\n");
+	}
+	// Holding SELECT at launch sends every display-list call by address, as before copies of the
+	// lists the game rewrites: each rewrite waits for the GX thread instead (to compare).
+	if (launchHeld & KEY_SELECT) {
+		GX3DS_SetListCopies(0);
+		printf("SELECT held: display lists by address\n");
+		fprintf(stderr, "[3ds] SELECT held at launch: display-list copies off (rewrites wait for the GX thread)\n");
+	}
 	if (launchHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
 		pica_set_big_ring(1);  // CPU-transformed vertices are larger
@@ -516,6 +533,13 @@ int main()
 	printf("GPU self-test... ");
 	const bool gpuOk = pica_selftest() != 0;
 	printf(gpuOk ? "ok\n" : "HUNG: see log; game not started\n");
+	// Touching the screen at launch times what a vertex costs the GPU under different vertex
+	// formats and memory ([vbench] lines, about a second).
+	if (gpuOk && (launchHeld & KEY_TOUCH)) {
+		printf("GPU vertex benchmark... ");
+		pica_vertex_bench();
+		printf("done\n");
+	}
 	// Overlapped frames (after the self-test, which runs one frame at a time): the CPU builds
 	// the next frame while the GPU draws the last. D-pad down at launch keeps them apart.
 	if (launchHeld & KEY_DDOWN) {
@@ -549,7 +573,7 @@ int main()
 		// needs START+SELECT.
 		hidScanInput();
 		pad3ds_poll();  // the game's PADRead takes this reading (pad_3ds.c)
-		static u32 prevHeld;
+		static u32 prevHeld = launchHeld;  // buttons held through launch are not presses
 		u32 held = hidKeysHeld(), pressed = held & ~prevHeld;
 		prevHeld = held;
 		if ((held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT))

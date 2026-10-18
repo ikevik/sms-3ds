@@ -1,0 +1,133 @@
+--- a/platform/gx/src/gx_api.cpp	2026-10-18 14:15:01
++++ b/platform/gx/src/gx_api.cpp	2026-10-18 14:15:01
+@@ -88,11 +88,15 @@
+ }
+ static inline uint32_t getField(uint32_t reg, int size, int shift) { return (reg >> shift) & ((1u << size) - 1u); }
+ 
++// 3DS port: the register and command writers use the pipe's inline writers (GXPC_Put*, gx_pc.h),
++// which append straight to the buffer and call GXPC_Write* only at its end or while redirected:
++// two or three calls into the pipe per register cost Delfino Plaza's game thread about 15 ms a
++// frame (some 117,000 of them).
+ static void apiBP(uint32_t reg, uint32_t data) {
+     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
+     if (s_recording || g_gxStream) {
+-        GXPC_Write8(0x61);
+-        GXPC_Write32(v);
++        GXPC_Put8(0x61);
++        GXPC_Put32(v);
+ #if defined(__3DS__)
+         if (!s_recording) apiKeepBP(reg, data & 0xFFFFFF);
+ #endif
+@@ -104,9 +108,9 @@
+ 
+ static void apiCP(uint8_t reg, uint32_t v) {
+     if (s_recording || g_gxStream) {
+-        GXPC_Write8(0x08);
+-        GXPC_Write8(reg);
+-        GXPC_Write32(v);
++        GXPC_Put8(0x08);
++        GXPC_Put8(reg);
++        GXPC_Put32(v);
+ #if defined(__3DS__)
+         if (!s_recording) apiKeepCP(reg, v);
+ #endif
+@@ -117,9 +121,9 @@
+ 
+ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
+     if (s_recording || g_gxStream) {
+-        GXPC_Write8(0x10);
+-        GXPC_Write32(((n - 1) << 16) | addr);
+-        for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
++        GXPC_Put8(0x10);
++        GXPC_Put32(((n - 1) << 16) | addr);
++        for (uint32_t i = 0; i < n; i++) GXPC_Put32(w[i]);
+ #if defined(__3DS__)
+         if (!s_recording) apiKeepXF(addr, n, w);
+ #endif
+@@ -439,9 +443,9 @@
+ }
+ void GXCallDisplayList(void* list, u32 nbytes) {
+     if (s_recording) {
+-        GXPC_Write8(0x40);
+-        GXPC_Write32(ptrToPhys(list));
+-        GXPC_Write32(uint32_t(nbytes));
++        GXPC_Put8(0x40);
++        GXPC_Put32(ptrToPhys(list));
++        GXPC_Put32(uint32_t(nbytes));
+         return;
+     }
+ #if defined(__3DS__)
+@@ -640,8 +644,8 @@
+ void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
+     __GXinBegin = GX_TRUE;
+     traceNoteBegin();
+-    GXPC_Write8(uint8_t(type | fmt));
+-    GXPC_Write16(nverts);
++    GXPC_Put8(uint8_t(type | fmt));
++    GXPC_Put16(nverts);
+ }
+ 
+ void GXSetLineWidth(u8 width, GXTexOffset off) {
+@@ -703,9 +707,9 @@
+ 
+ void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
+ void GXLoadPosMtxIndx(u16 idx, u32 id) {
+-    GXPC_Write8(0x20);
+-    GXPC_Write16(idx);
+-    GXPC_Write16(uint16_t((11u << 12) | (id * 4)));
++    GXPC_Put8(0x20);
++    GXPC_Put16(idx);
++    GXPC_Put16(uint16_t((11u << 12) | (id * 4)));
+ }
+ void GXLoadNrmMtxImm(f32 mtx[3][4], u32 id) {
+     float m[9] = {mtx[0][0], mtx[0][1], mtx[0][2], mtx[1][0], mtx[1][1], mtx[1][2], mtx[2][0], mtx[2][1], mtx[2][2]};
+@@ -713,9 +717,9 @@
+ }
+ void GXLoadNrmMtxImm3x3(f32 mtx[3][3], u32 id) { apiXFf(uint16_t(0x400 + id * 3), 9, &mtx[0][0]); }
+ void GXLoadNrmMtxIndx3x3(u16 idx, u32 id) {
+-    GXPC_Write8(0x28);
+-    GXPC_Write16(idx);
+-    GXPC_Write16(uint16_t((8u << 12) | (0x400 + id * 3)));
++    GXPC_Put8(0x28);
++    GXPC_Put16(idx);
++    GXPC_Put16(uint16_t((8u << 12) | (0x400 + id * 3)));
+ }
+ void GXSetCurrentMtx(u32 id) {
+     uint32_t a = setField(xfReg(XFR_MATIDX_A), 6, 0, id);
+@@ -743,9 +747,9 @@
+         addr = id * 4;
+         n = type == GX_MTX2x4 ? 8 : 12;
+     }
+-    GXPC_Write8(0x30);
+-    GXPC_Write16(idx);
+-    GXPC_Write16(uint16_t(((n - 1) << 12) | addr));
++    GXPC_Put8(0x30);
++    GXPC_Put16(idx);
++    GXPC_Put16(uint16_t(((n - 1) << 12) | addr));
+ }
+ 
+ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
+@@ -883,9 +887,9 @@
+     apiXF(uint16_t(0x600 + lightIndex(light) * 16), 16, w);
+ }
+ void GXLoadLightObjIndx(u32 idx, GXLightID light) {
+-    GXPC_Write8(0x38);
+-    GXPC_Write16(uint16_t(idx));
+-    GXPC_Write16(uint16_t((15u << 12) | (0x600 + lightIndex(light) * 16)));
++    GXPC_Put8(0x38);
++    GXPC_Put16(uint16_t(idx));
++    GXPC_Put16(uint16_t((15u << 12) | (0x600 + lightIndex(light) * 16)));
+ }
+ void GXGetLightAttnA(const GXLightObj* o, f32* a0, f32* a1, f32* a2) {
+     const LightObjInt* l = reinterpret_cast<const LightObjInt*>(o);
+@@ -1674,8 +1678,8 @@
+     apiCP(CP_VAT_C + GX_VTXFMT3, C);
+ }
+ static void vtxPN(float x, float y, float z, float nx, float ny, float nz) {
+-    GXPC_WriteF32(x); GXPC_WriteF32(y); GXPC_WriteF32(z);
+-    GXPC_WriteF32(nx); GXPC_WriteF32(ny); GXPC_WriteF32(nz);
++    GXPC_PutF32(x); GXPC_PutF32(y); GXPC_PutF32(z);
++    GXPC_PutF32(nx); GXPC_PutF32(ny); GXPC_PutF32(nz);
+ }
+ // The SDK's cube (GXDrawCube in the decomp's GXDraw.c): six quads with the
+ // corners on the unit sphere (+-0.57735026), wound clockwise seen from

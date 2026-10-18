@@ -1,6 +1,6 @@
---- a/platform/gx/src/gx_api.cpp	2026-10-17 23:53:17
-+++ b/platform/gx/src/gx_api.cpp	2026-10-17 23:53:17
-@@ -27,6 +27,60 @@
+--- a/platform/gx/src/gx_api.cpp	2026-10-18 08:38:31
++++ b/platform/gx/src/gx_api.cpp	2026-10-18 08:38:31
+@@ -27,6 +27,61 @@
  static uint8_t* s_dlBegin = nullptr;
  static uint32_t s_dlSize = 0;
  
@@ -16,6 +16,7 @@
 +extern "C" void GXPC_StreamFrameEnd(void);  // the 3DS back end: a display copy sent
 +extern "C" void GXPC_StreamDrain(void);     // the 3DS back end: waits until the GX thread has run everything
 +extern "C" void GXPC_StreamNoteDL(const void* list, uint32_t nbytes);  // ... a list called (rewrites wait for it)
++extern "C" int GXPC_StreamCopyDL(const void* list, uint32_t nbytes);    // ... 1: send the list's bytes (rewritten)
 +namespace gx {
 +void apiStreamStart() {
 +    State* s = static_cast<State*>(malloc(sizeof(State)));
@@ -61,7 +62,7 @@
  static inline uint32_t setField(uint32_t reg, int size, int shift, uint32_t v) {
      uint32_t m = ((1u << size) - 1u) << shift;
      return (reg & ~m) | ((v << shift) & m);
-@@ -35,30 +89,39 @@
+@@ -35,30 +90,39 @@
  
  static void apiBP(uint32_t reg, uint32_t data) {
      uint32_t v = (reg << 24) | (data & 0xFFFFFF);
@@ -105,7 +106,7 @@
          return;
      }
      writeXF(addr, n, w);
-@@ -74,7 +137,7 @@
+@@ -74,7 +138,7 @@
      memcpy(&u, &f, 4);
      return u;
  }
@@ -114,7 +115,7 @@
  
  // ------------------------------------------------------------------ internal object layouts
  namespace {
-@@ -145,6 +208,13 @@
+@@ -145,6 +209,13 @@
  GXFifoObj* GXInit(void* base, u32 size) {
      // bring up a window (or a headless context) unless the host already did
      if (!rendererReady()) GXPC_InitAuto(1);
@@ -128,7 +129,7 @@
      resetState();
      FifoObjInt* f = reinterpret_cast<FifoObjInt*>(&s_fifo);
      f->base = static_cast<uint8_t*>(base);
-@@ -227,7 +297,16 @@
+@@ -227,7 +298,16 @@
  }
  
  void GXSetMisc(GXMiscToken, u32) {}
@@ -146,7 +147,7 @@
  void GXResetWriteGatherPipe(void) {}
  void GXAbortFrame(void) {}
  BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
-@@ -236,14 +315,27 @@
+@@ -236,14 +316,27 @@
      apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
      apiBP(BP_PE_TOKEN, token);
  }
@@ -177,7 +178,7 @@
      if (s_drawDoneCb) s_drawDoneCb();
  }
  void GXPixModeSync(void) {}
-@@ -329,7 +421,7 @@
+@@ -329,7 +422,7 @@
  
  // ================================================================== display lists
  void GXBeginDisplayList(void* list, u32 size) {
@@ -186,7 +187,7 @@
      s_recording = true;
      s_dlBegin = static_cast<uint8_t*>(list);
      s_dlSize = size;
-@@ -351,12 +443,22 @@
+@@ -351,12 +444,27 @@
          GXPC_Write32(uint32_t(nbytes));
          return;
      }
@@ -195,6 +196,11 @@
 +        uint8_t a[8];
 +        streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(list)));
 +        streamU32(a + 4, uint32_t(nbytes));
++        if (GXPC_StreamCopyDL(list, uint32_t(nbytes))) {  // the game may rewrite it before it is read
++            GXPC_StreamOp(kStreamOpCallDLCopy, a, 8);
++            GXPC_StreamBytes(list, uint32_t(nbytes));
++            return;
++        }
 +        GXPC_StreamOp(kStreamOpCallDL, a, 8);
 +        GXPC_StreamNoteDL(list, uint32_t(nbytes));
 +        return;
@@ -210,7 +216,7 @@
      uint32_t t = uint32_t(type) & 3;
      if (attr == GX_VA_PNMTXIDX) lo = setField(lo, 1, 0, t != 0);
      else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) lo = setField(lo, 1, 1 + (attr - GX_VA_TEX0MTXIDX), t != 0);
-@@ -365,8 +467,9 @@
+@@ -365,8 +473,9 @@
      else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
      else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
      else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
@@ -222,7 +228,7 @@
  }
  void GXSetVtxDescv(const GXVtxDescList* list) {
      for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
-@@ -376,7 +479,7 @@
+@@ -376,7 +485,7 @@
      apiCP(CP_VCD_HI, 0);
  }
  void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
@@ -231,7 +237,7 @@
      if (attr == GX_VA_PNMTXIDX) t = lo & 1;
      else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) t = getField(lo, 1, 1 + attr - GX_VA_TEX0MTXIDX);
      else if (attr == GX_VA_POS) t = getField(lo, 2, 9);
-@@ -397,7 +500,7 @@
+@@ -397,7 +506,7 @@
  }
  
  void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
@@ -240,7 +246,7 @@
      uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
      switch (attr) {
      case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
-@@ -420,15 +523,15 @@
+@@ -420,15 +529,15 @@
      default: break;
      }
      A |= 1u << 30;
@@ -260,7 +266,7 @@
      uint32_t c = 0, t = 0, f = 0;
      switch (attr) {
      case GX_VA_POS: c = getField(A, 1, 0); t = getField(A, 3, 1); f = getField(A, 5, 4); break;
-@@ -463,14 +566,14 @@
+@@ -463,14 +572,14 @@
  void GXSetArray(GXAttr attr, const void* base, u8 stride) {
      int slot = attr == GX_VA_NBT ? 1 : int(attr) - GX_VA_POS;
      if (slot < 0 || slot > 15) return;
@@ -279,7 +285,7 @@
      g_arrayGen++;
  }
  void GXInvalidateVtxCache(void) {}
-@@ -536,33 +639,33 @@
+@@ -536,33 +645,33 @@
  }
  
  void GXSetLineWidth(u8 width, GXTexOffset off) {
@@ -324,7 +330,7 @@
  void GXSetCoPlanar(GXBool enable) { bpField(BP_GENMODE, 1, 19, enable); }
  
  // ================================================================== GXTransform
-@@ -584,13 +687,13 @@
+@@ -584,13 +693,13 @@
  }
  void GXSetProjectionv(f32* ptr) {
      traceNoteProjection(ptr);
@@ -340,7 +346,7 @@
  
  void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
  void GXLoadPosMtxIndx(u16 idx, u32 id) {
-@@ -641,12 +744,12 @@
+@@ -641,12 +750,12 @@
  
  void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
      if (field == 0) top -= 0.5f;
@@ -359,7 +365,7 @@
      float v[6];
      v[0] = wd * 0.5f;
      v[1] = -ht * 0.5f;
-@@ -659,13 +762,13 @@
+@@ -659,13 +768,13 @@
  void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
      GXSetViewportJitter(left, top, wd, ht, nearz, farz, 1);
  }
@@ -378,7 +384,7 @@
      uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
      tl = setField(tl, 11, 12, uint32_t(left) + 342);
      uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
-@@ -674,10 +777,10 @@
+@@ -674,10 +783,10 @@
      apiBP(BP_SCISSOR_BR, br);
  }
  void GXGetScissor(u32* left, u32* top, u32* wd, u32* ht) {
@@ -393,7 +399,7 @@
  }
  void GXSetScissorBoxOffset(s32 x, s32 y) {
      uint32_t r = setField(0, 10, 0, uint32_t(x + 342) >> 1);
-@@ -861,7 +964,7 @@
+@@ -861,7 +970,7 @@
      GXSetTevAlphaOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
  }
  void GXSetTevColorIn(GXTevStageID s, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
@@ -402,7 +408,7 @@
      r = setField(r, 4, 12, a);
      r = setField(r, 4, 8, b);
      r = setField(r, 4, 4, c);
-@@ -869,7 +972,7 @@
+@@ -869,7 +978,7 @@
      apiBP(BP_TEV_COLOR_ENV + 2 * s, r);
  }
  void GXSetTevAlphaIn(GXTevStageID s, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d) {
@@ -411,7 +417,7 @@
      r = setField(r, 3, 13, a);
      r = setField(r, 3, 10, b);
      r = setField(r, 3, 7, c);
-@@ -889,10 +992,10 @@
+@@ -889,10 +998,10 @@
      return setField(r, 2, 22, out);
  }
  void GXSetTevColorOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
@@ -424,7 +430,7 @@
  }
  static void tevRegWrite(uint32_t id, int r, int gg, int b, int a, bool konst) {
      uint32_t ra = setField(0, 11, 0, uint32_t(r)) | setField(0, 11, 12, uint32_t(a)) | (konst ? 0x800000u : 0);
-@@ -910,13 +1013,13 @@
+@@ -910,13 +1019,13 @@
      bpField(BP_TEV_KSEL + (s >> 1), 5, (s & 1) ? 19 : 9, sel);
  }
  void GXSetTevSwapMode(GXTevStageID s, GXTevSwapSel ras, GXTevSwapSel tex) {
@@ -441,7 +447,7 @@
      apiBP(BP_TEV_KSEL + 2 * t + 1, setField(k1, 2, 2, a));
  }
  void GXSetTevClampMode(void) {}
-@@ -938,7 +1041,7 @@
+@@ -938,7 +1047,7 @@
      int sh = (s & 1) ? 12 : 0;
      uint32_t tmap = uint32_t(map) & 0xFF;
      bool enable = tmap != 0xFF && !(uint32_t(map) & 0x100);
@@ -450,7 +456,7 @@
      r = setField(r, 3, sh, tmap == 0xFF ? 0 : tmap & 7);
      r = setField(r, 3, sh + 3, coord == GX_TEXCOORD_NULL ? 0 : uint32_t(coord) & 7);
      r = setField(r, 1, sh + 6, enable);
-@@ -979,11 +1082,11 @@
+@@ -979,11 +1088,11 @@
  void GXSetIndTexCoordScale(GXIndTexStageID ind, GXIndTexScale ss, GXIndTexScale ts) {
      uint32_t reg = ind < 2 ? BP_RAS1_SS0 : BP_RAS1_SS1;
      int sh = (ind & 1) ? 8 : 0;
@@ -464,7 +470,7 @@
      apiBP(BP_RAS1_IREF, setField(r, 3, 6 * ind + 3, uint32_t(coord) & 7));
  }
  void GXSetNumIndStages(u8 n) { bpField(BP_GENMODE, 3, 16, n); }
-@@ -1067,7 +1170,7 @@
+@@ -1067,7 +1176,7 @@
      apiBP(BP_FOG_RANGE, (uint32_t(center) + 342) | (uint32_t(enable) << 10));
  }
  void GXSetBlendMode(GXBlendMode type, GXBlendFactor src, GXBlendFactor dst, GXLogicOp op) {
@@ -473,7 +479,7 @@
      r = setField(r, 1, 0, type == GX_BM_BLEND || type == GX_BM_SUBTRACT);
      r = setField(r, 1, 1, type == GX_BM_LOGIC);
      r = setField(r, 1, 11, type == GX_BM_SUBTRACT);
-@@ -1084,7 +1187,7 @@
+@@ -1084,7 +1193,7 @@
  }
  void GXSetZCompLoc(GXBool before) { bpField(BP_PE_CONTROL, 1, 6, before); }
  void GXSetPixelFmt(GXPixelFmt pix, GXZFmt16 z) {
@@ -482,7 +488,7 @@
      apiBP(BP_PE_CONTROL, setField(r, 3, 3, z));
      bpField(BP_GENMODE, 1, 9, pix == GX_PF_RGB565_Z16);
  }
-@@ -1176,19 +1279,29 @@
+@@ -1176,19 +1285,29 @@
      if (disp) apiBP(BP_COPY_YSCALE, s_dispYScale);
      // the renderer needs the host pointer; commands carry a physical address
      apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
@@ -514,7 +520,7 @@
  }
  void GXCopyDisp(void* dest, GXBool clear) { doCopy(dest, clear, true); }
  void GXCopyTex(void* dest, GXBool clear) { doCopy(dest, clear, false); }
-@@ -1335,7 +1448,15 @@
+@@ -1335,7 +1454,15 @@
          uint32_t fmt = idx < 20 ? s_tlutLoaded[idx].fmt : 0;
          apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
      }
@@ -531,7 +537,7 @@
  }
  void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
      if (s_texRegionCb) s_texRegionCb(obj, id);
-@@ -1362,8 +1483,18 @@
+@@ -1362,8 +1489,18 @@
      uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
      uint32_t bytes = uint32_t(t->entries) * 2;
      if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
@@ -551,7 +557,7 @@
      tlutTouched(off, bytes);
  }
  void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
-@@ -1384,8 +1515,22 @@
+@@ -1384,8 +1521,22 @@
      r->tmemAddr = uint32_t(addr);
      r->size = uint32_t(size);
  }
@@ -575,7 +581,7 @@
      flushBatch();
      textureInvalidateAll();
  }
-@@ -1402,7 +1547,7 @@
+@@ -1402,7 +1553,7 @@
  void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
  void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
      if (coord >= 8) return;
@@ -584,7 +590,7 @@
      if (enable) {
          bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
          bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
-@@ -1508,8 +1653,8 @@
+@@ -1508,8 +1659,8 @@
  
  // ================================================================== GXDraw (SDK helper shapes)
  static void drawWithPosNrm(void (*body)()) {
@@ -595,8 +601,8 @@
      GXClearVtxDesc();
      GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
      GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
---- a/platform/gx/src/gx_fifo.cpp	2026-10-17 23:53:17
-+++ b/platform/gx/src/gx_fifo.cpp	2026-10-17 23:53:17
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-18 08:38:31
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-18 08:38:31
 @@ -212,6 +212,16 @@
  uint32_t g_arrayGen = 1;
  #define s_defaultArrayBE g_defaultArrayBE
@@ -646,17 +652,20 @@
  static bool s_dlRecFail = false;  // the list being recorded does more than draw
  
  // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
-@@ -1001,8 +1029,83 @@
+@@ -999,10 +1027,90 @@
+ #define CMD_COUNT(i) (GXPC_CmdCount[i]++)
+ #else
  #define CMD_COUNT(i) ((void)0)
- #endif
- 
++#endif
++
 +#if defined(__3DS__)
 +// The stream's own commands (kStreamOp*): the whole length, or the header's while that is cut.
 +static uint32_t streamOpLen(const uint8_t* p, uint32_t avail) {
 +    switch (p[0]) {
 +    case kStreamOpCallDL:
 +    case kStreamOpBERange: return 9;
-+    case kStreamOpTlut: return avail < 9 ? 9 : 9 + be32(p + 5);
++    case kStreamOpTlut:
++    case kStreamOpCallDLCopy: return avail < 9 ? 9 : 9 + be32(p + 5);
 +    case kStreamOpArrayBE: return 3;
 +    case kStreamOpDefaultBE: return 2;
 +    case kStreamOpTexImage: return 6;
@@ -683,10 +692,14 @@
 +    g_arrayGen++;
 +}
 +#if defined(__3DS__)
++static void callDisplayListAt(const void* key, const uint8_t* data, uint32_t size, bool copy);
 +static void streamOpRun(const uint8_t* p) {
 +    switch (p[0]) {
 +    case kStreamOpCallDL:
 +        callDisplayList(reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 1))), be32(p + 5));
++        break;
++    case kStreamOpCallDLCopy:
++        callDisplayListAt(reinterpret_cast<const void*>(uintptr_t(be32(p + 1))), p + 9, be32(p + 5), true);
 +        break;
 +    case kStreamOpFlush: flushBatch(); break;
 +    case kStreamOpTexInval:
@@ -719,8 +732,8 @@
 +    ParseDepth() { s_parseDepth++; }
 +    ~ParseDepth() { s_parseDepth--; }
 +};
-+#endif
-+
+ #endif
+ 
  static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
      GXPC_CMD_TIMER;
 +#if defined(__3DS__)
@@ -730,7 +743,7 @@
      const uint8_t* start = p;
      const uint8_t* end = p + n;
      while (p < end) {
-@@ -1045,7 +1148,7 @@
+@@ -1045,7 +1153,7 @@
              const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
              uint32_t sz = be32(p + 5);
              CMD_COUNT(6);
@@ -739,7 +752,7 @@
                  s_dlDepth++;
                  runCommands(dl, sz);
                  s_dlDepth--;
-@@ -1074,6 +1177,12 @@
+@@ -1074,6 +1182,12 @@
              } else {
                  decodeVertices(op & 0xF8, p + 3, cnt, L, op & 7);
              }
@@ -752,7 +765,7 @@
          } else {
              logmsg("unknown FIFO opcode 0x%02X, skipping byte", op);
              p++;
-@@ -1098,6 +1207,9 @@
+@@ -1098,6 +1212,9 @@
                  len = 3 + be16(p + 1) * layoutFor(op & 7).size;
              }
          }
@@ -762,7 +775,37 @@
          *need = len;
      }
      return uint32_t(p - start);
-@@ -1434,7 +1546,7 @@
+@@ -1342,7 +1459,11 @@
+     return true;
+ }
+ #endif
+-static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
++// 3DS port: copy, data is a copy of the list made when it was called (kStreamOpCallDLCopy): the
++// write stamps describe the list in game memory, so the copy is always hashed, and a match says
++// nothing about game memory now (the game may have rewritten the list since the copy was made):
++// the entry's check time is left as it was, so a later call by address still hashes the list.
++static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size, bool copy = false) {
+     if (!e.valid) return DL_FAIL(0);
+     if (e.size != size) return DL_FAIL(1);
+     if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return DL_FAIL(2);
+@@ -1353,7 +1474,7 @@
+     for (const DlArray& a : e.arrays)
+         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
+             return DL_FAIL(5);
+-    bool unwritten = trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
++    bool unwritten = !copy && trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
+     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
+         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
+     if (unwritten && g_displayFrames - e.checkedFrame < kDlRecheckFrames) return true;
+@@ -1365,6 +1486,7 @@
+         if (unwritten) e.hashAlways = true;  // changed behind the write stamps' back
+         return DL_FAIL(6);
+     }
++    if (copy) return true;
+     e.checkedClock = clock;
+     e.checkedFrame = g_displayFrames;
+     return true;
+@@ -1434,7 +1556,7 @@
              break;
          case 0x40: {
              const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(s.n));
@@ -771,7 +814,55 @@
                  s_dlDepth++;
                  runCommands(dl, s.v);
                  s_dlDepth--;
-@@ -1596,7 +1708,13 @@
+@@ -1446,7 +1568,16 @@
+     }
+ }
+ 
++#if defined(__3DS__)
++// 3DS port: the cache names a list by key, its address in game memory; data holds its bytes (the
++// list itself, or a copy carried by the stream).
++void callDisplayList(const uint8_t* data, uint32_t size) { callDisplayListAt(data, data, size, false); }
++static void callDisplayListAt(const void* key, const uint8_t* data, uint32_t size, bool copy) {
++#else
+ void callDisplayList(const uint8_t* data, uint32_t size) {
++    const void* key = data;
++    const bool copy = false;
++#endif
+     GXPC_CMD_TIMER;
+     GXPC_DL_TIMER(dlt, 3);
+     GXPC_DL_COUNT(GXPC_DlCalls++);
+@@ -1458,7 +1589,7 @@
+         return;
+     }
+     GXPC_DL_TO(dlt, 0);
+-    DlEntry& e = dlLookup(data);
++    DlEntry& e = dlLookup(key);
+     if (e.skip) {
+         GXPC_DL_TO(dlt, 3);
+         GXPC_DL_COUNT(GXPC_DlUncached++);
+@@ -1468,7 +1599,7 @@
+         GXPC_DL_COUNT(s_uncachedDepth--);
+         return;
+     }
+-    if (dlReusable(e, data, size)) {
++    if (dlReusable(e, data, size, copy)) {
+         GXPC_DL_TO(dlt, 1);
+         GXPC_DL_COUNT(GXPC_DlHits++);
+         GXPC_DL_COUNT(GXPC_DlVerts += e.verts);
+@@ -1539,6 +1670,12 @@
+     }
+     e.checkedClock = writeClock();
+     e.checkedFrame = g_displayFrames;
++#if defined(__3DS__)
++    if (copy) {  // recorded from a copy: never checked against game memory (see dlReusable)
++        e.checkedClock = 0;
++        e.checkedFrame = g_displayFrames - kDlRecheckFrames;
++    }
++#endif
+     s_dlRec = &e;
+     s_dlRecFail = false;
+     uint32_t need = 0;
+@@ -1596,7 +1733,13 @@
  #define s_pipeBuf GXPC_PipeBuf
  #define s_pipeLen GXPC_PipeLen
  namespace gx {
@@ -785,12 +876,13 @@
  
  // Writes through a redirected pipe go to memory directly (uncached on the
  // GameCube, so the game flushes nothing): stamp them when the redirect ends.
-@@ -1633,12 +1751,39 @@
+@@ -1633,12 +1776,41 @@
      pipeFastUpdate();
  }
  
 +#if defined(__3DS__)
 +// Streamed GX: the full buffer goes to the back end, which returns an empty one.
++extern "C" uint32_t GXPC_StreamPuts;  // writes that took this slow path (profile runs report them)
 +static void streamSwap() {
 +    uint32_t cap = 0;
 +    s_pipeBuf = s_streamSwap(s_pipeBuf, s_pipeLen, &cap);
@@ -799,6 +891,7 @@
 +    pipeFastUpdate();
 +}
 +static void streamPut(const uint8_t* bytes, uint32_t n) {
++    GXPC_StreamPuts++;
 +    while (n) {  // a command may span buffers: the GX thread joins the pieces
 +        if (s_pipeLen == s_pipeCap) streamSwap();
 +        const uint32_t k = std::min(n, s_pipeCap - s_pipeLen);
@@ -825,7 +918,7 @@
      if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
      memcpy(s_pipeBuf + s_pipeLen, bytes, n);
      s_pipeLen += n;
-@@ -1647,6 +1792,20 @@
+@@ -1647,6 +1817,20 @@
  
  void pipeWrite(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
  
@@ -846,7 +939,7 @@
  }  // namespace gx
  
  // ------------------------------------------------------------------ C entry points
-@@ -1663,17 +1822,28 @@
+@@ -1663,17 +1847,28 @@
  
  void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
      if (!p || !size) return;
@@ -884,7 +977,7 @@
  }
  uint32_t GXPC_PtrToPhys(const void* p) { return ptrToPhys(p); }
  void* GXPC_PhysToPtr(uint32_t phys) { return physToPtr(phys); }
-@@ -1683,14 +1853,57 @@
+@@ -1683,15 +1878,58 @@
      if (attr == 25) slot = 1;           // GX_VA_NBT shares the normal array
      else if (attr >= 9 && attr <= 24) slot = attr - 9;
      else return;
@@ -912,7 +1005,7 @@
 +#endif
 +    setDefaultBE(bigEndian != 0);
  }
-+
+ 
 +#if defined(__3DS__)
 +// Streamed GX (gx_internal.h). At start-up, before the game's first GX call: `swap` takes a full
 +// buffer (null and 0 the first time) and returns an empty one of *cap bytes; `token` gets each
@@ -944,12 +1037,13 @@
 +    return used;
 +}
 +#endif
- 
++
  void GXPC_Write8(uint8_t v) { pipePut(&v, 1); }
  void GXPC_Write16(uint16_t v) {
---- a/platform/gx/src/gx_internal.h	2026-10-17 23:53:17
-+++ b/platform/gx/src/gx_internal.h	2026-10-17 23:53:17
-@@ -308,6 +308,31 @@
+     uint8_t b[2] = {uint8_t(v >> 8), uint8_t(v)};
+--- a/platform/gx/src/gx_internal.h	2026-10-18 08:38:31
++++ b/platform/gx/src/gx_internal.h	2026-10-18 08:38:31
+@@ -308,6 +308,33 @@
  void overlayText(std::vector<uint8_t>& px, int w, int h, int x, int y, const char* text, const uint8_t c[4], int scale = 1);
  int overlayTextWidth(const char* text);  // in font pixels
  
@@ -972,6 +1066,8 @@
 +    kStreamOpBERange = 0xC6,    // u32 start, u32 bytes (0: remove)
 +    kStreamOpTexImage = 0xC7,   // u8 map, u32 host pointer: a texture's image (after its BP_TX_IMAGE3)
 +    kStreamOpCopyDest = 0xC8,   // u32 host pointer: an EFB copy's destination (after its BP_COPY_DST)
++    kStreamOpCallDLCopy = 0xC9, // u32 list, u32 bytes, the bytes: callDisplayList on a copy (a list
++                                // the game rewrites in place; cached under the list's address)
 +};
 +// (The BP registers hold 24 bits of a 32-byte-aligned offset from MEM1: images and copy
 +// destinations below MEM1, in the program image, do not survive them.)
