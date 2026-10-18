@@ -122,6 +122,10 @@ static PrimClass s_bclass = PRIM_TRIS;
 static inline bool batchHasVertices() { return !s_idx.empty(); }
 static uint8_t* s_bArena;          // the resident page the batch draws from (display-list arena below), or null
 static uint32_t s_bmin, s_bmax;    // its vertices there: [s_bmin, s_bmax)
+// A resident batch whose vertices carry matrix indices: the matrices its runs use (arenaRunMtx), as
+// its page window may also hold other runs' vertices, which it does not draw.
+static uint8_t s_bPnMax;           // highest position matrix index
+static uint8_t s_bTexMtx[8];       // each coordinate's texture matrix index, 0xFF where it varies
 
 // The render side: its copy of the register file (bp, kreg, xfReg, xfMem, texImage, copyDest and
 // tlutMem are kept; the rest is not used), and the batch being drawn.
@@ -132,6 +136,8 @@ static uint32_t r_count, r_nidx, r_stride, r_fmt;
 static PrimClass r_class = PRIM_TRIS;
 static VtxFmtLayout r_layout;
 static const uint8_t* r_arena;     // non-null: r_verts is in a resident page (drawn where it is)
+static bool r_amtx;                // a resident batch with matrix indices: its runs' matrices follow
+static uint8_t r_pnMax, r_texMtx[8];
 static uint32_t s_rFrames;         // display copies the render side has done
 
 // ---- profiler -------------------------------------------------------------------------------
@@ -2516,7 +2522,9 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	                           uint8_t((matA >> 24) & 63), uint8_t(matB & 63),         uint8_t((matB >> 6) & 63),
 	                           uint8_t((matB >> 12) & 63), uint8_t((matB >> 18) & 63)};
 	// Position matrix rows: the shader indexes rows idx..idx+2 of the 30 it holds.
-	if (hasMtx) {
+	if (hasMtx && r_amtx) {
+		if (r_pnMax > PICA_GX_MTX_ROWS - 3) return gpuFail(FB_PNMTX, n);
+	} else if (hasMtx) {
 		for (uint32_t i = 0; i < n; i++)
 			if (r_verts[size_t(i) * r_stride + L.mtx] > PICA_GX_MTX_ROWS - 3) return gpuFail(FB_PNMTX, n);
 	} else if (defPm > PICA_GX_MTX_ROWS - 3) {
@@ -2583,7 +2591,10 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 		{
 		// Texture matrix: the default index, or the per-vertex one when it is the same everywhere.
 		uint32_t tm = defTex[coord];
-		if (hasMtx) {
+		if (hasMtx && r_amtx) {
+			tm = r_texMtx[coord];
+			if (tm == 0xFF) return gpuFail(FB_TEXMTX_VARIES, n);
+		} else if (hasMtx) {
 			tm = r_verts[L.mtx + 1 + coord];
 			for (uint32_t i = 1; i < n; i++)
 				if (r_verts[size_t(i) * r_stride + L.mtx + 1 + coord] != tm) return gpuFail(FB_TEXMTX_VARIES, n);
@@ -3058,6 +3069,8 @@ struct DrawRec {
 	void* copyDest;
 	uint32_t stateOff;     // non-zero: the registers to apply first, at this offset in the record
 	uint8_t cut;           // pixels cut (profile runs)
+	uint8_t amtx;          // resident with matrix indices: pnMax and texMtx hold its runs' matrices
+	uint8_t pnMax, texMtx[8];
 };
 // Where a draw record's data starts (vertices, then indices; or nothing, with ext).
 static const uint32_t kDrawHead = uint32_t(sizeof(RecHdr) + sizeof(DrawRec) + 7) & ~7u;
@@ -3399,6 +3412,9 @@ static void enqueueDraw() {
 	d->copyDest = g.copyDest;
 	d->stateOff = stateOff;
 	d->cut = s_bcut;
+	d->amtx = s_bArena && (s_bfmt & VF_MTX);
+	d->pnMax = s_bPnMax;
+	memcpy(d->texMtx, s_bTexMtx, sizeof d->texMtx);
 	uint8_t* data = ext ? ext : p + head;
 	if (!s_bArena && !inPlace) {
 		PerfScope pv(PERF_QVERT);
@@ -3430,6 +3446,9 @@ static void renderDraw(const RecHdr* h) {
 	r_layout = d->L;
 	r_arena = d->arena;
 	r_verts = d->arena ? d->arena : data;
+	r_amtx = d->amtx != 0;
+	r_pnMax = d->pnMax;
+	memcpy(r_texMtx, d->texMtx, sizeof r_texMtx);
 	r_idx = reinterpret_cast<const uint16_t*>(data + vbytes);
 	if (d->cut) pica_set_draw_cut(1);
 	drawBatch();
@@ -3640,6 +3659,29 @@ extern "C" void GX3DS_SetArena(int on) { s_arenaOn = on != 0; }
 bool arenaEnabled() { return s_arenaOn; }
 uint32_t arenaGeneration() { return s_agen; }
 
+// Each stored run's indices are preceded by kRunInfo words: the matrices its vertices use when they
+// carry matrix indices, worked out on its first draw from its CPU copy. [0]: bit 31 once worked out,
+// low byte the highest position matrix index; [1], [2]: each coordinate's texture matrix index,
+// 0xFF where it varies. The render side checks these instead of the page window's vertices.
+static const uint32_t kRunInfo = 3;
+static const uint32_t* arenaRunMtx(const ArenaRef& ref, const uint8_t* verts, uint32_t n, uint32_t stride,
+                                   uint32_t mtxOff) {
+	uint32_t* info = &s_aidx[ref.iOff - kRunInfo];
+	if (!(info[0] >> 31)) {
+		uint8_t pn = 0, tex[8];
+		memcpy(tex, verts + mtxOff + 1, 8);
+		for (uint32_t i = 0; i < n; i++) {
+			const uint8_t* m = verts + size_t(i) * stride + mtxOff;
+			if (m[0] > pn) pn = m[0];
+			for (int c = 0; c < 8; c++)
+				if (m[1 + c] != tex[c]) tex[c] = 0xFF;
+		}
+		info[0] = 0x80000000u | pn;
+		memcpy(&info[1], tex, 8);
+	}
+	return info;
+}
+
 bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32_t* idx, uint32_t nidx, ArenaRef& out) {
 	if (!s_ready || !s_arenaOn || n == 0 || nidx == 0 || stride == 0 || stride >= 256) return false;
 	if (!s_apagesInit) {
@@ -3668,8 +3710,9 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
 	memcpy(dst, verts, size_t(n) * stride);
 	pica_flush(dst, n * stride);
 	pg.used += n;
-	const size_t io = s_aidx.size();
+	const size_t io = s_aidx.size() + kRunInfo;
 	s_aidx.resize(io + nidx);
+	s_aidx[io - kRunInfo] = 0;  // its matrices: not worked out yet (arenaRunMtx)
 	for (uint32_t i = 0; i < nidx; i++) s_aidx[io + i] = idx[i] + vb;
 	out.gen = s_agen;
 	out.baseVertex = int32_t((uint32_t(pi) << 16) | vb);
@@ -3679,7 +3722,7 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
 }
 
 void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& ref, uint32_t n, uint32_t nidx,
-                 const uint8_t*) {
+                 const uint8_t* verts) {
 	PerfScopeExcl ps(PERF_APPEND);
 	GX3DS_GameVerts += n;
 	const ArenaPage& pg = s_apages[size_t(uint32_t(ref.baseVertex) >> 16)];
@@ -3690,6 +3733,20 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& r
 	s_bfmt = fmt;
 	s_bstride = stride;
 	if (!s_ready || n == 0 || nidx == 0) return;
+	if (fmt & VF_MTX) {
+		const uint32_t* info = arenaRunMtx(ref, verts, n, stride, vtxFmtLayout(fmt).mtx);
+		const uint8_t pn = uint8_t(info[0]);
+		uint8_t tex[8];
+		memcpy(tex, &info[1], 8);
+		if (!batchHasVertices()) {
+			s_bPnMax = pn;
+			memcpy(s_bTexMtx, tex, 8);
+		} else {
+			if (pn > s_bPnMax) s_bPnMax = pn;
+			for (int c = 0; c < 8; c++)
+				if (s_bTexMtx[c] != tex[c]) s_bTexMtx[c] = 0xFF;
+		}
+	}
 	if (!batchHasVertices()) {
 		s_bArena = pg.base;
 		s_bmin = vb;

@@ -221,7 +221,9 @@ static void check_stall(uint32_t frames, uint32_t batches)
 	static uint32_t last_frames = ~0u;
 	static u64 since;
 	static int reports;
-	u64 now = osGetTime();
+	// Milliseconds from the system tick: osGetTime follows the clock, which steps back now and
+	// then, and a step back read as a stall of billions of seconds (17 Oct log, frame 4588).
+	u64 now = svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000);
 	if (frames != last_frames) {
 		if (reports) fprintf(stderr, "[stall] frames moving again at %lu\n", (unsigned long)frames);
 		last_frames = frames;

@@ -5,9 +5,9 @@
  #endif
              const uint32_t nidx = uint32_t(r.idx.size());
 +#if defined(__3DS__)
-+            // 3DS port: only triangles without per-vertex matrices are kept resident (the back
-+            // end draws them in place; its per-vertex matrix checks read the batch's own copy).
-+            if (arena && nidx && r.cls == PRIM_TRIS && !(r.fmt & VF_MTX) &&
++            // 3DS port: only triangles are kept resident (the back end draws them in place;
++            // runs with per-vertex matrices too, their matrices worked out once per run).
++            if (arena && nidx && r.cls == PRIM_TRIS &&
 +#else
              if (arena && nidx &&
 +#endif
