@@ -1,0 +1,983 @@
+--- a/platform/gx/src/gx_api.cpp	2026-10-17 23:53:17
++++ b/platform/gx/src/gx_api.cpp	2026-10-17 23:53:17
+@@ -27,6 +27,60 @@
+ static uint8_t* s_dlBegin = nullptr;
+ static uint32_t s_dlSize = 0;
+ 
++// The registers the API reads back (its read-modify-writes and getters): the renderer's own,
++// except while streamed (3DS port, gx_internal.h), when the API keeps a copy of what it wrote (as
++// the SDK's __GXData) and the renderer's state is on the GX thread, behind.
++#if defined(__3DS__)
++static State* s_apiState = &g;
++#define GA (*s_apiState)
++extern "C" void GXPC_StreamFlush(void);
++extern "C" void GXPC_StreamOp(uint8_t op, const void* args, uint32_t n);
++extern "C" void GXPC_StreamBytes(const void* bytes, uint32_t n);
++extern "C" void GXPC_StreamFrameEnd(void);  // the 3DS back end: a display copy sent
++extern "C" void GXPC_StreamDrain(void);     // the 3DS back end: waits until the GX thread has run everything
++extern "C" void GXPC_StreamNoteDL(const void* list, uint32_t nbytes);  // ... a list called (rewrites wait for it)
++namespace gx {
++void apiStreamStart() {
++    State* s = static_cast<State*>(malloc(sizeof(State)));
++    if (!s) fatal("no memory for the GX API's registers");
++    memcpy(s, &g, sizeof(State));
++    s_apiState = s;
++}
++}  // namespace gx
++static void streamU32(uint8_t* p, uint32_t v) {
++    p[0] = uint8_t(v >> 24);
++    p[1] = uint8_t(v >> 16);
++    p[2] = uint8_t(v >> 8);
++    p[3] = uint8_t(v);
++}
++// The API's copy of a register it sends (writeBP/writeCP/writeXF's storage, without their effects).
++static void apiKeepBP(uint32_t reg, uint32_t data) {
++    if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) GA.kreg[reg & 7] = data;
++    else if (reg != BP_MASK) GA.bp[reg] = data;
++}
++static void apiKeepCP(uint8_t reg, uint32_t v) {
++    switch (reg & 0xF0) {
++    case CP_MATIDX_A: GA.cpMatA = v; break;
++    case CP_MATIDX_B: GA.cpMatB = v; break;
++    case CP_VCD_LO: GA.cpVcdLo = v; break;
++    case CP_VCD_HI: GA.cpVcdHi = v; break;
++    case CP_VAT_A: GA.cpVatA[reg & 7] = v; break;
++    case CP_VAT_B: GA.cpVatB[reg & 7] = v; break;
++    case CP_VAT_C: GA.cpVatC[reg & 7] = v; break;
++    default: break;
++    }
++}
++static void apiKeepXF(uint16_t addr, uint32_t n, const uint32_t* w) {
++    for (uint32_t i = 0; i < n; i++, addr++) {
++        if (addr < XF_MEM_WORDS) GA.xfMem[addr] = w[i];
++        else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) GA.xfReg[addr - XF_REG_BASE] = w[i];
++    }
++}
++#else
++#define GA g
++static const bool g_gxStream = false;
++#endif
++
+ static inline uint32_t setField(uint32_t reg, int size, int shift, uint32_t v) {
+     uint32_t m = ((1u << size) - 1u) << shift;
+     return (reg & ~m) | ((v << shift) & m);
+@@ -35,30 +89,39 @@
+ 
+ static void apiBP(uint32_t reg, uint32_t data) {
+     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
+-    if (s_recording) {
++    if (s_recording || g_gxStream) {
+         GXPC_Write8(0x61);
+         GXPC_Write32(v);
++#if defined(__3DS__)
++        if (!s_recording) apiKeepBP(reg, data & 0xFFFFFF);
++#endif
+         return;
+     }
+     writeBP(v);
+ }
+-static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(g.bp[reg], size, shift, v)); }
++static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GA.bp[reg], size, shift, v)); }
+ 
+ static void apiCP(uint8_t reg, uint32_t v) {
+-    if (s_recording) {
++    if (s_recording || g_gxStream) {
+         GXPC_Write8(0x08);
+         GXPC_Write8(reg);
+         GXPC_Write32(v);
++#if defined(__3DS__)
++        if (!s_recording) apiKeepCP(reg, v);
++#endif
+         return;
+     }
+     writeCP(reg, v);
+ }
+ 
+ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
+-    if (s_recording) {
++    if (s_recording || g_gxStream) {
+         GXPC_Write8(0x10);
+         GXPC_Write32(((n - 1) << 16) | addr);
+         for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
++#if defined(__3DS__)
++        if (!s_recording) apiKeepXF(addr, n, w);
++#endif
+         return;
+     }
+     writeXF(addr, n, w);
+@@ -74,7 +137,7 @@
+     memcpy(&u, &f, 4);
+     return u;
+ }
+-static uint32_t xfReg(int r) { return g.xfReg[r]; }
++static uint32_t xfReg(int r) { return GA.xfReg[r]; }
+ 
+ // ------------------------------------------------------------------ internal object layouts
+ namespace {
+@@ -145,6 +208,13 @@
+ GXFifoObj* GXInit(void* base, u32 size) {
+     // bring up a window (or a headless context) unless the host already did
+     if (!rendererReady()) GXPC_InitAuto(1);
++#if defined(__3DS__)
++    if (g_gxStream) {  // the renderer's registers start over on the GX thread's side, idle
++        GXPC_StreamDrain();
++        resetState();
++        memcpy(s_apiState, &g, sizeof(State));
++    } else
++#endif
+     resetState();
+     FifoObjInt* f = reinterpret_cast<FifoObjInt*>(&s_fifo);
+     f->base = static_cast<uint8_t*>(base);
+@@ -227,7 +297,16 @@
+ }
+ 
+ void GXSetMisc(GXMiscToken, u32) {}
+-void GXFlush(void) { flushBatch(); }
++void GXFlush(void) {
++#if defined(__3DS__)
++    if (g_gxStream) {
++        GXPC_StreamOp(kStreamOpFlush, nullptr, 0);
++        GXPC_StreamFlush();
++        return;
++    }
++#endif
++    flushBatch();
++}
+ void GXResetWriteGatherPipe(void) {}
+ void GXAbortFrame(void) {}
+ BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
+@@ -236,14 +315,27 @@
+     apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
+     apiBP(BP_PE_TOKEN, token);
+ }
+-u16 GXReadDrawSync(void) { return g.drawSyncToken; }
++u16 GXReadDrawSync(void) { return g.drawSyncToken; }  // the renderer's: the last token it passed
+ void GXSetDrawDone(void) {
+     apiBP(BP_DRAWDONE, 2);
+     if (s_drawDoneCb) s_drawDoneCb();
+ }
+-void GXWaitDrawDone(void) { flushBatch(); }
+-void GXDrawDone(void) {
++// Hands the renderer every command so far: the batch drawn (it never waited for the GPU here).
++// Streamed, the GX thread gets them without waiting for it: the game ends every frame with
++// GXDrawDone (THPPlayerDrawDone), and waiting cost the overlap with the GX thread.
++static void drawDoneWait() {
++#if defined(__3DS__)
++    if (g_gxStream) {
++        GXPC_StreamOp(kStreamOpFlush, nullptr, 0);
++        GXPC_StreamFlush();
++        return;
++    }
++#endif
+     flushBatch();
++}
++void GXWaitDrawDone(void) { drawDoneWait(); }
++void GXDrawDone(void) {
++    drawDoneWait();
+     if (s_drawDoneCb) s_drawDoneCb();
+ }
+ void GXPixModeSync(void) {}
+@@ -329,7 +421,7 @@
+ 
+ // ================================================================== display lists
+ void GXBeginDisplayList(void* list, u32 size) {
+-    flushBatch();
++    if (!g_gxStream) flushBatch();  // (streamed: recording only writes the list, nothing to draw first)
+     s_recording = true;
+     s_dlBegin = static_cast<uint8_t*>(list);
+     s_dlSize = size;
+@@ -351,12 +443,22 @@
+         GXPC_Write32(uint32_t(nbytes));
+         return;
+     }
++#if defined(__3DS__)
++    if (g_gxStream) {  // through the display-list cache, on the GX thread
++        uint8_t a[8];
++        streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(list)));
++        streamU32(a + 4, uint32_t(nbytes));
++        GXPC_StreamOp(kStreamOpCallDL, a, 8);
++        GXPC_StreamNoteDL(list, uint32_t(nbytes));
++        return;
++    }
++#endif
+     callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
+ }
+ 
+ // ================================================================== GXGeometry / GXAttr
+ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
++    uint32_t lo = GA.cpVcdLo, hi = GA.cpVcdHi;
+     uint32_t t = uint32_t(type) & 3;
+     if (attr == GX_VA_PNMTXIDX) lo = setField(lo, 1, 0, t != 0);
+     else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) lo = setField(lo, 1, 1 + (attr - GX_VA_TEX0MTXIDX), t != 0);
+@@ -365,8 +467,9 @@
+     else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
+     else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
+     else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
+-    if (lo != g.cpVcdLo) apiCP(CP_VCD_LO, lo);
+-    if (hi != g.cpVcdHi) apiCP(CP_VCD_HI, hi);
++    // (Streamed, the API's copy may not be what a display list left: written whatever it says.)
++    if (lo != GA.cpVcdLo || g_gxStream) apiCP(CP_VCD_LO, lo);
++    if (hi != GA.cpVcdHi || g_gxStream) apiCP(CP_VCD_HI, hi);
+ }
+ void GXSetVtxDescv(const GXVtxDescList* list) {
+     for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
+@@ -376,7 +479,7 @@
+     apiCP(CP_VCD_HI, 0);
+ }
+ void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
+-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi, t = 0;
++    uint32_t lo = GA.cpVcdLo, hi = GA.cpVcdHi, t = 0;
+     if (attr == GX_VA_PNMTXIDX) t = lo & 1;
+     else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) t = getField(lo, 1, 1 + attr - GX_VA_TEX0MTXIDX);
+     else if (attr == GX_VA_POS) t = getField(lo, 2, 9);
+@@ -397,7 +500,7 @@
+ }
+ 
+ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
+-    uint32_t A = g.cpVatA[fmt], B = g.cpVatB[fmt], C = g.cpVatC[fmt];
++    uint32_t A = GA.cpVatA[fmt], B = GA.cpVatB[fmt], C = GA.cpVatC[fmt];
+     uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
+     switch (attr) {
+     case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
+@@ -420,15 +523,15 @@
+     default: break;
+     }
+     A |= 1u << 30;
+-    if (A != g.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
+-    if (B != g.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
+-    if (C != g.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
++    if (A != GA.cpVatA[fmt] || g_gxStream) apiCP(uint8_t(CP_VAT_A + fmt), A);
++    if (B != GA.cpVatB[fmt] || g_gxStream) apiCP(uint8_t(CP_VAT_B + fmt), B);
++    if (C != GA.cpVatC[fmt] || g_gxStream) apiCP(uint8_t(CP_VAT_C + fmt), C);
+ }
+ void GXSetVtxAttrFmtv(GXVtxFmt fmt, const GXVtxAttrFmtList* list) {
+     for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);
+ }
+ void GXGetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt* cnt, GXCompType* type, u8* frac) {
+-    uint32_t A = g.cpVatA[fmt], B = g.cpVatB[fmt], C = g.cpVatC[fmt];
++    uint32_t A = GA.cpVatA[fmt], B = GA.cpVatB[fmt], C = GA.cpVatC[fmt];
+     uint32_t c = 0, t = 0, f = 0;
+     switch (attr) {
+     case GX_VA_POS: c = getField(A, 1, 0); t = getField(A, 3, 1); f = getField(A, 5, 4); break;
+@@ -463,14 +566,14 @@
+ void GXSetArray(GXAttr attr, const void* base, u8 stride) {
+     int slot = attr == GX_VA_NBT ? 1 : int(attr) - GX_VA_POS;
+     if (slot < 0 || slot > 15) return;
+-    if (s_recording) {
++    if (s_recording || g_gxStream) {  // (the byte order is looked up where the CP write runs)
+         apiCP(uint8_t(CP_ARRAY_BASE + slot), ptrToPhys(base));
+         apiCP(uint8_t(CP_ARRAY_STRIDE + slot), stride);
+         return;
+     }
+-    g.arrayBase[slot] = static_cast<const uint8_t*>(base);
+-    g.arrayStride[slot] = stride;
+-    g.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
++    GA.arrayBase[slot] = static_cast<const uint8_t*>(base);
++    GA.arrayStride[slot] = stride;
++    GA.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
+     g_arrayGen++;
+ }
+ void GXInvalidateVtxCache(void) {}
+@@ -536,33 +639,33 @@
+ }
+ 
+ void GXSetLineWidth(u8 width, GXTexOffset off) {
+-    g.lineWidth = width;
+-    uint32_t r = setField(g.bp[BP_LPSIZE], 8, 0, width);
++    GA.lineWidth = width;
++    uint32_t r = setField(GA.bp[BP_LPSIZE], 8, 0, width);
+     apiBP(BP_LPSIZE, setField(r, 3, 16, off));
+ }
+ void GXGetLineWidth(u8* width, GXTexOffset* off) {
+-    *width = u8(getField(g.bp[BP_LPSIZE], 8, 0));
+-    *off = GXTexOffset(getField(g.bp[BP_LPSIZE], 3, 16));
++    *width = u8(getField(GA.bp[BP_LPSIZE], 8, 0));
++    *off = GXTexOffset(getField(GA.bp[BP_LPSIZE], 3, 16));
+ }
+ void GXSetPointSize(u8 size, GXTexOffset off) {
+-    g.pointSize = size;
+-    uint32_t r = setField(g.bp[BP_LPSIZE], 8, 8, size);
++    GA.pointSize = size;
++    uint32_t r = setField(GA.bp[BP_LPSIZE], 8, 8, size);
+     apiBP(BP_LPSIZE, setField(r, 3, 19, off));
+ }
+ void GXGetPointSize(u8* size, GXTexOffset* off) {
+-    *size = u8(getField(g.bp[BP_LPSIZE], 8, 8));
+-    *off = GXTexOffset(getField(g.bp[BP_LPSIZE], 3, 19));
++    *size = u8(getField(GA.bp[BP_LPSIZE], 8, 8));
++    *off = GXTexOffset(getField(GA.bp[BP_LPSIZE], 3, 19));
+ }
+ void GXEnableTexOffsets(GXTexCoordID coord, u8 line, u8 point) {
+-    uint32_t r = setField(g.bp[BP_SU_SSIZE + 2 * coord], 1, 18, line);
++    uint32_t r = setField(GA.bp[BP_SU_SSIZE + 2 * coord], 1, 18, line);
+     apiBP(BP_SU_SSIZE + 2 * coord, setField(r, 1, 19, point));
+ }
+ void GXSetCullMode(GXCullMode mode) {
+-    g.cullMode = mode;
++    GA.cullMode = mode;
+     uint32_t hw = mode == GX_CULL_FRONT ? 2 : mode == GX_CULL_BACK ? 1 : uint32_t(mode);
+     bpField(BP_GENMODE, 2, 14, hw);
+ }
+-void GXGetCullMode(GXCullMode* mode) { *mode = GXCullMode(g.cullMode); }
++void GXGetCullMode(GXCullMode* mode) { *mode = GXCullMode(GA.cullMode); }
+ void GXSetCoPlanar(GXBool enable) { bpField(BP_GENMODE, 1, 19, enable); }
+ 
+ // ================================================================== GXTransform
+@@ -584,13 +687,13 @@
+ }
+ void GXSetProjectionv(f32* ptr) {
+     traceNoteProjection(ptr);
+-    memcpy(g.projection, ptr, sizeof(g.projection));
++    memcpy(GA.projection, ptr, sizeof(GA.projection));
+     uint32_t w[7];
+     for (int i = 0; i < 6; i++) w[i] = fbits(ptr[1 + i]);
+     w[6] = ptr[0] != 0.0f ? 1 : 0;
+     apiXF(XF_REG_BASE + XFR_PROJ, 7, w);
+ }
+-void GXGetProjectionv(f32* ptr) { memcpy(ptr, g.projection, sizeof(g.projection)); }
++void GXGetProjectionv(f32* ptr) { memcpy(ptr, GA.projection, sizeof(GA.projection)); }
+ 
+ void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
+ void GXLoadPosMtxIndx(u16 idx, u32 id) {
+@@ -641,12 +744,12 @@
+ 
+ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
+     if (field == 0) top -= 0.5f;
+-    g.viewport[0] = left;
+-    g.viewport[1] = top;
+-    g.viewport[2] = wd;
+-    g.viewport[3] = ht;
+-    g.viewport[4] = nearz;
+-    g.viewport[5] = farz;
++    GA.viewport[0] = left;
++    GA.viewport[1] = top;
++    GA.viewport[2] = wd;
++    GA.viewport[3] = ht;
++    GA.viewport[4] = nearz;
++    GA.viewport[5] = farz;
+     float v[6];
+     v[0] = wd * 0.5f;
+     v[1] = -ht * 0.5f;
+@@ -659,13 +762,13 @@
+ void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
+     GXSetViewportJitter(left, top, wd, ht, nearz, farz, 1);
+ }
+-void GXGetViewportv(f32* vp) { memcpy(vp, g.viewport, sizeof(g.viewport)); }
++void GXGetViewportv(f32* vp) { memcpy(vp, GA.viewport, sizeof(GA.viewport)); }
+ 
+ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
+-    g.scissor[0] = uint32_t(left);
+-    g.scissor[1] = uint32_t(top);
+-    g.scissor[2] = uint32_t(wd);
+-    g.scissor[3] = uint32_t(ht);
++    GA.scissor[0] = uint32_t(left);
++    GA.scissor[1] = uint32_t(top);
++    GA.scissor[2] = uint32_t(wd);
++    GA.scissor[3] = uint32_t(ht);
+     uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
+     tl = setField(tl, 11, 12, uint32_t(left) + 342);
+     uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
+@@ -674,10 +777,10 @@
+     apiBP(BP_SCISSOR_BR, br);
+ }
+ void GXGetScissor(u32* left, u32* top, u32* wd, u32* ht) {
+-    *left = g.scissor[0];
+-    *top = g.scissor[1];
+-    *wd = g.scissor[2];
+-    *ht = g.scissor[3];
++    *left = GA.scissor[0];
++    *top = GA.scissor[1];
++    *wd = GA.scissor[2];
++    *ht = GA.scissor[3];
+ }
+ void GXSetScissorBoxOffset(s32 x, s32 y) {
+     uint32_t r = setField(0, 10, 0, uint32_t(x + 342) >> 1);
+@@ -861,7 +964,7 @@
+     GXSetTevAlphaOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+ }
+ void GXSetTevColorIn(GXTevStageID s, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
+-    uint32_t r = g.bp[BP_TEV_COLOR_ENV + 2 * s];
++    uint32_t r = GA.bp[BP_TEV_COLOR_ENV + 2 * s];
+     r = setField(r, 4, 12, a);
+     r = setField(r, 4, 8, b);
+     r = setField(r, 4, 4, c);
+@@ -869,7 +972,7 @@
+     apiBP(BP_TEV_COLOR_ENV + 2 * s, r);
+ }
+ void GXSetTevAlphaIn(GXTevStageID s, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d) {
+-    uint32_t r = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1];
++    uint32_t r = GA.bp[BP_TEV_COLOR_ENV + 2 * s + 1];
+     r = setField(r, 3, 13, a);
+     r = setField(r, 3, 10, b);
+     r = setField(r, 3, 7, c);
+@@ -889,10 +992,10 @@
+     return setField(r, 2, 22, out);
+ }
+ void GXSetTevColorOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
+-    apiBP(BP_TEV_COLOR_ENV + 2 * s, tevOp(g.bp[BP_TEV_COLOR_ENV + 2 * s], op, bias, scale, clamp, out));
++    apiBP(BP_TEV_COLOR_ENV + 2 * s, tevOp(GA.bp[BP_TEV_COLOR_ENV + 2 * s], op, bias, scale, clamp, out));
+ }
+ void GXSetTevAlphaOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
+-    apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, tevOp(g.bp[BP_TEV_COLOR_ENV + 2 * s + 1], op, bias, scale, clamp, out));
++    apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, tevOp(GA.bp[BP_TEV_COLOR_ENV + 2 * s + 1], op, bias, scale, clamp, out));
+ }
+ static void tevRegWrite(uint32_t id, int r, int gg, int b, int a, bool konst) {
+     uint32_t ra = setField(0, 11, 0, uint32_t(r)) | setField(0, 11, 12, uint32_t(a)) | (konst ? 0x800000u : 0);
+@@ -910,13 +1013,13 @@
+     bpField(BP_TEV_KSEL + (s >> 1), 5, (s & 1) ? 19 : 9, sel);
+ }
+ void GXSetTevSwapMode(GXTevStageID s, GXTevSwapSel ras, GXTevSwapSel tex) {
+-    uint32_t r = setField(g.bp[BP_TEV_COLOR_ENV + 2 * s + 1], 2, 0, ras);
++    uint32_t r = setField(GA.bp[BP_TEV_COLOR_ENV + 2 * s + 1], 2, 0, ras);
+     apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, setField(r, 2, 2, tex));
+ }
+ void GXSetTevSwapModeTable(GXTevSwapSel t, GXTevColorChan r, GXTevColorChan gch, GXTevColorChan b, GXTevColorChan a) {
+-    uint32_t k0 = setField(g.bp[BP_TEV_KSEL + 2 * t], 2, 0, r);
++    uint32_t k0 = setField(GA.bp[BP_TEV_KSEL + 2 * t], 2, 0, r);
+     apiBP(BP_TEV_KSEL + 2 * t, setField(k0, 2, 2, gch));
+-    uint32_t k1 = setField(g.bp[BP_TEV_KSEL + 2 * t + 1], 2, 0, b);
++    uint32_t k1 = setField(GA.bp[BP_TEV_KSEL + 2 * t + 1], 2, 0, b);
+     apiBP(BP_TEV_KSEL + 2 * t + 1, setField(k1, 2, 2, a));
+ }
+ void GXSetTevClampMode(void) {}
+@@ -938,7 +1041,7 @@
+     int sh = (s & 1) ? 12 : 0;
+     uint32_t tmap = uint32_t(map) & 0xFF;
+     bool enable = tmap != 0xFF && !(uint32_t(map) & 0x100);
+-    uint32_t r = g.bp[reg];
++    uint32_t r = GA.bp[reg];
+     r = setField(r, 3, sh, tmap == 0xFF ? 0 : tmap & 7);
+     r = setField(r, 3, sh + 3, coord == GX_TEXCOORD_NULL ? 0 : uint32_t(coord) & 7);
+     r = setField(r, 1, sh + 6, enable);
+@@ -979,11 +1082,11 @@
+ void GXSetIndTexCoordScale(GXIndTexStageID ind, GXIndTexScale ss, GXIndTexScale ts) {
+     uint32_t reg = ind < 2 ? BP_RAS1_SS0 : BP_RAS1_SS1;
+     int sh = (ind & 1) ? 8 : 0;
+-    uint32_t r = setField(g.bp[reg], 4, sh, ss);
++    uint32_t r = setField(GA.bp[reg], 4, sh, ss);
+     apiBP(reg, setField(r, 4, sh + 4, ts));
+ }
+ void GXSetIndTexOrder(GXIndTexStageID ind, GXTexCoordID coord, GXTexMapID map) {
+-    uint32_t r = setField(g.bp[BP_RAS1_IREF], 3, 6 * ind, uint32_t(map) & 7);
++    uint32_t r = setField(GA.bp[BP_RAS1_IREF], 3, 6 * ind, uint32_t(map) & 7);
+     apiBP(BP_RAS1_IREF, setField(r, 3, 6 * ind + 3, uint32_t(coord) & 7));
+ }
+ void GXSetNumIndStages(u8 n) { bpField(BP_GENMODE, 3, 16, n); }
+@@ -1067,7 +1170,7 @@
+     apiBP(BP_FOG_RANGE, (uint32_t(center) + 342) | (uint32_t(enable) << 10));
+ }
+ void GXSetBlendMode(GXBlendMode type, GXBlendFactor src, GXBlendFactor dst, GXLogicOp op) {
+-    uint32_t r = g.bp[BP_CMODE0];
++    uint32_t r = GA.bp[BP_CMODE0];
+     r = setField(r, 1, 0, type == GX_BM_BLEND || type == GX_BM_SUBTRACT);
+     r = setField(r, 1, 1, type == GX_BM_LOGIC);
+     r = setField(r, 1, 11, type == GX_BM_SUBTRACT);
+@@ -1084,7 +1187,7 @@
+ }
+ void GXSetZCompLoc(GXBool before) { bpField(BP_PE_CONTROL, 1, 6, before); }
+ void GXSetPixelFmt(GXPixelFmt pix, GXZFmt16 z) {
+-    uint32_t r = setField(g.bp[BP_PE_CONTROL], 3, 0, pix);
++    uint32_t r = setField(GA.bp[BP_PE_CONTROL], 3, 0, pix);
+     apiBP(BP_PE_CONTROL, setField(r, 3, 3, z));
+     bpField(BP_GENMODE, 1, 9, pix == GX_PF_RGB565_Z16);
+ }
+@@ -1176,19 +1279,29 @@
+     if (disp) apiBP(BP_COPY_YSCALE, s_dispYScale);
+     // the renderer needs the host pointer; commands carry a physical address
+     apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
+-    if (!s_recording) g.copyDest = dest;  // keep the full host pointer (64-bit hosts)
++    if (!s_recording && !g_gxStream) GA.copyDest = dest;  // keep the full host pointer (64-bit hosts)
++#if defined(__3DS__)
++    if (!s_recording && g_gxStream) {  // (the same on the GX thread: BP_COPY_DST cannot hold it)
++        uint8_t a[4];
++        streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(dest)));
++        GXPC_StreamOp(kStreamOpCopyDest, a, 4);
++    }
++#endif
+     uint32_t ctrl = disp ? s_dispCtrl : s_texCtrl;
+     ctrl = setField(ctrl, 1, 11, clear);
+     ctrl = setField(ctrl, 1, 14, disp);
+     if (!disp && s_texCopyZ) {
+         // the SDK switches PE_CONTROL to Z24 for depth copies
+-        uint32_t pe = g.bp[BP_PE_CONTROL];
++        uint32_t pe = GA.bp[BP_PE_CONTROL];
+         apiBP(BP_PE_CONTROL, setField(pe, 3, 0, 3));
+         apiBP(BP_COPY_EXEC, ctrl);
+         apiBP(BP_PE_CONTROL, pe);
+     } else {
+         apiBP(BP_COPY_EXEC, ctrl);
+     }
++#if defined(__3DS__)
++    if (disp && g_gxStream && !s_recording) GXPC_StreamFrameEnd();
++#endif
+ }
+ void GXCopyDisp(void* dest, GXBool clear) { doCopy(dest, clear, true); }
+ void GXCopyTex(void* dest, GXBool clear) { doCopy(dest, clear, false); }
+@@ -1335,7 +1448,15 @@
+         uint32_t fmt = idx < 20 ? s_tlutLoaded[idx].fmt : 0;
+         apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
+     }
+-    if (!s_recording) g.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
++    if (!s_recording && !g_gxStream) GA.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
++#if defined(__3DS__)
++    if (!s_recording && g_gxStream) {  // (the same on the GX thread: BP_TX_IMAGE3 cannot hold it)
++        uint8_t a[5];
++        a[0] = uint8_t(map);
++        streamU32(a + 1, uint32_t(reinterpret_cast<uintptr_t>(static_cast<const void*>(t->image))));
++        GXPC_StreamOp(kStreamOpTexImage, a, 5);
++    }
++#endif
+ }
+ void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
+     if (s_texRegionCb) s_texRegionCb(obj, id);
+@@ -1362,8 +1483,18 @@
+     uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
+     uint32_t bytes = uint32_t(t->entries) * 2;
+     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
++#if defined(__3DS__)
++    if (g_gxStream) {  // the palette as it is now, loaded on the GX thread
++        uint8_t a[8];
++        streamU32(a, off);
++        streamU32(a + 4, t->data ? bytes : 0);
++        GXPC_StreamOp(kStreamOpTlut, a, 8);
++        if (t->data && bytes) GXPC_StreamBytes(t->data, bytes);
++        return;
++    }
++#endif
+     onStateChange();
+-    if (t->data) memcpy(g.tlutMem + off, t->data, bytes);
++    if (t->data) memcpy(GA.tlutMem + off, t->data, bytes);
+     tlutTouched(off, bytes);
+ }
+ void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
+@@ -1384,8 +1515,22 @@
+     r->tmemAddr = uint32_t(addr);
+     r->size = uint32_t(size);
+ }
+-void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
++void GXInvalidateTexRegion(GXTexRegion*) {
++#if defined(__3DS__)
++    if (g_gxStream) {
++        GXPC_StreamOp(kStreamOpTexInval, nullptr, 0);
++        return;
++    }
++#endif
++    textureInvalidateAll();
++}
+ void GXInvalidateTexAll(void) {
++#if defined(__3DS__)
++    if (g_gxStream) {
++        GXPC_StreamOp(kStreamOpTexInval, nullptr, 0);
++        return;
++    }
++#endif
+     flushBatch();
+     textureInvalidateAll();
+ }
+@@ -1402,7 +1547,7 @@
+ void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
+ void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
+     if (coord >= 8) return;
+-    g.tcManual[coord] = enable != 0;
++    GA.tcManual[coord] = enable != 0;
+     if (enable) {
+         bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
+         bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
+@@ -1508,8 +1653,8 @@
+ 
+ // ================================================================== GXDraw (SDK helper shapes)
+ static void drawWithPosNrm(void (*body)()) {
+-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
+-    uint32_t A = g.cpVatA[GX_VTXFMT3], B = g.cpVatB[GX_VTXFMT3], C = g.cpVatC[GX_VTXFMT3];
++    uint32_t lo = GA.cpVcdLo, hi = GA.cpVcdHi;
++    uint32_t A = GA.cpVatA[GX_VTXFMT3], B = GA.cpVatB[GX_VTXFMT3], C = GA.cpVatC[GX_VTXFMT3];
+     GXClearVtxDesc();
+     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+     GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-17 23:53:17
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-17 23:53:17
+@@ -212,6 +212,16 @@
+ uint32_t g_arrayGen = 1;
+ #define s_defaultArrayBE g_defaultArrayBE
+ 
++#if defined(__3DS__)
++// Streamed GX (gx_internal.h): the back end's hand-over of full pipe buffers and of draw-sync
++// tokens (the callback runs game code, so the back end has the game thread run it).
++bool g_gxStream = false;
++static uint8_t* (*s_streamSwap)(uint8_t* buf, uint32_t len, uint32_t* cap);
++static void (*s_streamToken)(uint16_t token);
++static bool s_streamParse;  // the GX thread is parsing the stream (GXPC_StreamParse)
++static int s_parseDepth;    // parse() calls in progress: the stream's own commands are its top level's
++#endif
++
+ void resetState() {
+     bool be[16];
+     memcpy(be, g.arrayBigEndian, sizeof(be));
+@@ -270,6 +280,10 @@
+         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
+             flushBatch();
+ #if defined(__3DS__)
++            if (g_gxStream && s_streamToken) {  // on the GX thread: the game thread runs the callback
++                s_streamToken(g.drawSyncToken);
++                return;
++            }
+             // 3DS port: draw-sync callbacks run game code (and may switch emulated threads) in
+             // the middle of command parsing; counted and timed (wall clock) for [perf].
+             GXPC_DrawSyncCalls++;
+@@ -929,6 +943,20 @@
+ 
+ // ------------------------------------------------------------------ command parser
+ static uint32_t s_dlDepth = 0;
++#if defined(__3DS__)
++// A list called from a list (0x40) lies in MEM1, as everything the GameCube's GPU reads does. Bytes
++// that only look like a call (a list read while the game was rewriting it) are skipped rather than
++// followed into unmapped memory.
++static bool nestedListOk(const uint8_t* dl, uint32_t size) {
++    const uintptr_t a = reinterpret_cast<uintptr_t>(dl), base = reinterpret_cast<uintptr_t>(s_memBase);
++    if (a >= base && a - base < s_memSize && size <= s_memSize - (a - base)) return true;
++    static uint32_t s_bad;
++    if (s_bad++ < 8) logmsg("nested display-list call outside MEM1 skipped (%p, %u bytes)", static_cast<const void*>(dl), size);
++    return false;
++}
++#else
++static bool nestedListOk(const uint8_t*, uint32_t) { return true; }
++#endif
+ static bool s_dlRecFail = false;  // the list being recorded does more than draw
+ 
+ // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
+@@ -1001,8 +1029,83 @@
+ #define CMD_COUNT(i) ((void)0)
+ #endif
+ 
++#if defined(__3DS__)
++// The stream's own commands (kStreamOp*): the whole length, or the header's while that is cut.
++static uint32_t streamOpLen(const uint8_t* p, uint32_t avail) {
++    switch (p[0]) {
++    case kStreamOpCallDL:
++    case kStreamOpBERange: return 9;
++    case kStreamOpTlut: return avail < 9 ? 9 : 9 + be32(p + 5);
++    case kStreamOpArrayBE: return 3;
++    case kStreamOpDefaultBE: return 2;
++    case kStreamOpTexImage: return 6;
++    case kStreamOpCopyDest: return 5;
++    default: return 1;  // kStreamOpFlush, kStreamOpTexInval
++    }
++}
++#endif
++// The byte-order settings, applied (on the GX thread while streamed).
++static void setBERange(uintptr_t a, uint32_t size) {
++    if (size) s_beRanges[a] = a + size;
++    else s_beRanges.erase(a);
++    s_beGen++;
++    s_beHitLo = 1;
++    s_beHitHi = 0;
++}
++static void setArrayBE(int slot, bool be) {
++    g.arrayBigEndian[slot] = be;
++    g_arrayGen++;
++}
++static void setDefaultBE(bool be) {
++    s_defaultArrayBE = be;
++    for (int i = 0; i < 16; i++) g.arrayBigEndian[i] = s_defaultArrayBE;
++    g_arrayGen++;
++}
++#if defined(__3DS__)
++static void streamOpRun(const uint8_t* p) {
++    switch (p[0]) {
++    case kStreamOpCallDL:
++        callDisplayList(reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 1))), be32(p + 5));
++        break;
++    case kStreamOpFlush: flushBatch(); break;
++    case kStreamOpTexInval:
++        flushBatch();
++        textureInvalidateAll();
++        break;
++    case kStreamOpTlut: {
++        const uint32_t off = be32(p + 1), bytes = be32(p + 5);
++        onStateChange();
++        memcpy(g.tlutMem + off, p + 9, bytes);
++        tlutTouched(off, bytes);
++        break;
++    }
++    case kStreamOpArrayBE: setArrayBE(p[1] & 15, p[2] != 0); break;
++    case kStreamOpDefaultBE: setDefaultBE(p[1] != 0); break;
++    case kStreamOpBERange: setBERange(uintptr_t(be32(p + 1)), be32(p + 5)); break;
++    case kStreamOpTexImage: {
++        const uint8_t* img = reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 2)));
++        if (g.texImage[p[1] & 7] != img) {
++            onStateChange();
++            g.texImage[p[1] & 7] = img;
++        }
++        break;
++    }
++    case kStreamOpCopyDest: g.copyDest = reinterpret_cast<void*>(uintptr_t(be32(p + 1))); break;
++    default: logmsg("unknown stream command 0x%02X", p[0]); break;
++    }
++}
++struct ParseDepth {
++    ParseDepth() { s_parseDepth++; }
++    ~ParseDepth() { s_parseDepth--; }
++};
++#endif
++
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
+     GXPC_CMD_TIMER;
++#if defined(__3DS__)
++    ParseDepth parseDepth;
++    const bool streamTop = s_streamParse && s_parseDepth == 1;
++#endif
+     const uint8_t* start = p;
+     const uint8_t* end = p + n;
+     while (p < end) {
+@@ -1045,7 +1148,7 @@
+             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
+             uint32_t sz = be32(p + 5);
+             CMD_COUNT(6);
+-            if (s_dlDepth < 4 && dl) {
++            if (s_dlDepth < 4 && dl && nestedListOk(dl, sz)) {
+                 s_dlDepth++;
+                 runCommands(dl, sz);
+                 s_dlDepth--;
+@@ -1074,6 +1177,12 @@
+             } else {
+                 decodeVertices(op & 0xF8, p + 3, cnt, L, op & 7);
+             }
++#if defined(__3DS__)
++        } else if (op >= 0xC0 && streamTop) {
++            len = streamOpLen(p, avail);
++            if (avail < len) break;
++            streamOpRun(p);
++#endif
+         } else {
+             logmsg("unknown FIFO opcode 0x%02X, skipping byte", op);
+             p++;
+@@ -1098,6 +1207,9 @@
+                 len = 3 + be16(p + 1) * layoutFor(op & 7).size;
+             }
+         }
++#if defined(__3DS__)
++        else if (op >= 0xC0 && streamTop) len = streamOpLen(p, avail);
++#endif
+         *need = len;
+     }
+     return uint32_t(p - start);
+@@ -1434,7 +1546,7 @@
+             break;
+         case 0x40: {
+             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(s.n));
+-            if (s_dlDepth < 4 && dl) {
++            if (s_dlDepth < 4 && dl && nestedListOk(dl, s.v)) {
+                 s_dlDepth++;
+                 runCommands(dl, s.v);
+                 s_dlDepth--;
+@@ -1596,7 +1708,13 @@
+ #define s_pipeBuf GXPC_PipeBuf
+ #define s_pipeLen GXPC_PipeLen
+ namespace gx {
++#if defined(__3DS__)
++static void pipeFastUpdate() {
++    GXPC_PipeFast = s_redirect ? 0 : g_gxStream ? s_pipeCap : std::min(s_pipeCap, s_pipeNeed - 1);
++}
++#else
+ static void pipeFastUpdate() { GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1); }
++#endif
+ 
+ // Writes through a redirected pipe go to memory directly (uncached on the
+ // GameCube, so the game flushes nothing): stamp them when the redirect ends.
+@@ -1633,12 +1751,39 @@
+     pipeFastUpdate();
+ }
+ 
++#if defined(__3DS__)
++// Streamed GX: the full buffer goes to the back end, which returns an empty one.
++static void streamSwap() {
++    uint32_t cap = 0;
++    s_pipeBuf = s_streamSwap(s_pipeBuf, s_pipeLen, &cap);
++    s_pipeCap = cap;
++    s_pipeLen = 0;
++    pipeFastUpdate();
++}
++static void streamPut(const uint8_t* bytes, uint32_t n) {
++    while (n) {  // a command may span buffers: the GX thread joins the pieces
++        if (s_pipeLen == s_pipeCap) streamSwap();
++        const uint32_t k = std::min(n, s_pipeCap - s_pipeLen);
++        memcpy(s_pipeBuf + s_pipeLen, bytes, k);
++        s_pipeLen += k;
++        bytes += k;
++        n -= k;
++    }
++}
++#endif
++
+ static inline void pipePut(const uint8_t* bytes, uint32_t n) {
+     if (s_redirect) {
+         memcpy(s_redirect, bytes, n);
+         s_redirect += n;
+         return;
+     }
++#if defined(__3DS__)
++    if (g_gxStream) {
++        streamPut(bytes, n);
++        return;
++    }
++#endif
+     if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
+     memcpy(s_pipeBuf + s_pipeLen, bytes, n);
+     s_pipeLen += n;
+@@ -1647,6 +1792,20 @@
+ 
+ void pipeWrite(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
+ 
++#if defined(__3DS__)
++// Streamed GX: settings the GX thread reads go through the stream, in order with the draws.
++static void streamOp(uint8_t op, const uint8_t* args, uint32_t n) {
++    pipePut(&op, 1);
++    if (n) pipePut(args, n);
++}
++static void streamU32(uint8_t* p, uint32_t v) {
++    p[0] = uint8_t(v >> 24);
++    p[1] = uint8_t(v >> 16);
++    p[2] = uint8_t(v >> 8);
++    p[3] = uint8_t(v);
++}
++#endif
++
+ }  // namespace gx
+ 
+ // ------------------------------------------------------------------ C entry points
+@@ -1663,17 +1822,28 @@
+ 
+ void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
+     if (!p || !size) return;
+-    uintptr_t a = reinterpret_cast<uintptr_t>(p);
+-    s_beRanges[a] = a + size;
+-    s_beGen++;
+-    s_beHitLo = 1;
+-    s_beHitHi = 0;
++#if defined(__3DS__)
++    if (g_gxStream) {
++        uint8_t a[8];
++        streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(p)));
++        streamU32(a + 4, size);
++        streamOp(kStreamOpBERange, a, 8);
++        return;
++    }
++#endif
++    setBERange(reinterpret_cast<uintptr_t>(p), size);
+ }
+ void GXPC_RemoveBigEndianRange(const void* p) {
+-    s_beRanges.erase(reinterpret_cast<uintptr_t>(p));
+-    s_beGen++;
+-    s_beHitLo = 1;
+-    s_beHitHi = 0;
++#if defined(__3DS__)
++    if (g_gxStream) {
++        uint8_t a[8];
++        streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(p)));
++        streamU32(a + 4, 0);
++        streamOp(kStreamOpBERange, a, 8);
++        return;
++    }
++#endif
++    setBERange(reinterpret_cast<uintptr_t>(p), 0);
+ }
+ uint32_t GXPC_PtrToPhys(const void* p) { return ptrToPhys(p); }
+ void* GXPC_PhysToPtr(uint32_t phys) { return physToPtr(phys); }
+@@ -1683,14 +1853,57 @@
+     if (attr == 25) slot = 1;           // GX_VA_NBT shares the normal array
+     else if (attr >= 9 && attr <= 24) slot = attr - 9;
+     else return;
+-    g.arrayBigEndian[slot] = bigEndian != 0;
+-    g_arrayGen++;
++#if defined(__3DS__)
++    if (g_gxStream) {
++        const uint8_t a[2] = {uint8_t(slot), uint8_t(bigEndian != 0)};
++        streamOp(kStreamOpArrayBE, a, 2);
++        return;
++    }
++#endif
++    setArrayBE(slot, bigEndian != 0);
+ }
+ void GXPC_SetDefaultArrayBigEndian(int bigEndian) {
+-    s_defaultArrayBE = bigEndian != 0;
+-    for (int i = 0; i < 16; i++) g.arrayBigEndian[i] = s_defaultArrayBE;
+-    g_arrayGen++;
++#if defined(__3DS__)
++    if (g_gxStream) {
++        const uint8_t a = uint8_t(bigEndian != 0);
++        streamOp(kStreamOpDefaultBE, &a, 1);
++        return;
++    }
++#endif
++    setDefaultBE(bigEndian != 0);
+ }
++
++#if defined(__3DS__)
++// Streamed GX (gx_internal.h). At start-up, before the game's first GX call: `swap` takes a full
++// buffer (null and 0 the first time) and returns an empty one of *cap bytes; `token` gets each
++// draw-sync token on the GX thread.
++void GXPC_SetStream(uint8_t* (*swap)(uint8_t* buf, uint32_t len, uint32_t* cap), void (*token)(uint16_t)) {
++    s_streamSwap = swap;
++    s_streamToken = token;
++    free(s_pipeBuf);
++    s_pipeBuf = nullptr;
++    s_pipeLen = 0;
++    s_pipeNeed = 1;
++    g_gxStream = true;
++    apiStreamStart();
++    streamSwap();
++}
++// Hands the bytes collected so far to the GX thread.
++void GXPC_StreamFlush(void) {
++    if (g_gxStream && s_pipeLen) streamSwap();
++}
++// Writes a command of the stream's own (gx_api.cpp).
++void GXPC_StreamOp(uint8_t op, const void* args, uint32_t n) { streamOp(op, static_cast<const uint8_t*>(args), n); }
++void GXPC_StreamBytes(const void* bytes, uint32_t n) { pipePut(static_cast<const uint8_t*>(bytes), n); }
++// The GX thread: executes the whole commands in [p, p + n) and returns the bytes used; a command
++// cut at the end is left, *need its whole length.
++uint32_t GXPC_StreamParse(const uint8_t* p, uint32_t n, uint32_t* need) {
++    s_streamParse = true;
++    const uint32_t used = parse(p, n, need);
++    s_streamParse = false;
++    return used;
++}
++#endif
+ 
+ void GXPC_Write8(uint8_t v) { pipePut(&v, 1); }
+ void GXPC_Write16(uint16_t v) {
+--- a/platform/gx/src/gx_internal.h	2026-10-17 23:53:17
++++ b/platform/gx/src/gx_internal.h	2026-10-17 23:53:17
+@@ -308,6 +308,31 @@
+ void overlayText(std::vector<uint8_t>& px, int w, int h, int x, int y, const char* text, const uint8_t c[4], int scale = 1);
+ int overlayTextWidth(const char* text);  // in font pixels
+ 
++#if defined(__3DS__)
++// ---------------------------------------------------------------- streamed GX (3DS port)
++// While g_gxStream is on (GXPC_SetStream), the API sends everything as FIFO bytes, as it does
++// while recording a display list, plus a few commands of the stream's own (kStreamOp*: host
++// pointers and calls into the renderer), and keeps its own copy of the registers for its
++// read-modify-writes and getters (as the SDK's __GXData). The write-gather pipe then only collects
++// bytes and hands full buffers to the back end, whose GX thread parses them (GXPC_StreamParse):
++// the renderer's state (g) and everything it calls run there, behind the game.
++extern bool g_gxStream;
++enum : uint8_t {
++    kStreamOpCallDL = 0xC0,     // u32 list, u32 bytes: callDisplayList (cached)
++    kStreamOpFlush = 0xC1,      // flushBatch
++    kStreamOpTexInval = 0xC2,   // flushBatch, textureInvalidateAll
++    kStreamOpTlut = 0xC3,       // u32 TMEM offset, u32 bytes, the bytes: a TLUT as loaded
++    kStreamOpArrayBE = 0xC4,    // u8 slot, u8 big-endian
++    kStreamOpDefaultBE = 0xC5,  // u8 big-endian
++    kStreamOpBERange = 0xC6,    // u32 start, u32 bytes (0: remove)
++    kStreamOpTexImage = 0xC7,   // u8 map, u32 host pointer: a texture's image (after its BP_TX_IMAGE3)
++    kStreamOpCopyDest = 0xC8,   // u32 host pointer: an EFB copy's destination (after its BP_COPY_DST)
++};
++// (The BP registers hold 24 bits of a 32-byte-aligned offset from MEM1: images and copy
++// destinations below MEM1, in the program image, do not survive them.)
++void apiStreamStart();  // gx_api.cpp: the API's copy of the registers, from g
++#endif
++
+ // ---------------------------------------------------------------- util
+ uint64_t hashBytes(const void* data, size_t n, uint64_t seed = 0);
+ [[noreturn]] void fatal(const char* fmt, ...);

@@ -185,6 +185,14 @@ extern "C" uint32_t GXPC_DlFail[7];  // patch 0009: why cached lists could not b
 static uint32_t s_perfDlFail0[7];
 extern "C" uint32_t GXPC_CmdCount[7];  // patch 0010: commands parsed, by kind
 static uint32_t s_perfCmdCount0[7];
+extern "C" void GXPC_SetStream(uint8_t* (*swap)(uint8_t*, uint32_t, uint32_t*), void (*token)(uint16_t));  // patch 0017
+extern "C" uint32_t GXPC_StreamParse(const uint8_t* p, uint32_t n, uint32_t* need);
+extern "C" void GXPC_StreamFlush(void);
+extern "C" void port_irq_kick(void);                 // the emulated OS (port_os.h): an interrupt source has work
+extern "C" void port_irq_add_source(void (*fn)(void));
+extern void (*drawSyncCallback)(uint16_t);  // gx_fifo.cpp
+extern "C" uint8_t* port_mem1_base;  // port_runtime.cpp: the emulated MEM1
+extern "C" uint32_t port_mem1_size;
 extern "C" uint32_t GXPC_DrawSyncCalls;          // patch 0011
 extern "C" uint64_t GXPC_DrawSyncTicks;
 extern "C" unsigned long long port_os_switches(void);
@@ -257,6 +265,9 @@ static uint64_t gameWaitTicks(); // the profiler window's game-thread wait for t
 static void renderThreadPerf(double frames);
 
 static uint64_t s_perfEnd0[PICA_END_COUNT];
+// Streamed GX (the GX thread, below): its numbers for the profiler window.
+static bool streamOn();
+static void streamPerf(uint64_t& gameWait, double perMs, bool print);
 
 static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
@@ -273,13 +284,16 @@ static void perfFrameEnd() {
 	if (++s_perfFrames < kPerfFrames) return;
 	const double frames = s_perfFrames, total = double(now - s_perfWindowStart);
 	// ours: the renderer's time on the game thread (with the render thread, the front-half phases
-	// and waiting for the render thread).
-	double ours = 0;
+	// and waiting for the render thread; with the GX thread as well, only waiting for that).
+	double front = 0;
 	for (int i = 0; i < PERF_COUNT; i++) {
 		s_perfAvgMs[i] = float(double(s_perfAcc[i]) / frames / kTicksPerMs);
-		if (!renderThreaded() || i == PERF_DECODE || i == PERF_BATCH || i == PERF_APPEND || i >= PERF_QSTATE) ours += s_perfAcc[i];
+		if (!renderThreaded() || i == PERF_DECODE || i == PERF_BATCH || i == PERF_APPEND || i >= PERF_QSTATE) front += s_perfAcc[i];
 	}
-	ours += double(gameWaitTicks());
+	front += double(gameWaitTicks());
+	uint64_t streamGameWait = 0;
+	streamPerf(streamGameWait, 0, false);
+	const double ours = streamOn() ? double(streamGameWait) : front;
 	s_perfAvgMs[PERF_COUNT] = float(total / frames / kTicksPerMs);
 	s_perfAvgMs[PERF_COUNT + 1] = float((total - ours) / frames / kTicksPerMs);
 	s_perfAvgBatches = float(s_perfBatches / frames);
@@ -331,14 +345,22 @@ static void perfFrameEnd() {
 		const double perMs = 1.0 / frames / kTicksPerMs;
 		const double cmd = double(GXPC_CmdTicks - s_perfCmd0), mainBusy = double(GX3DS_MainBusyTicks - s_perfMain0);
 		const double idleMs = (port_idle_seconds() - s_perfIdle0) * 1000.0 / frames;
-		const double cmdOnly = cmd > ours ? (cmd - ours) * perMs : 0.0;
+		const double cmdOnly = cmd > front ? (cmd - front) * perMs : 0.0;
 		const double otherMs = s_perfAvgMs[PERF_COUNT + 1], mainMs = mainBusy * perMs;
 		// Wall-clock times on a shared core: the status screen's redraw can preempt the game thread
 		// inside any of the others, so it is reported beside them, not subtracted.
-		fprintf(stderr,
-		        "[perf]   other %.1f = idle %.1f + gx commands %.1f + game %.1f ms/frame (gx commands incl. our draw "
-		        "work: %.1f; status screen redraw, main thread: %.1f)\n",
-		        otherMs, idleMs, cmdOnly, otherMs - idleMs - cmdOnly, cmd * perMs, mainMs);
+		if (streamOn()) {
+			fprintf(stderr,
+			        "[perf]   other %.1f = idle %.1f + game %.1f ms/frame (game thread; its GX calls only write "
+			        "commands; status screen redraw, main thread: %.1f)\n",
+			        otherMs, idleMs, otherMs - idleMs, mainMs);
+			streamPerf(streamGameWait, perMs, true);
+		} else {
+			fprintf(stderr,
+			        "[perf]   other %.1f = idle %.1f + gx commands %.1f + game %.1f ms/frame (gx commands incl. our draw "
+			        "work: %.1f; status screen redraw, main thread: %.1f)\n",
+			        otherMs, idleMs, cmdOnly, otherMs - idleMs - cmdOnly, cmd * perMs, mainMs);
+		}
 		// gx commands = display lists (validate a cached one, replay it, record one, run one uncached)
 		// + everything else the parser runs (the game's direct GX commands)
 		double dl[4], dlSum = 0;
@@ -3121,10 +3143,11 @@ static void renderThreadPerf(double frames) {
 	s_perfQBytes0 = s_qBytesSeen;
 	if (s_rtCore >= 0) {
 		fprintf(stderr,
-		        "[perf]   render thread (core %d): busy %.1f, idle %.1f ms/frame | game thread waited for it %.1f "
+		        "[perf]   render thread (core %d): busy %.1f, idle %.1f ms/frame | %s thread waited for it %.1f "
 		        "ms/frame (queue full %.1f, a frame ahead %.1f, arena reset %.1f) | queue %.0f KB/frame, peak %u of %u "
 		        "KB, %lu big batches outside it so far\n",
 		        s_rtCore, double(s_rBusy - s_perfRBusy0) * perMs, double(s_rIdle - s_perfRIdle0) * perMs,
+		        streamOn() ? "GX" : "game",
 		        w[0] + w[1] + w[2], w[0], w[1], w[2], kb, unsigned(s_qPeakWin >> 10), unsigned(s_ringCap >> 10),
 		        (unsigned long)s_qExtSeen);
 	} else {
@@ -3132,8 +3155,8 @@ static void renderThreadPerf(double frames) {
 		        "KB/frame\n", s_rtWanted ? "could not start" : "Left held at launch", kb);
 	}
 	static uint32_t s_toHeap0;
-	fprintf(stderr, "[perf]   game thread queueing (in batch): registers %.2f, vertices %.2f, indices %.2f ms/frame | "
-	        "%.1f batches/frame moved out of the queue\n", s_perfAvgMs[PERF_QSTATE], s_perfAvgMs[PERF_QVERT],
+	fprintf(stderr, "[perf]   %s thread queueing (in batch): registers %.2f, vertices %.2f, indices %.2f ms/frame | "
+	        "%.1f batches/frame moved out of the queue\n", streamOn() ? "GX" : "game", s_perfAvgMs[PERF_QSTATE], s_perfAvgMs[PERF_QVERT],
 	        s_perfAvgMs[PERF_QIDX], (s_batchToHeap - s_toHeap0) / frames);
 	s_toHeap0 = s_batchToHeap;
 	s_perfRBusy0 = s_rBusy;
@@ -3787,6 +3810,208 @@ static void arenaFrameEnd() {
 	s_aresetFrame = g_displayFrames;
 }
 
+// ---- GX thread: streamed GX ---------------------------------------------------------------------
+// The game thread's GX calls only write command bytes (patch 0017: the API sends everything as
+// FIFO bytes and keeps its own copy of the registers, as the SDK's __GXData; the write-gather pipe
+// fills 64 KB chunks). This thread, on core 1, parses them: the command parser, the display-list
+// cache and this file's front half (batches, the render queue) run here, a frame at most behind
+// the game, which then only waits when it gets further ahead (J3D double-buffers what the GPU reads
+// and expects it read within a frame). Draw-sync tokens go back to the game thread, whose callback
+// runs game code: an interrupt source there runs it at its next check point. Off with D-pad right
+// held at launch (GX3DS_SetGxThread), and with the render thread off.
+static const uint32_t kStreamChunk = 64u << 10, kStreamChunks = 16;
+static uint8_t* s_sChunk[kStreamChunks];
+static uint32_t s_sLen[kStreamChunks];
+static std::atomic<uint32_t> s_sHead{0}, s_sTail{0};  // chunks handed over; done (released after parsing)
+static std::atomic<uint32_t> s_sFramesDone{0};        // display copies the GX thread has run
+static uint32_t s_sFramesSent;                         // ... and the game thread has sent
+static bool s_gxWanted = true, s_streamOn;
+static std::atomic<uint64_t> s_sWait[4];  // game thread waiting: a free chunk, a frame ahead, a drain, a list rewrite
+static std::atomic<uint64_t> s_sBusy{0}, s_sIdle{0};  // GX thread: parsing, waiting for chunks
+enum { EV_GX = 2, EV_GAME = 3 };
+
+// Game thread: waits until ready() (the GX thread signals EV_GAME as it releases chunks and frames).
+template <class F>
+static void streamWait(std::atomic<uint64_t>& acc, F ready) {
+	if (ready()) return;
+	const uint64_t t0 = svcGetSystemTick();
+	while (!ready()) pica_event_wait(EV_GAME);
+	acc += svcGetSystemTick() - t0;
+}
+
+// The write-gather pipe's hand-over (gx_fifo.cpp): publishes the full chunk and returns the next,
+// once the GX thread is done with what it held last.
+static uint8_t* streamSwap(uint8_t* buf, uint32_t len, uint32_t* cap) {
+	*cap = kStreamChunk;
+	if (buf) {
+		s_sLen[s_sHead.load(std::memory_order_relaxed) % kStreamChunks] = len;
+		s_sHead.fetch_add(1, std::memory_order_release);
+		pica_event_signal(EV_GX);
+	}
+	const uint32_t h = s_sHead.load(std::memory_order_relaxed);
+	streamWait(s_sWait[0], [h] { return h - s_sTail.load(std::memory_order_acquire) < kStreamChunks; });
+	return s_sChunk[h % kStreamChunks];
+}
+
+// Display lists the game rewrites in place. J3D rebuilds a material's list (GD) every time a model
+// is entered for drawing, and a list shared by every instance of a model (J3DMaterial's
+// newSharedDisplayList) swaps its two buffers once per instance: with an even number on screen the
+// same buffer is rewritten every frame, while the GX thread may not yet have read last frame's call
+// of it (a crash on Delfino Airstrip: a nested call out of a half-rewritten list). The GameCube
+// is safe through the frame's GXDrawDone (THPPlayerDrawDone, before the copy); here each call
+// through the stream stamps the 32-byte blocks of MEM1 it covers with the chunk that carries it,
+// and before the game starts writing a list (GDInitGDLObj) it waits while the GX thread has not
+// finished that chunk.
+static uint32_t* s_dlMark;  // per 32-byte block of MEM1: 1 + the chunk of its last call (0: none)
+static uint32_t s_dlBlocks, s_dlWaits;
+
+static bool mem1Blocks(const void* p, uint32_t n, uint32_t& b0, uint32_t& b1) {
+	const uintptr_t a = reinterpret_cast<uintptr_t>(p), base = reinterpret_cast<uintptr_t>(port_mem1_base);
+	if (!s_dlMark || !n || a < base || a - base >= port_mem1_size) return false;
+	b0 = uint32_t(a - base) >> 5;
+	b1 = std::min<uint32_t>(uint32_t(a - base + n - 1) >> 5, s_dlBlocks - 1);
+	return true;
+}
+// Game thread, after the call's command is in the stream: the chunk being filled carries its end.
+static void streamNoteDL(const void* list, uint32_t n) {
+	uint32_t b0, b1;
+	if (!mem1Blocks(list, n, b0, b1)) return;
+	const uint32_t mark = s_sHead.load(std::memory_order_relaxed) + 1;
+	for (uint32_t b = b0; b <= b1; b++) s_dlMark[b] = mark;
+}
+// Game thread, before it writes [p, p + n).
+static void streamBeforeWrite(const void* p, uint32_t n) {
+	uint32_t b0, b1;
+	if (!s_streamOn || !mem1Blocks(p, n, b0, b1)) return;
+	const uint32_t tail = s_sTail.load(std::memory_order_acquire);
+	int32_t ahead = 0;  // the latest call's chunk + 1, past the GX thread's
+	for (uint32_t b = b0; b <= b1; b++) ahead = std::max(ahead, int32_t(s_dlMark[b] - tail));
+	if (ahead <= 0) return;  // read already (or never called)
+	const uint32_t mark = tail + uint32_t(ahead);
+	if (mark - 1 == s_sHead.load(std::memory_order_relaxed)) GXPC_StreamFlush();  // still being filled
+	s_dlWaits++;
+	streamWait(s_sWait[3], [mark] { return int32_t(mark - s_sTail.load(std::memory_order_acquire)) <= 0; });
+}
+
+// Draw-sync tokens, GX thread -> game thread.
+static const uint32_t kTokens = 256;
+static uint16_t s_tok[kTokens];
+static std::atomic<uint32_t> s_tokHead{0}, s_tokTail{0};
+static uint32_t s_tokDropped;
+static void streamToken(uint16_t t) {
+	const uint32_t h = s_tokHead.load(std::memory_order_relaxed);
+	if (h - s_tokTail.load(std::memory_order_acquire) >= kTokens) {
+		if (!s_tokDropped++) fprintf(stderr, "[gx3ds] draw-sync tokens not taken by the game: dropped\n");
+		return;
+	}
+	s_tok[h % kTokens] = t;
+	s_tokHead.store(h + 1, std::memory_order_release);
+	port_irq_kick();
+}
+// Game thread, in interrupt context (an emulated-OS interrupt source): the callbacks.
+static void streamTokenPoll() {
+	for (;;) {
+		const uint32_t t = s_tokTail.load(std::memory_order_relaxed);
+		if (t == s_tokHead.load(std::memory_order_acquire)) return;
+		const uint16_t token = s_tok[t % kTokens];
+		s_tokTail.store(t + 1, std::memory_order_release);
+		if (!drawSyncCallback) continue;
+		GXPC_DrawSyncCalls++;
+		const uint64_t t0 = svcGetSystemTick();
+		drawSyncCallback(token);
+		GXPC_DrawSyncTicks += svcGetSystemTick() - t0;
+	}
+}
+
+static void gxMain(void*) {
+	std::vector<uint8_t> carry;  // a command the last chunk cut, and its whole length
+	uint32_t carryNeed = 0;
+	for (;;) {
+		const uint64_t t0 = svcGetSystemTick();
+		while (s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire)) pica_event_wait(EV_GX);
+		const uint64_t t1 = svcGetSystemTick();
+		s_sIdle += t1 - t0;
+		const uint32_t t = s_sTail.load(std::memory_order_relaxed);
+		const uint8_t* p = s_sChunk[t % kStreamChunks];
+		uint32_t n = s_sLen[t % kStreamChunks];
+		while (!carry.empty() && n) {
+			const uint32_t k = std::min(n, carryNeed - uint32_t(carry.size()));
+			carry.insert(carry.end(), p, p + k);
+			p += k;
+			n -= k;
+			if (carry.size() < carryNeed) break;
+			uint32_t need = 0;
+			const uint32_t used = GXPC_StreamParse(carry.data(), uint32_t(carry.size()), &need);
+			carry.erase(carry.begin(), carry.begin() + used);
+			carryNeed = need;
+		}
+		if (carry.empty() && n) {
+			uint32_t need = 0;
+			const uint32_t used = GXPC_StreamParse(p, n, &need);
+			if (used < n) {
+				carry.assign(p + used, p + n);
+				carryNeed = need;
+			}
+		}
+		s_sTail.store(t + 1, std::memory_order_release);
+		pica_event_signal(EV_GAME);
+		s_sBusy += svcGetSystemTick() - t1;
+	}
+}
+
+// From GXPC_InitAuto (GXInit, game thread), before the game's first GX command.
+static void streamStart() {
+	if (!s_gxWanted || !s_rtWanted) return;
+	for (uint32_t i = 0; i < kStreamChunks; i++) {
+		s_sChunk[i] = static_cast<uint8_t*>(memalign(64, kStreamChunk));
+		if (!s_sChunk[i]) {
+			fprintf(stderr, "[gx3ds] no memory for the GX thread's buffers: GX on the game thread\n");
+			return;
+		}
+	}
+	s_dlBlocks = port_mem1_size >> 5;
+	s_dlMark = static_cast<uint32_t*>(calloc(s_dlBlocks, sizeof(uint32_t)));
+	if (!s_dlMark) {
+		fprintf(stderr, "[gx3ds] no memory for the GX thread's display-list marks: GX on the game thread\n");
+		return;
+	}
+	s_sFramesSent = g_displayFrames;
+	s_sFramesDone.store(g_displayFrames);
+	port_irq_add_source(streamTokenPoll);
+	if (pica_gx_thread_start(gxMain, nullptr) < 0) {
+		fprintf(stderr, "[gx3ds] GX thread could not start: GX on the game thread\n");
+		return;
+	}
+	s_streamOn = true;
+	GXPC_SetStream(streamSwap, streamToken);
+	fprintf(stderr, "[gx3ds] GX thread on core 1: the game thread only writes commands (%u KB of buffers)\n",
+	        unsigned(kStreamChunk * kStreamChunks >> 10));
+}
+
+static bool streamOn() { return s_streamOn; }
+// The profiler window's GX-thread numbers (render thread, at the window's end): the game thread's
+// wait for it, then, with print, the line (which starts the next window).
+static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
+	static uint64_t w0[4], busy0, idle0;
+	static uint32_t dlWaits0;
+	uint64_t w[4];
+	for (int i = 0; i < 4; i++) w[i] = s_sWait[i].load() - w0[i];
+	gameWait = w[0] + w[1] + w[2] + w[3];
+	if (!print) return;
+	const uint64_t busy = s_sBusy.load(), idle = s_sIdle.load();
+	fprintf(stderr,
+	        "[perf]   GX thread (core 1): busy %.1f, idle %.1f ms/frame | game thread waited for it %.1f ms/frame "
+	        "(buffers full %.1f, a frame ahead %.1f, GXInit %.1f, rewriting a list it had yet to read %.1f, %u times) "
+	        "| %u chunks queued\n",
+	        double(busy - busy0) * perMs, double(idle - idle0) * perMs, double(gameWait) * perMs, double(w[0]) * perMs,
+	        double(w[1]) * perMs, double(w[2]) * perMs, double(w[3]) * perMs, unsigned(s_dlWaits - dlWaits0),
+	        unsigned(s_sHead.load() - s_sTail.load()));
+	for (int i = 0; i < 4; i++) w0[i] += w[i];
+	dlWaits0 = s_dlWaits;
+	busy0 = busy;
+	idle0 = idle;
+}
+
 // ---- frame / copies ---------------------------------------------------------------------------
 // Called when a frame is complete (a display copy). Set by the 3DS side to present it.
 typedef void (*FrameHook)(const Stats& frame, uint32_t frameNumber);
@@ -3819,6 +4044,10 @@ void executeCopy(uint32_t ctrl) {
 	if ((ctrl >> 14) & 1) {
 		g_displayFrames++;
 		s_gFrames++;
+		if (s_streamOn) {  // the game thread may start its next frame
+			s_sFramesDone.store(g_displayFrames, std::memory_order_release);
+			pica_event_signal(EV_GAME);
+		}
 		arenaFrameEnd();
 		if (s_rtCore >= 0) gameWaitFor(s_gWait[1], [] { return s_gFrames - s_rDone.load() <= 1; });
 	}
@@ -3993,9 +4222,36 @@ int GXPC_InitAuto(int) {
 	if (!gx::s_ready) {
 		gx::resetState();
 		gx::s_ready = true;
+		gx::streamStart();
 	}
 	return 1;
 }
+
+// Streamed GX, game thread (gx_api.cpp): a display copy was sent; waits while the GX thread is
+// more than a frame behind.
+void GXPC_StreamFrameEnd(void) {
+	gx::GXPC_StreamFlush();
+	const uint32_t sent = ++gx::s_sFramesSent;
+	gx::streamWait(gx::s_sWait[1], [sent] { return sent - gx::s_sFramesDone.load(std::memory_order_acquire) <= 1; });
+}
+// ... a display list was called through the stream (GXCallDisplayList).
+void GXPC_StreamNoteDL(const void* list, uint32_t nbytes) { gx::streamNoteDL(list, nbytes); }
+// The game is about to write a display list (GD; linked with --wrap=GDInitGDLObj): waits while
+// the GX thread has yet to read a call of it.
+void __real_GDInitGDLObj(void* dl, void* start, uint32_t length);
+void __wrap_GDInitGDLObj(void* dl, void* start, uint32_t length) {
+	gx::streamBeforeWrite(start, length);
+	__real_GDInitGDLObj(dl, start, length);
+}
+// ... waits until the GX thread has run every command sent (GXInit: the registers start over).
+void GXPC_StreamDrain(void) {
+	if (!gx::s_streamOn) return;
+	gx::GXPC_StreamFlush();
+	const uint32_t h = gx::s_sHead.load();
+	gx::streamWait(gx::s_sWait[2], [h] { return gx::s_sTail.load(std::memory_order_acquire) == h; });
+}
+// Off before the first frame: GX runs on the game thread (no GX thread).
+void GX3DS_SetGxThread(int on) { gx::s_gxWanted = on != 0; }
 
 // 0: material, 1: debug colours, 2: opaque (material colours, no blending or alpha test).
 void GX3DS_TraceNextFrame(void) {

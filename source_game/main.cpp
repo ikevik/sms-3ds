@@ -43,6 +43,7 @@ extern "C" void SMS3DS_ProfRequest(void);
 extern "C" int SMS3DS_ProfState(void);
 void GX3DS_SetArena(int on);
 void GX3DS_SetRenderThread(int on);
+void GX3DS_SetGxThread(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 // Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
 // 0008); -1 in the normal build.
@@ -478,6 +479,12 @@ int main()
 		GX3DS_SetRenderThread(0);
 		printf("Left held: no render thread\n");
 		fprintf(stderr, "[3ds] Left held at launch: renderer on the game thread (no render thread)\n");
+	}
+	// Holding D-pad right at launch keeps GX command parsing on the game thread (no GX thread).
+	if (launchHeld & KEY_DRIGHT) {
+		GX3DS_SetGxThread(0);
+		printf("Right held: GX on the game thread\n");
+		fprintf(stderr, "[3ds] Right held at launch: GX thread off\n");
 	}
 	// Holding ZL at launch keeps every texture in FCRAM, as before VRAM textures (to compare).
 	if (launchHeld & KEY_ZL) {

@@ -220,6 +220,8 @@ void pica_set_big_ring(int on);
 /* Starts fn(arg) on another CPU core (2, else 1), detached; returns the core, or -1. Two one-shot
  * events (0, 1) for it and the thread that started it to wake each other. */
 int pica_thread_start(void (*fn)(void*), void* arg);
+/* Starts fn(arg) on core 1 for the GX thread (events 2 and 3); returns 1, or -1. */
+int pica_gx_thread_start(void (*fn)(void*), void* arg);
 void pica_event_wait(int i);
 void pica_event_signal(int i);
 int pica_overlap(void);

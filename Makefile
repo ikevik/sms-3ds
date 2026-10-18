@@ -59,6 +59,9 @@ ifeq ($(MODE),game)
 SMSLIBS  := -Wl,--wrap=__sms_game_new -Wl,--wrap=__sms_game_new_array
 # Movie frames decode on core 2 (platform/3ds/thp_3ds.cpp).
 SMSLIBS  += -Wl,--wrap=THPVideoDecode
+# Before the game rewrites a display list in place, wait while the GX thread has yet to read it
+# (platform/3ds/gx/gx3ds_backend.cpp).
+SMSLIBS  += -Wl,--wrap=GDInitGDLObj
 # The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
 # and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
 SMSLIBS  += -Wl,--no-enum-size-warning

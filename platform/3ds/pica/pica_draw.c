@@ -1951,7 +1951,7 @@ uint32_t pica_linear_free(void)
 }
 
 /* ---- the GX back end's render thread ------------------------------------------------------ */
-static LightEvent s_evt[2];
+static LightEvent s_evt[4];
 
 int pica_thread_start(void (*fn)(void*), void* arg)
 {
@@ -1963,6 +1963,18 @@ int pica_thread_start(void (*fn)(void*), void* arg)
 	/* Core 2: the New 3DS's second application core, otherwise idle. Then core 1 (the system
 	 * core), with up to 80% of its time given to the application. */
 	if (threadCreate(fn, arg, 256u << 10, prio, 2, true)) return 2;
+	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)) && threadCreate(fn, arg, 256u << 10, prio, 1, true)) return 1;
+	return -1;
+}
+/* The GX back end's GX thread: on core 1 (the system core, up to 80% of its time for the
+ * application), just above the thread that starts it; events 2 and 3. Returns 1, or -1. */
+int pica_gx_thread_start(void (*fn)(void*), void* arg)
+{
+	LightEvent_Init(&s_evt[2], RESET_ONESHOT);
+	LightEvent_Init(&s_evt[3], RESET_ONESHOT);
+	s32 prio = 0x30;
+	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+	if (prio > 0x19) prio--;
 	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)) && threadCreate(fn, arg, 256u << 10, prio, 1, true)) return 1;
 	return -1;
 }
