@@ -48,6 +48,7 @@ void GX3DS_SetRenderThread(int on);
 void GX3DS_SetGxThread(int on);
 void GX3DS_SetListCopies(int on);
 void GX3DS_SetResidentIndicesInPlace(int on);
+void GXPC_SetWriteFilter(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 // Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
 // 0008); -1 in the normal build.
@@ -517,6 +518,13 @@ int main()
 		GX3DS_SetListCopies(0);
 		printf("SELECT held: display lists by address\n");
 		fprintf(stderr, "[3ds] SELECT held at launch: display-list copies off (rewrites wait for the GX thread)\n");
+	}
+	// Circle pad left at launch: every GX register write is sent, as before the write filter
+	// (gx_api.cpp, patch 0023) left out those that change nothing (to compare).
+	if (launchHeld & KEY_CPAD_LEFT) {
+		GXPC_SetWriteFilter(0);
+		printf("Circle pad left: GX write filter off\n");
+		fprintf(stderr, "[3ds] circle pad left at launch: GX write filter off (every register write sent)\n");
 	}
 	// Circle pad up at launch: resident display-list runs' indices are copied into the GPU ring each
 	// frame, rebased to the batch (the render thread's copy, as before), not drawn where stored.

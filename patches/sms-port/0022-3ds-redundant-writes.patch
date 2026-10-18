@@ -1,0 +1,193 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-18 17:29:48
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-18 17:36:43
+@@ -328,8 +328,17 @@
+ // gets only the registers that changed.
+ static void writeBPImpl(uint32_t value);
+ void writeBP(uint32_t value) {
++#if defined(__3DS__)
++    // Only a value that changed: J3D sends most registers again for every shape (on Delfino Plaza
++    // ~73% of the BP writes changed nothing), and each register touched is copied into the next
++    // draw record and applied again on the render thread.
++    const uint32_t reg = value >> 24, before = g.bp[reg];
+     writeBPImpl(value);
++    if (g.bp[reg] != before) bpTouched(reg);
++#else
++    writeBPImpl(value);
+     bpTouched(value >> 24);
++#endif
+ }
+ 
+ static void writeBPImpl(uint32_t value) {
+@@ -1010,6 +1019,9 @@
+ 
+ // Commands 0x20/0x28/0x30/0x38: XF memory loaded from an element of array
+ // 12-15 (position, normal, texture matrices, lights).
++#if defined(__3DS__)
++static inline void wrFromList(int t, uint32_t reg);  // [perf] counters (below)
++#endif
+ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
+     uint32_t addr = v & 0xFFF, cnt = (v >> 12) + 1;
+     int slot = 12 + ((op - 0x20) >> 3);
+@@ -1021,6 +1033,10 @@
+         words[k] = be ? be32(src + k * 4)
+                       : (uint32_t(src[k * 4]) | uint32_t(src[k * 4 + 1]) << 8 | uint32_t(src[k * 4 + 2]) << 16 |
+                          uint32_t(src[k * 4 + 3]) << 24);
++#if defined(__3DS__)
++    // values from memory: a game-side filter cannot know them, wherever the load came from
++    for (uint32_t k = 0; k < cnt; k++) wrFromList(2, addr + k);
++#endif
+     writeXF(uint16_t(addr), cnt, words);
+ }
+ 
+@@ -1201,6 +1217,72 @@
+ uint32_t GXPC_OpTimed[10], GXPC_OpAll[10];
+ }
+ static uint32_t s_opSample;
++// Register writes whose value was already there, for [perf]: direct ([0], the stream's top level)
++// and replayed from cached lists ([1]), BP, CP and XF words; direct BP and CP by register too.
++uint32_t GXPC_WrAll[2][3], GXPC_WrSame[2][3], GXPC_BpSame[256], GXPC_CpSame[256];
++// What a filter on the game side could drop of the direct writes that changed nothing: [0] one that
++// forgets every register at each display-list call, [1] one that forgets only those a list writes.
++uint32_t GXPC_WrFilter[2][3];
++uint32_t s_dlSeq;  // display-list calls so far
++static uint32_t s_cpLast[256];
++static uint8_t s_cpSeen[256];
++enum { kXfSlots = 0x1060 };
++static uint32_t s_seqBP[256], s_seqCP[256], s_seqXF[kXfSlots];
++static uint8_t s_dlBP[256], s_dlCP[256], s_dlXF[kXfSlots];
++static inline uint32_t xfSlot(uint32_t addr) { return addr < kXfSlots ? addr : kXfSlots - 1; }
++// A write from a display list (replayed or parsed): what a footprint filter would forget.
++static inline void wrFromList(int t, uint32_t reg) {
++    if (t == 0) s_dlBP[reg & 255] = 1;
++    else if (t == 1) s_dlCP[reg & 255] = 1;
++    else s_dlXF[xfSlot(reg)] = 1;
++}
++static inline void wrDirect(int t, uint32_t reg, bool same) {
++    uint32_t* seq = t == 0 ? &s_seqBP[reg & 255] : t == 1 ? &s_seqCP[reg & 255] : &s_seqXF[xfSlot(reg)];
++    uint8_t* dl = t == 0 ? &s_dlBP[reg & 255] : t == 1 ? &s_dlCP[reg & 255] : &s_dlXF[xfSlot(reg)];
++    if (same) {
++        if (*seq == s_dlSeq) GXPC_WrFilter[0][t]++;
++        if (!*dl) GXPC_WrFilter[1][t]++;
++    }
++    *seq = s_dlSeq;
++    *dl = 0;
++}
++static inline void wrCountBP(int k, uint32_t v) {
++    const uint32_t reg = v >> 24, data = v & 0xFFFFFF;
++    GXPC_WrAll[k][0]++;
++    bool same;
++    if (reg == BP_MASK || g.bpMask != 0xFFFFFF) same = false;
++    else if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) same = g.kreg[reg & 7] == data;
++    else same = g.bp[reg] == data;
++    if (same) {
++        GXPC_WrSame[k][0]++;
++        if (k == 0) GXPC_BpSame[reg]++;
++    }
++    if (k == 0) wrDirect(0, reg, same);
++    else wrFromList(0, reg);
++}
++static inline void wrCountCP(int k, uint8_t reg, uint32_t v) {
++    GXPC_WrAll[k][1]++;
++    const bool same = s_cpSeen[reg] && s_cpLast[reg] == v;
++    if (same) {
++        GXPC_WrSame[k][1]++;
++        if (k == 0) GXPC_CpSame[reg]++;
++    }
++    if (k == 0) wrDirect(1, reg, same);
++    else wrFromList(1, reg);
++    s_cpSeen[reg] = 1;
++    s_cpLast[reg] = v;
++}
++static inline void wrCountXF(int k, uint32_t addr, const uint32_t* w, uint32_t n) {
++    GXPC_WrAll[k][2] += n;
++    for (uint32_t i = 0; i < n; i++, addr++) {
++        const uint32_t cur = addr < XF_MEM_WORDS ? g.xfMem[addr]
++                             : (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) ? g.xfReg[addr - XF_REG_BASE]
++                                                                                          : ~w[i];
++        if (cur == w[i]) GXPC_WrSame[k][2]++;
++        if (k == 0) wrDirect(2, addr, cur == w[i]);
++        else wrFromList(2, addr);
++    }
++}
+ static inline int opKind(uint8_t op) {
+     if (op == 0x61) return 0;
+     if (op == 0x08) return 1;
+@@ -1239,6 +1321,10 @@
+             len = 6;
+             if (avail < len) break;
+             CMD_COUNT(5);
++#if defined(__3DS__)
++            if (streamTop) wrCountCP(0, p[1], be32(p + 2));
++            else wrFromList(1, p[1]);
++#endif
+             writeCP(p[1], be32(p + 2));
+         } else if (op == 0x10) {
+             CMD_COUNT(2);
+@@ -1252,6 +1338,11 @@
+             for (uint32_t i = 0; i < cnt;) {
+                 uint32_t m = cnt - i > 64 ? 64 : cnt - i;
+                 for (uint32_t k = 0; k < m; k++) words[k] = be32(p + 5 + (i + k) * 4);
++#if defined(__3DS__)
++                if (streamTop) wrCountXF(0, addr + i, words, m);
++                else
++                    for (uint32_t k = 0; k < m; k++) wrFromList(2, addr + i + k);
++#endif
+                 writeXF(uint16_t(addr + i), m, words);
+                 i += m;
+             }
+@@ -1266,6 +1357,9 @@
+             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
+             uint32_t sz = be32(p + 5);
+             CMD_COUNT(6);
++#if defined(__3DS__)
++            s_dlSeq++;
++#endif
+             if (s_dlDepth < 4 && dl && nestedListOk(dl, sz)) {
+                 s_dlDepth++;
+                 runCommands(dl, sz);
+@@ -1275,6 +1369,10 @@
+             len = 5;
+             if (avail < len) break;
+             CMD_COUNT(4);
++#if defined(__3DS__)
++            if (streamTop) wrCountBP(0, be32(p + 1));
++            else wrFromList(0, p[1]);
++#endif
+             writeBP(be32(p + 1));
+         } else if (op >= 0x80 && op < 0xC0) {
+             CMD_COUNT(0);
+@@ -1690,9 +1788,22 @@
+ static void dlReplayState(const DlEntry& e) {
+     for (const StateOp& s : e.ops) {
+         switch (s.type) {
+-        case 0x08: writeCP(s.reg, s.v); break;
+-        case 0x61: writeBP(s.v); break;
++        case 0x08:
++#if defined(__3DS__)
++            wrCountCP(1, s.reg, s.v);
++#endif
++            writeCP(s.reg, s.v);
++            break;
++        case 0x61:
++#if defined(__3DS__)
++            wrCountBP(1, s.v);
++#endif
++            writeBP(s.v);
++            break;
+         case 0x10:
++#if defined(__3DS__)
++            wrCountXF(1, s.a, &e.words[s.v], s.n);
++#endif
+             for (uint32_t i = 0; i < s.n;) {  // as parse: at most 64 words per writeXF
+                 uint32_t m = s.n - i > 64 ? 64 : s.n - i;
+                 writeXF(uint16_t(s.a + i), m, &e.words[s.v + i]);
+@@ -1726,6 +1837,9 @@
+     GXPC_CMD_TIMER;
+     GXPC_DL_TIMER(dlt, 3);
+     GXPC_DL_COUNT(GXPC_DlCalls++);
++#if defined(__3DS__)
++    s_dlSeq++;
++#endif
+     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
+         GXPC_DL_COUNT(GXPC_DlUncached++);
+         GXPC_DL_COUNT(s_uncachedDepth++);

@@ -1,0 +1,40 @@
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DTevs.cpp	2026-10-18 17:46:34
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DTevs.cpp	2026-10-18 17:46:34
+@@ -44,23 +44,34 @@
+ const u16 j3dDefaultAlphaCmpID    = 0xE7;
+ const u16 j3dDefaultZModeID       = 0x17;
+ 
++#if defined(__3DS__)
++/* 3DS: the same CP command, written through the GX layer's API (GXPC_LoadCPReg) instead of
++ * straight into the FIFO, so its write filter knows the register's value and can leave out the
++ * many writes that change nothing (J3D sets every shape's arrays and vertex formats again). */
++extern "C" void GXPC_LoadCPReg(u8 reg, u32 value);
++#endif
++
+ void J3DLoadCPCmd(u8 cmd, u32 param)
+ {
++#if defined(__3DS__)
++	GXPC_LoadCPReg(cmd, param);
++#else
+ 	GXCmd1u8(8);
+ 	GXCmd1u8(cmd);
+ 	GXCmd1u32(param);
++#endif
+ }
+ 
+ void J3DLoadArrayBasePtr(GXAttr attr, void* ptr)
+ {
+ 	u32 a = attr == GX_VA_NBT ? 1 : attr - 9;
+-	GXCmd1u8(8);
+-	GXCmd1u8(a + 0xA0);
+ #if defined(__3DS__)
+ 	/* MEM1 is not at 0x80000000 here: the CP wants the offset into the MEM1 block, which the
+ 	 * GameCube mask (cached -> physical) does not give. The vertex arrays came out unmapped. */
+-	GXCmd1u32(OSCachedToPhysical(ptr));
++	GXPC_LoadCPReg(a + 0xA0, OSCachedToPhysical(ptr));
+ #else
++	GXCmd1u8(8);
++	GXCmd1u8(a + 0xA0);
+ 	GXCmd1u32((u32)ptr & 0x7fffffff);
+ #endif
+ }

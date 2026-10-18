@@ -4233,6 +4233,9 @@ static void streamStart() {
 
 static bool streamOn() { return s_streamOn; }
 extern "C" uint64_t GXPC_OpTicks[10];
+extern uint32_t GXPC_WrAll[2][3], GXPC_WrSame[2][3], GXPC_BpSame[256], GXPC_CpSame[256];  // patch 0022
+extern uint32_t GXPC_WrFilter[2][3];
+extern "C" uint32_t GXPC_FilterDropped[3];  // patch 0023: writes the game thread left out
 extern "C" uint32_t GXPC_OpTimed[10], GXPC_OpAll[10];
 // The profiler window's GX-thread numbers (render thread, at the window's end): the game thread's
 // wait for it, then, with print, the line (which starts the next window).
@@ -4277,6 +4280,57 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 		}
 		fprintf(stderr, "[perf]   GX thread by command (count/frame, ms/frame estimated from 1 in 16 timed; %.1f ms "
 		        "in all):%s\n", sum, line);
+	}
+	{
+		// Register writes that changed nothing (patch 0022), and the registers most direct ones hit.
+		static uint32_t all0[2][3], same0[2][3], bp0[256], cp0[256];
+		uint32_t all[2][3], same[2][3];
+		for (int k = 0; k < 2; k++)
+			for (int t = 0; t < 3; t++) {
+				all[k][t] = GXPC_WrAll[k][t] - all0[k][t];
+				same[k][t] = GXPC_WrSame[k][t] - same0[k][t];
+				all0[k][t] = GXPC_WrAll[k][t];
+				same0[k][t] = GXPC_WrSame[k][t];
+			}
+		auto top = [&](const uint32_t* now, uint32_t* before, int nTop, char* out, size_t cap) {
+			uint32_t d[256];
+			for (int r = 0; r < 256; r++) d[r] = now[r] - before[r], before[r] = now[r];
+			int at = 0;
+			for (int i = 0; i < nTop; i++) {
+				int best = -1;
+				for (int r = 0; r < 256; r++)
+					if (d[r] && (best < 0 || d[r] > d[best])) best = r;
+				if (best < 0) break;
+				at += snprintf(out + at, cap - at, " %02x:%.0f", best, d[best] * perFrame);
+				d[best] = 0;
+			}
+			if (!at) out[0] = 0;
+		};
+		{
+			static uint32_t f0[2][3];
+			uint32_t f[2][3];
+			for (int k = 0; k < 2; k++)
+				for (int t = 0; t < 3; t++) f[k][t] = GXPC_WrFilter[k][t] - f0[k][t], f0[k][t] = GXPC_WrFilter[k][t];
+			static uint32_t d0[3];
+			uint32_t d[3];
+			for (int t = 0; t < 3; t++) d[t] = GXPC_FilterDropped[t] - d0[t], d0[t] = GXPC_FilterDropped[t];
+			fprintf(stderr,
+			        "[perf]   the game thread's write filter left out BP %.0f, CP %.0f, XF words %.0f | of the rest, a filter "
+			        "could still drop: forgetting everything at each list call BP %.0f, CP %.0f, XF words %.0f | "
+			        "forgetting only what each list writes BP %.0f, CP %.0f, XF words %.0f\n",
+			        d[0] * perFrame, d[1] * perFrame, d[2] * perFrame, f[0][0] * perFrame, f[0][1] * perFrame,
+			        f[0][2] * perFrame, f[1][0] * perFrame, f[1][1] * perFrame, f[1][2] * perFrame);
+		}
+		char bpTop[160], cpTop[120];
+		top(GXPC_BpSame, bp0, 8, bpTop, sizeof bpTop);
+		top(GXPC_CpSame, cp0, 6, cpTop, sizeof cpTop);
+		fprintf(stderr,
+		        "[perf]   writes that changed nothing, per frame: direct BP %.0f of %.0f, CP %.0f of %.0f, XF words %.0f "
+		        "of %.0f | in cached lists BP %.0f of %.0f, CP %.0f of %.0f, XF words %.0f of %.0f | direct BP by register"
+		        "%s | CP%s\n",
+		        same[0][0] * perFrame, all[0][0] * perFrame, same[0][1] * perFrame, all[0][1] * perFrame,
+		        same[0][2] * perFrame, all[0][2] * perFrame, same[1][0] * perFrame, all[1][0] * perFrame,
+		        same[1][1] * perFrame, all[1][1] * perFrame, same[1][2] * perFrame, all[1][2] * perFrame, bpTop, cpTop);
 	}
 	for (int i = 0; i < 4; i++) w0[i] += w[i];
 	dlWaits0 = s_dlWaits;

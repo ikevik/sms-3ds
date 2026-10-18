@@ -1,0 +1,267 @@
+--- a/platform/gx/src/gx_api.cpp	2026-10-18 17:45:59
++++ b/platform/gx/src/gx_api.cpp	2026-10-18 17:48:43
+@@ -92,8 +92,108 @@
+ // which append straight to the buffer and call GXPC_Write* only at its end or while redirected:
+ // two or three calls into the pipe per register cost Delfino Plaza's game thread about 15 ms a
+ // frame (some 117,000 of them).
++#if defined(__3DS__)
++// 3DS port: a write that would set a register to the value the API last sent it is not sent. J3D
++// sends most of a material's and a shape's registers again for every draw (on Delfino Plaza ~73%
++// of the BP, 88% of the CP and 80% of the XF words changed nothing), and each costs the game
++// thread the write and the GX thread its parsing. What the API sent is only known until something
++// else may have changed the GX thread's registers: a display-list call forgets everything; an
++// indexed matrix load the words it loads; a command written straight to the FIFO (GXCmd1u8,
++// GXWGFifo) its kind of register; the vertex arrays' byte order the array bases. Registers with
++// effects beyond their value (copies, tokens, draw-done, TLUT loads, texture invalidation, the BP
++// mask and the write after it) are always sent, and nothing is held back while a display list
++// is recorded. Circle pad left at launch: off (GXPC_SetWriteFilter).
++enum { kFltBP = 256 + 8, kFltCP = 256, kFltXF = 0x1060 };
++static uint32_t s_fltBP[kFltBP], s_fltCP[kFltCP], s_fltXF[kFltXF];        // values last sent
++static uint32_t s_genOfBP[kFltBP], s_genOfCP[kFltCP], s_genOfXF[kFltXF];  // generation they were sent in
++static uint32_t s_genBP = 1, s_genCP = 1, s_genXF = 1;
++static bool s_fltMaskNext, s_fltOn = true;
++extern "C" {
++uint32_t GXPC_FilterDropped[3];  // BP, CP, XF words not sent
++void GXPC_SetWriteFilter(int on) { s_fltOn = on != 0; }
++}
++namespace gx {
++void apiForget(int kinds) {
++    if (kinds & 1) s_genBP++;
++    if (kinds & 2) s_genCP++;
++    if (kinds & 4) s_genXF++;
++}
++}  // namespace gx
++extern "C" void GXPC_FilterForget(int kinds) { gx::apiForget(kinds); }
++static void apiForgetXF(uint32_t addr, uint32_t n) {
++    for (uint32_t i = 0; i < n; i++, addr++)
++        if (addr < kFltXF) s_genOfXF[addr] = 0;
++}
++static inline bool fltActive() { return s_fltOn && g_gxStream && !s_recording; }
++// True when the write may be dropped; otherwise remembers it as sent.
++static bool fltBP(uint32_t reg, uint32_t data) {
++    if (!fltActive()) return false;
++    if (reg == BP_MASK) {
++        s_fltMaskNext = data != 0xFFFFFF;
++        return false;
++    }
++    const uint32_t i = (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) ? 256 + (reg & 7) : reg;
++    if (s_fltMaskNext) {  // a masked write: what it leaves is not known here
++        s_fltMaskNext = false;
++        s_genOfBP[i] = 0;
++        return false;
++    }
++    switch (reg) {
++    case BP_COPY_EXEC: case BP_PE_TOKEN: case BP_PE_TOKEN_INT: case BP_DRAWDONE: case BP_LOADTLUT0:
++    case BP_LOADTLUT1: case BP_TEXINVALIDATE:
++        return false;
++    default: break;
++    }
++    if (s_genOfBP[i] == s_genBP && s_fltBP[i] == data) {
++        GXPC_FilterDropped[0]++;
++        return true;
++    }
++    s_fltBP[i] = data;
++    s_genOfBP[i] = s_genBP;
++    return false;
++}
++static bool fltCP(uint8_t reg, uint32_t v) {
++    if (!fltActive()) return false;
++    if (s_genOfCP[reg] == s_genCP && s_fltCP[reg] == v) {
++        GXPC_FilterDropped[1]++;
++        return true;
++    }
++    s_fltCP[reg] = v;
++    s_genOfCP[reg] = s_genCP;
++    return false;
++}
++static bool fltXF(uint16_t addr, uint32_t n, const uint32_t* w) {
++    if (!fltActive()) return false;
++    if (uint32_t(addr) + n > kFltXF) return false;
++    bool same = true;
++    for (uint32_t i = 0; i < n && same; i++) same = s_genOfXF[addr + i] == s_genXF && s_fltXF[addr + i] == w[i];
++    if (same) {
++        GXPC_FilterDropped[2] += n;
++        return true;
++    }
++    for (uint32_t i = 0; i < n; i++) {
++        s_fltXF[addr + i] = w[i];
++        s_genOfXF[addr + i] = s_genXF;
++    }
++    return false;
++}
++// A command byte written straight to the FIFO (GXCmd1u8, GXWGFifo.u8): forget its kind of
++// register (a byte that only looks like one, as a register number, just forgets more).
++extern "C" void GXPC_RawCmdByte(uint8_t op) {
++    if (op == 0x61) s_genBP++;
++    else if (op == 0x08) s_genCP++;
++    else if (op == 0x10 || (op >= 0x20 && op <= 0x38 && (op & 7) == 0)) s_genXF++;
++}
++#else
++static inline bool fltBP(uint32_t, uint32_t) { return false; }
++static inline bool fltCP(uint8_t, uint32_t) { return false; }
++static inline bool fltXF(uint16_t, uint32_t, const uint32_t*) { return false; }
++static inline void apiForgetXF(uint32_t, uint32_t) {}
++#endif
++
+ static void apiBP(uint32_t reg, uint32_t data) {
+     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
++    if (fltBP(reg, data & 0xFFFFFF)) return;
+     if (s_recording || g_gxStream) {
+         GXPC_Put8(0x61);
+         GXPC_Put32(v);
+@@ -107,6 +207,7 @@
+ static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GA.bp[reg], size, shift, v)); }
+ 
+ static void apiCP(uint8_t reg, uint32_t v) {
++    if (fltCP(reg, v)) return;
+     if (s_recording || g_gxStream) {
+         GXPC_Put8(0x08);
+         GXPC_Put8(reg);
+@@ -120,6 +221,7 @@
+ }
+ 
+ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
++    if (fltXF(addr, n, w)) return;
+     if (s_recording || g_gxStream) {
+         GXPC_Put8(0x10);
+         GXPC_Put32(((n - 1) << 16) | addr);
+@@ -218,6 +320,7 @@
+         GXPC_StreamDrain();
+         resetState();
+         memcpy(s_apiState, &g, sizeof(State));
++        apiForget(7);  // the write filter's record of what was sent no longer holds
+     } else
+ #endif
+     resetState();
+@@ -441,6 +544,11 @@
+     if (n > s_dlSize) logmsg("display list overflow (%u > %u)", n, s_dlSize);
+     return n;
+ }
++#if defined(__3DS__)
++// J3D's CP helpers (J3DLoadCPCmd, J3DLoadArrayBasePtr; decomp patch 3ds-0011) write through here
++// rather than straight to the FIFO, so the write filter sees them.
++extern "C" void GXPC_LoadCPReg(uint8_t reg, uint32_t v) { apiCP(reg, v); }
++#endif
+ void GXCallDisplayList(void* list, u32 nbytes) {
+     if (s_recording) {
+         GXPC_Put8(0x40);
+@@ -449,6 +557,9 @@
+         return;
+     }
+ #if defined(__3DS__)
++    apiForget(7);  // the list may set any register
++#endif
++#if defined(__3DS__)
+     if (g_gxStream) {  // through the display-list cache, on the GX thread
+         uint8_t a[8];
+         streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(list)));
+@@ -707,6 +818,7 @@
+ 
+ void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
+ void GXLoadPosMtxIndx(u16 idx, u32 id) {
++    apiForgetXF(id * 4, 12);
+     GXPC_Put8(0x20);
+     GXPC_Put16(idx);
+     GXPC_Put16(uint16_t((11u << 12) | (id * 4)));
+@@ -717,6 +829,7 @@
+ }
+ void GXLoadNrmMtxImm3x3(f32 mtx[3][3], u32 id) { apiXFf(uint16_t(0x400 + id * 3), 9, &mtx[0][0]); }
+ void GXLoadNrmMtxIndx3x3(u16 idx, u32 id) {
++    apiForgetXF(0x400 + id * 3, 9);
+     GXPC_Put8(0x28);
+     GXPC_Put16(idx);
+     GXPC_Put16(uint16_t((8u << 12) | (0x400 + id * 3)));
+@@ -747,6 +860,7 @@
+         addr = id * 4;
+         n = type == GX_MTX2x4 ? 8 : 12;
+     }
++    apiForgetXF(addr, n);
+     GXPC_Put8(0x30);
+     GXPC_Put16(idx);
+     GXPC_Put16(uint16_t(((n - 1) << 12) | addr));
+--- a/platform/gx/src/gx_vert.cpp	2026-10-18 17:45:59
++++ b/platform/gx/src/gx_vert.cpp	2026-10-18 17:45:59
+@@ -4,7 +4,15 @@
+ 
+ extern "C" {
+ 
++#if defined(__3DS__)
++void GXPC_RawCmdByte(uint8_t op);  // gx_api.cpp: the write filter forgets what this may set
++void GXCmd1u8(u8 x) {
++    GXPC_RawCmdByte(x);
++    GXPC_Put8(x);
++}
++#else
+ void GXCmd1u8(u8 x) { GXPC_Put8(x); }
++#endif
+ void GXCmd1u16(u16 x) { GXPC_Put16(x); }
+ void GXCmd1u32(u32 x) { GXPC_Put32(uint32_t(x)); }
+ void GXParam1u8(u8 x) { GXPC_Put8(x); }
+--- a/platform/gx/include/sms_gx/gx_pc.h	2026-10-18 17:45:59
++++ b/platform/gx/include/sms_gx/gx_pc.h	2026-10-18 17:45:59
+@@ -225,12 +225,24 @@
+ #ifdef __cplusplus
+ }
+ 
++#if defined(__3DS__)
++extern "C" void GXPC_RawCmdByte(uint8_t op);  /* gx_api.cpp: a command byte written straight to the pipe */
++#endif
+ /* C++ replacement for the write-gather pipe union: `GXWGFifo.f32 = x` becomes
+  * a call into the pipe.  To use it, GXVert.h (TARGET_PC) does
+  *     #define GXWGFifo GXPC_WGPipe
+  * instead of the 0xCC008000 cast. */
+ struct GXPCWGPipe {
++#if defined(__3DS__)
++    struct U8 {
++        void operator=(uint8_t v) const {
++            if (v == 0x61 || v == 0x08 || v == 0x10 || (v >= 0x20 && v <= 0x38)) GXPC_RawCmdByte(v);
++            GXPC_Put8(v);
++        }
++    } u8;
++#else
+     struct U8 { void operator=(uint8_t v) const { GXPC_Put8(v); } } u8;
++#endif
+     struct S8 { void operator=(int8_t v) const { GXPC_Put8((uint8_t)v); } } s8;
+     struct U16 { void operator=(uint16_t v) const { GXPC_Put16(v); } } u16;
+     struct S16 { void operator=(int16_t v) const { GXPC_Put16((uint16_t)v); } } s16;
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-18 17:45:59
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-18 17:46:19
+@@ -2106,10 +2106,14 @@
+ 
+ void GXPC_MemoryWritten(const void* p, uint32_t size) { memoryWritten(p, size); }
+ 
++#if defined(__3DS__)
++extern "C" void GXPC_FilterForget(int kinds);  // gx_api.cpp's write filter
++#endif
+ void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
+     if (!p || !size) return;
+ #if defined(__3DS__)
+     if (g_gxStream) {
++        GXPC_FilterForget(2);  // the array bases' byte order may change: send them again
+         uint8_t a[8];
+         streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(p)));
+         streamU32(a + 4, size);
+@@ -2122,6 +2126,7 @@
+ void GXPC_RemoveBigEndianRange(const void* p) {
+ #if defined(__3DS__)
+     if (g_gxStream) {
++        GXPC_FilterForget(2);
+         uint8_t a[8];
+         streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(p)));
+         streamU32(a + 4, 0);
+@@ -2141,6 +2146,7 @@
+     else return;
+ #if defined(__3DS__)
+     if (g_gxStream) {
++        GXPC_FilterForget(2);
+         const uint8_t a[2] = {uint8_t(slot), uint8_t(bigEndian != 0)};
+         streamOp(kStreamOpArrayBE, a, 2);
+         return;
+@@ -2151,6 +2157,7 @@
+ void GXPC_SetDefaultArrayBigEndian(int bigEndian) {
+ #if defined(__3DS__)
+     if (g_gxStream) {
++        GXPC_FilterForget(2);
+         const uint8_t a = uint8_t(bigEndian != 0);
+         streamOp(kStreamOpDefaultBE, &a, 1);
+         return;
