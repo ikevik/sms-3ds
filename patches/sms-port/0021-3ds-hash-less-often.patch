@@ -1,0 +1,116 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-18 16:33:21
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-18 16:40:18
+@@ -195,7 +195,32 @@
+ static std::atomic<uint32_t> s_pageStamp[kStampPages];
+ static std::atomic<uint32_t> s_writeClock{1};
+ 
++#if defined(__3DS__)
++// 3DS port: MEM1 is a heap block, and the program image (its static data: display lists and
++// vertex arrays the game builds in, at 0x00100000) lies far below it, outside the window above, so
++// its data was hashed on every check (~42 KB a frame on Delfino Plaza). It has stamps of its own.
++extern "C" char __start__[], __end__[];
++enum : uint32_t { kImageStampPages = (16u << 20) >> kStampShift };
++static std::atomic<uint32_t> s_imageStamp[kImageStampPages];
++static inline bool imageRange(const void* p, size_t n, uintptr_t& a) {
++    a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(__start__);
++    const uintptr_t span = std::min<uintptr_t>(uintptr_t(__end__ - __start__), uintptr_t(kImageStampPages) << kStampShift);
++    return a < span && a + n <= span;
++}
++#endif
++
+ void memoryWritten(const void* p, size_t n) {
++#if defined(__3DS__)
++    {
++        uintptr_t ia;
++        if (n && imageRange(p, n, ia)) {
++            const uint32_t stamp = s_writeClock.fetch_add(1, std::memory_order_relaxed) + 1;
++            for (uintptr_t pg = ia >> kStampShift, last = (ia + n - 1) >> kStampShift; pg <= last; pg++)
++                s_imageStamp[pg].store(stamp, std::memory_order_relaxed);
++            return;
++        }
++    }
++#endif
+     uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_memBase);
+     const uintptr_t span = uintptr_t(kStampPages) << kStampShift;
+     if (!n || a >= span) return;
+@@ -220,6 +245,17 @@
+ // True when no page of [p, p + n) was stamped after `since` (a writeClock()
+ // value); false for memory outside the tracked range.
+ bool unwrittenSince(const void* p, size_t n, uint32_t since) {
++#if defined(__3DS__)
++    {
++        uintptr_t ia;
++        if (imageRange(p, n, ia)) {
++            if (!n) return true;
++            for (uintptr_t pg = ia >> kStampShift, last = (ia + n - 1) >> kStampShift; pg <= last; pg++)
++                if (int32_t(s_imageStamp[pg].load(std::memory_order_relaxed) - since) > 0) return false;
++            return true;
++        }
++    }
++#endif
+     uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_memBase);
+     const uintptr_t span = uintptr_t(kStampPages) << kStampShift;
+     if (a >= span || a + n > span) return false;
+@@ -1031,6 +1067,8 @@
+ // running it uncached), each without the back end's own timed work (GX3DS_OursTicks), with
+ // counts of records, new cache entries, uncached runs and bytes hashed.
+ extern "C" {
++uint64_t GXPC_DlHashedOutside;
++uintptr_t GXPC_DlOutLo = ~uintptr_t(0), GXPC_DlOutHi;
+ uint64_t GXPC_DlTicks[4];
+ uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
+ uint64_t GXPC_DlHashed;
+@@ -1412,7 +1450,11 @@
+ FILE* traceFile();
+ 
+ // Lists are compared by hash at least this often (texture data: kRecheckFrames).
++#if defined(__3DS__)
++enum { kDlRecheckFrames = 120 };  // 3DS port: see kRecheckFrames
++#else
+ enum { kDlRecheckFrames = 30 };
++#endif
+ 
+ static bool dlCacheEnabled() {
+     static int on = -1;
+@@ -1564,6 +1606,24 @@
+         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
+     if (unwritten && g_displayFrames - e.checkedFrame < kDlRecheckFrames) return true;
+     uint32_t clock = writeClock();
++#if defined(__3DS__)
++    // 3DS port, for [perf]: bytes hashed here because they lie outside the write stamps' window
++    // (MEM1 is a heap block on the 3DS: the program image's data and the other heaps are not in it),
++    // and the addresses they span.
++    {
++        auto outside = [](const void* q, size_t m) {
++            if (!unwrittenSince(q, 0, 0) || (m && !unwrittenSince(static_cast<const uint8_t*>(q) + m - 1, 0, 0))) {
++                GXPC_DlHashedOutside += m;
++                const uintptr_t a = reinterpret_cast<uintptr_t>(q);
++                if (a < GXPC_DlOutLo) GXPC_DlOutLo = a;
++                if (a + m > GXPC_DlOutHi) GXPC_DlOutHi = a + m;
++            }
++        };
++        if (!copy) outside(data, size);
++        for (size_t i = 0; i < e.arrays.size(); i++)
++            outside(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo);
++    }
++#endif
+     bool same = GXPC_HASH(data, size) == e.hash;
+     for (size_t i = 0; same && i < e.arrays.size(); i++)
+         same = GXPC_HASH(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo) == e.arrays[i].hash;
+--- a/platform/gx/src/gx_internal.h	2026-10-18 16:40:18
++++ b/platform/gx/src/gx_internal.h	2026-10-18 16:40:18
+@@ -109,7 +109,14 @@
+ // writes nothing reported, and always with trustWriteStamps() false.
+ bool unwrittenSince(const void* p, size_t n, uint32_t since);
+ bool trustWriteStamps();
++#if defined(__3DS__)
++// 3DS port: data no write stamp touched is hashed again every 120 frames, not 8 (display lists:
++// kDlRecheckFrames, also 120): the safety net for writes nothing reported cost Delfino Plaza's
++// threads ~150 KB (textures) and ~230 KB (lists) of hashing a frame, on cores that are all busy.
++enum { kRecheckFrames = 120 };
++#else
+ enum { kRecheckFrames = 8 };
++#endif
+ extern uint32_t g_displayFrames;  // display copies so far
+ extern double g_presentWaited, g_presentDrain;  // gx_render.cpp, GXPC_GetTimes
+ extern bool g_defaultArrayBE;

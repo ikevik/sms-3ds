@@ -196,6 +196,12 @@ uint64_t GX3DS_OursTicks;
 extern "C" uint64_t GXPC_DlTicks[4];
 extern "C" uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
 extern "C" uint64_t GXPC_DlHashed;
+// Hashing by where the bytes are (patch 0021, and the texture cache below): outside the write stamps'
+// window (64 MiB from MEM1's base) the caches cannot trust stamps and hash on every check.
+extern "C" uint64_t GXPC_DlHashedOutside;
+extern "C" uintptr_t GXPC_DlOutLo, GXPC_DlOutHi;
+static uint64_t s_texHashed, s_texHashedOut, s_tlutHashed;
+static uintptr_t s_texOutLo = ~uintptr_t(0), s_texOutHi;
 extern "C" uint32_t GXPC_CullRuns, GXPC_CullVerts;  // patch 0014
 extern "C" int GXPC_CullOff;
 static uint32_t s_perfCullRuns0, s_perfCullVerts0;
@@ -401,6 +407,22 @@ static void perfFrameEnd() {
 		        (GXPC_DlNew - s_perfDlNew0) / frames, (GXPC_DlUncached - s_perfDlUncached0) / frames,
 		        double(GXPC_DlHashed - s_perfDlHashed0) / frames / 1024.0, unsigned(GXPC_DlEntryCount()),
 		        unsigned(GXPC_DlCacheBytes() >> 10));
+		{
+			static uint64_t do0, th0, to0, tl0;
+			const uintptr_t base = uintptr_t(physToPtr(32)) - 32;
+			fprintf(stderr,
+			        "[perf]   hashing per frame: display lists %.0f KB outside the write-stamp window (%08lx-%08lx; the "
+			        "window is %08lx-%08lx) | textures %.0f KB, %.0f KB of it outside (%08lx-%08lx), TLUTs %.0f KB\n",
+			        double(GXPC_DlHashedOutside - do0) / frames / 1024.0,
+			        (unsigned long)(GXPC_DlOutHi ? GXPC_DlOutLo : 0), (unsigned long)GXPC_DlOutHi, (unsigned long)base,
+			        (unsigned long)(base + (64u << 20)), double(s_texHashed - th0) / frames / 1024.0,
+			        double(s_texHashedOut - to0) / frames / 1024.0, (unsigned long)(s_texOutHi ? s_texOutLo : 0),
+			        (unsigned long)s_texOutHi, double(s_tlutHashed - tl0) / frames / 1024.0);
+			do0 = GXPC_DlHashedOutside;
+			th0 = s_texHashed;
+			to0 = s_texHashedOut;
+			tl0 = s_tlutHashed;
+		}
 		fprintf(stderr, "[perf]   off-screen culling: %.1f display-list draws (%.0f verts) skipped per frame%s\n",
 		        (GXPC_CullRuns - s_perfCullRuns0) / frames, (GXPC_CullVerts - s_perfCullVerts0) / frames,
 		        GXPC_CullOff ? " (off: L held at launch)" : "");
@@ -831,6 +853,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	// since it was last hashed, trust it, but still hash every kRecheckFrames frames for writes
 	// nothing reported. TLUTs live in TMEM, rewritten by register loads: always hashed (small).
 	const uint64_t th = tlut ? hashBytes(tlut, tlutBytes) : 0;
+	if (tlut) s_tlutHashed += tlutBytes;
 	e.checkedFrame = s_rFrames;
 	const bool stamps = trustWriteStamps();
 	if (e.tex && th == e.tlutHash && stamps && s_rFrames - e.hashedFrame < kRecheckFrames &&
@@ -844,6 +867,14 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	e.hashedClock = writeClock();
 	e.hashedFrame = s_rFrames;
 	const uint64_t dh = rewritten ? 0 : hashBytes(ptr, bytes);
+	if (!rewritten) {
+		s_texHashed += bytes;
+		if (!unwrittenSince(ptr, 0, 0)) {
+			s_texHashedOut += bytes;
+			if (uintptr_t(ptr) < s_texOutLo) s_texOutLo = uintptr_t(ptr);
+			if (uintptr_t(ptr) + bytes > s_texOutHi) s_texOutHi = uintptr_t(ptr) + bytes;
+		}
+	}
 	if (!rewritten && e.tex && dh == e.dataHash && th == e.tlutHash) return e.tex;
 
 	const uint32_t pw = pow2Side(w), ph = pow2Side(h);
