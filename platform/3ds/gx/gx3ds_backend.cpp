@@ -123,7 +123,15 @@ static uint32_t s_bstride;
 static uint32_t s_bfmt;
 static PrimClass s_bclass = PRIM_TRIS;
 
-static inline bool batchHasVertices() { return !s_idx.empty(); }
+// A resident batch's indices: its runs' 16-bit indices where the arena stored them (GPU-readable,
+// relative to the page), runs stored one after another making one span. Nothing is copied per frame.
+struct IdxSpan {
+	const uint16_t* idx;
+	uint32_t n;
+};
+static std::vector<IdxSpan> s_bSpans;
+static uint32_t s_bSpanIdx;        // indices in s_bSpans
+static inline bool batchHasVertices() { return !s_idx.empty() || !s_bSpans.empty(); }
 static uint8_t* s_bArena;          // the resident page the batch draws from (display-list arena below), or null
 static uint32_t s_bmin, s_bmax;    // its vertices there: [s_bmin, s_bmax)
 // A resident batch whose vertices carry matrix indices: the matrices its runs use (arenaRunMtx), as
@@ -135,7 +143,15 @@ static uint8_t s_bTexMtx[8];       // each coordinate's texture matrix index, 0x
 // tlutMem are kept; the rest is not used), and the batch being drawn.
 static State rs;
 static const uint8_t* r_verts;     // r_count vertices of r_stride bytes, layout r_layout
-static const uint16_t* r_idx;      // r_nidx indices
+static const uint16_t* r_idx;      // r_nidx indices (null while r_spans holds them)
+static const IdxSpan* r_spans;     // a resident batch: r_nspans spans of indices relative to its page,
+static uint32_t r_nspans, r_bmin;  // r_verts the page's first vertex; its vertices from r_bmin are drawn
+static uint64_t s_spanBatches, s_spansDrawn, s_spanCopies;  // render side: resident batches, their spans, those copied
+// Off (circle pad up at launch): every resident batch's indices are copied into the ring rebased to
+// its first vertex, as before they were stored (the GPU took ~8 ms more a frame drawing them in
+// place on Delfino Plaza; to compare).
+static bool s_idxInPlace = true;
+extern "C" void GX3DS_SetResidentIndicesInPlace(int on) { s_idxInPlace = on != 0; }
 static uint32_t r_count, r_nidx, r_stride, r_fmt;
 static PrimClass r_class = PRIM_TRIS;
 static VtxFmtLayout r_layout;
@@ -433,11 +449,17 @@ static void perfFrameEnd() {
 			        unsigned(aPeak));
 		}
 		renderThreadPerf(frames);
-		fprintf(stderr, "[perf]   resident vertices: %.0f drawn from %u pages (%u KB) per frame, %.0f KB stored per "
-		        "frame | %lu resets, %lu times full%s\n", double(s_arenaDrawVerts - s_perfArenaDraw0) / frames,
+		static uint64_t sb0, sd0, sc0;
+		fprintf(stderr, "[perf]   resident vertices: %.0f drawn from %u pages (%u KB with their indices) per frame, %.0f KB "
+		        "stored per frame | %lu resets, %lu times full%s | resident batches %.0f/frame in %.0f index spans, %.0f "
+		        "copied into the ring (more than one span)\n", double(s_arenaDrawVerts - s_perfArenaDraw0) / frames,
 		        unsigned(arenaPageCount()), unsigned(arenaBytes() >> 10),
 		        double(s_arenaUploadBytes - s_perfArenaUp0) / frames / 1024.0, (unsigned long)arenaResets(),
-		        (unsigned long)arenaFullCount(), arenaEnabled() ? "" : " (off: Up held at launch)");
+		        (unsigned long)arenaFullCount(), arenaEnabled() ? "" : " (off: Up held at launch)",
+		        (s_spanBatches - sb0) / frames, (s_spansDrawn - sd0) / frames, (s_spanCopies - sc0) / frames);
+		sb0 = s_spanBatches;
+		sd0 = s_spansDrawn;
+		sc0 = s_spanCopies;
 		{
 			const uint64_t c[4] = {s_copyRunVerts, s_copyDirectVerts, s_aNoRoomVerts, s_aTooBigVerts};
 			double d[4];
@@ -2727,10 +2749,35 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	{
 		PerfScope ps(PERF_XFORM);
 		const bool inPlace = r_arena != nullptr;  // decoded into the ring and claimed: drawn where it is
-		if (!pica_alloc_raw(inPlace ? 0 : n * r_stride, nidx, &vb, &ib)) return true;  // ring full: dropped
-		if (inPlace) vb = const_cast<uint8_t*>(r_verts);
+		// A resident batch of one span draws its indices where they are stored; one of several
+		// (its page's runs not stored one after another) copies them into the ring, as every draw
+		// costs the GPU a pipeline drain and its vertex cache.
+		const bool oneSpan = r_spans && r_nspans == 1 && s_idxInPlace;
+		const bool rebase = r_spans && !s_idxInPlace;
+		if (r_spans) {
+			s_spanBatches++;
+			s_spansDrawn += r_nspans;
+			if (!oneSpan) s_spanCopies++;
+		}
+		if (!pica_alloc_raw(inPlace ? 0 : n * r_stride, oneSpan ? 0 : nidx, &vb, &ib)) return true;  // ring full: dropped
+		if (inPlace) vb = const_cast<uint8_t*>(r_verts) + (rebase ? size_t(r_bmin) * r_stride : 0);
 		else memcpy(vb, r_verts, size_t(n) * r_stride);
-		memcpy(ib, r_idx, size_t(nidx) * 2);
+		if (oneSpan) {
+			ib = const_cast<uint16_t*>(r_spans[0].idx);
+		} else if (rebase) {
+			uint16_t* o = ib;
+			const uint16_t b = uint16_t(r_bmin);
+			for (uint32_t i = 0; i < r_nspans; i++)
+				for (uint32_t k = 0; k < r_spans[i].n; k++) *o++ = uint16_t(r_spans[i].idx[k] - b);
+		} else if (r_spans) {
+			uint16_t* o = ib;
+			for (uint32_t i = 0; i < r_nspans; i++) {
+				memcpy(o, r_spans[i].idx, size_t(r_spans[i].n) * 2);
+				o += r_spans[i].n;
+			}
+		} else {
+			memcpy(ib, r_idx, size_t(nidx) * 2);
+		}
 	}
 	PerfScope ps(PERF_SUBMIT);
 	if (!pica_draw_gx(vb, n, &lay, ib, nidx, &u, dirty, s_posRows, s_nrmRows, &st)) {
@@ -2741,6 +2788,22 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	return true;
 }
 
+// The CPU path wants a resident batch as the others are: its indices in one list, from its window's
+// first vertex (r_verts and r_count moved there).
+static std::vector<uint16_t> r_flat;
+static void flattenSpans() {
+	r_flat.resize(r_nidx);
+	uint16_t* o = r_flat.data();
+	for (uint32_t s = 0; s < r_nspans; s++)
+		for (uint32_t i = 0; i < r_spans[s].n; i++) *o++ = uint16_t(r_spans[s].idx[i] - r_bmin);
+	r_idx = r_flat.data();
+	r_verts += size_t(r_bmin) * r_stride;
+	r_count -= r_bmin;
+	r_spans = nullptr;
+	r_nspans = 0;
+	r_bmin = 0;
+}
+
 static void drawTriangles() {
 	if (((rs.bp[BP_GENMODE] >> 14) & 3) == 3) return;  // every face culled
 	if (s_afterTexCopy) s_drawsAfterCopy++;
@@ -2749,7 +2812,7 @@ static void drawTriangles() {
 	uint32_t n = r_count, nidx = uint32_t(r_nidx);
 
 	s_perfBatches++;
-	s_perfVerts += n;
+	s_perfVerts += n - (r_spans ? r_bmin : 0);
 	// The textures the TEV stages sample, per (map, coordinate) pair, and the combiner stages,
 	// which give PICA texture units to the pairs they use (none in debug-colour mode).
 	const bool debug = s_debugColors;
@@ -2873,6 +2936,10 @@ static void drawTriangles() {
 	perfAdd(PERF_TEV, svcGetSystemTick() - perfTev0);
 	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
 	s_cpuBatches++;
+	if (r_spans) {
+		flattenSpans();
+		n = r_count;
+	}
 	// A projective texgen on unit 0 (the sea's lookup of the screen copy, which the sea's colour
 	// comes from): its (s q, t q, q) go to the GPU, which divides per pixel (texture unit 0 in
 	// projection mode). Divided here per vertex, the coordinates bend across a large polygon and
@@ -3108,6 +3175,8 @@ struct DrawRec {
 	uint8_t cut;           // pixels cut (profile runs)
 	uint8_t amtx;          // resident with matrix indices: pnMax and texMtx hold its runs' matrices
 	uint8_t pnMax, texMtx[8];
+	uint32_t nspans;       // non-zero: a resident batch, its data nspans IdxSpans (arena at the page's start)
+	uint32_t bmin;         // its first vertex in the page
 };
 // Where a draw record's data starts (vertices, then indices; or nothing, with ext).
 static const uint32_t kDrawHead = uint32_t(sizeof(RecHdr) + sizeof(DrawRec) + 7) & ~7u;
@@ -3388,17 +3457,18 @@ static void enqueueDraw() {
 	const uint8_t* verts;
 	uint32_t count;
 	if (s_bArena) {
-		// Drawn from its window of the resident page: indices from the window's start (rebased below).
-		count = s_bmax - s_bmin;
-		verts = s_bArena + size_t(s_bmin) * s_bstride;
-		s_arenaDrawVerts += count;
+		// Drawn from the resident page where it is, its indices where the arena stored them (spans).
+		count = s_bmax;
+		verts = s_bArena;
+		s_arenaDrawVerts += s_bmax - s_bmin;
 	} else {
 		count = s_bcount;
 		verts = s_vdata.data();
 	}
-	const uint32_t nidx = uint32_t(s_idx.size());
+	const uint32_t nspans = s_bArena ? uint32_t(s_bSpans.size()) : 0;
+	const uint32_t nidx = s_bArena ? s_bSpanIdx : uint32_t(s_idx.size());
 	const size_t vbytes = s_bArena ? 0 : (size_t(count) * s_bstride + 3) & ~size_t(3);
-	const size_t ibytes = size_t(nidx) * 2;
+	const size_t ibytes = s_bArena ? size_t(nspans) * sizeof(IdxSpan) : size_t(nidx) * 2;
 	const size_t head = kDrawHead;
 	uint8_t* p = nullptr;
 	uint32_t stateOff = 0;
@@ -3453,6 +3523,8 @@ static void enqueueDraw() {
 	d->amtx = s_bArena && (s_bfmt & VF_MTX);
 	d->pnMax = s_bPnMax;
 	memcpy(d->texMtx, s_bTexMtx, sizeof d->texMtx);
+	d->nspans = nspans;
+	d->bmin = s_bArena ? s_bmin : 0;
 	uint8_t* data = ext ? ext : p + head;
 	if (!s_bArena && !inPlace) {
 		PerfScope pv(PERF_QVERT);
@@ -3460,10 +3532,13 @@ static void enqueueDraw() {
 	}
 	{
 		PerfScope pi(PERF_QIDX);
-		uint16_t* ix = reinterpret_cast<uint16_t*>(data + vbytes);
-		const uint32_t* si = s_idx.data();
-		const uint32_t base = s_bArena ? s_bmin : 0;
-		for (uint32_t i = 0; i < nidx; i++) ix[i] = uint16_t(si[i] - base);
+		if (s_bArena) {
+			memcpy(data + vbytes, s_bSpans.data(), ibytes);
+		} else {
+			uint16_t* ix = reinterpret_cast<uint16_t*>(data + vbytes);
+			const uint32_t* si = s_idx.data();
+			for (uint32_t i = 0; i < nidx; i++) ix[i] = uint16_t(si[i]);
+		}
 	}
 	rcCommit(uint32_t(size));
 }
@@ -3487,7 +3562,10 @@ static void renderDraw(const RecHdr* h) {
 	r_amtx = d->amtx != 0;
 	r_pnMax = d->pnMax;
 	memcpy(r_texMtx, d->texMtx, sizeof r_texMtx);
-	r_idx = reinterpret_cast<const uint16_t*>(data + vbytes);
+	r_spans = d->nspans ? reinterpret_cast<const IdxSpan*>(data) : nullptr;
+	r_nspans = d->nspans;
+	r_bmin = d->bmin;
+	r_idx = d->nspans ? nullptr : reinterpret_cast<const uint16_t*>(data + vbytes);
 	if (d->cut) pica_set_draw_cut(1);
 	drawBatch();
 	if (d->cut) pica_set_draw_cut(0);
@@ -3552,6 +3630,8 @@ void flushBatch() {
 	}
 	s_vdata.clear();
 	s_idx.clear();
+	s_bSpans.clear();
+	s_bSpanIdx = 0;
 	s_bcount = 0;
 	s_bArena = nullptr;
 }
@@ -3683,6 +3763,7 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 struct ArenaPage {
 	uint8_t* base;
 	uint32_t stride, cap, used;
+	int iblock = -1;  // its runs' current index block (s_ablocks): a page's runs' indices stay together
 };
 static std::vector<ArenaPage> s_apages;
 static int s_apageFor[256];  // current page of each stride, or -1
@@ -3704,7 +3785,42 @@ uint32_t arenaGeneration() { return s_agen; }
 // carry matrix indices, worked out on its first draw from its CPU copy. [0]: bit 31 once worked out,
 // low byte the highest position matrix index; [1], [2]: each coordinate's texture matrix index,
 // 0xFF where it varies. The render side checks these instead of the page window's vertices.
-static const uint32_t kRunInfo = 3;
+// [3]: where its 16-bit indices are stored (arenaIdxAlloc), [4]: how many (with padding).
+static const uint32_t kRunInfo = 5;
+
+// The runs' indices, 16-bit and relative to their page, in GPU-readable blocks: written once when
+// the run is stored, drawn from there (IdxSpan). Each page has blocks of its own, so the runs a
+// batch draws from one page, stored one after another, make one span (every span is a draw of its
+// own, which on the PICA leaves drawing mode and clears the vertex cache: with the pages' runs
+// interleaved, Delfino Plaza's GPU time went up 47 -> 55 ms). Each run's start stays 4-byte aligned
+// (as the ring's indices are): an odd count is padded with one degenerate triangle. Blocks count
+// towards the arena's budget and go with its reset.
+struct IdxBlock {
+	uint16_t* base;
+	uint32_t cap, used;  // indices
+};
+static std::vector<IdxBlock> s_ablocks;
+static const uint32_t kIdxBlock = 128u << 10;  // indices (256 KB)
+static uint16_t* arenaIdxAlloc(ArenaPage& pg, uint32_t n) {
+	if (pg.iblock >= 0) {
+		IdxBlock& b = s_ablocks[size_t(pg.iblock)];
+		if (b.used + n <= b.cap) {
+			uint16_t* p = b.base + b.used;
+			b.used += n;
+			return p;
+		}
+	}
+	// about three indices a vertex the page holds, at most kIdxBlock (a run larger gets its own)
+	const uint32_t cap = std::max(n, std::min(kIdxBlock, (pg.cap * 3u + 1023u) & ~1023u));
+	const uint32_t bytes = (cap * 2u + 4095u) & ~4095u;
+	if (s_abytes + bytes > kArenaMax || pica_linear_free() <= kArenaReserve + bytes) return nullptr;
+	uint16_t* p = static_cast<uint16_t*>(pica_linear_alloc(bytes));
+	if (!p) return nullptr;
+	s_abytes += bytes;
+	s_ablocks.push_back(IdxBlock{p, bytes / 2, n});
+	pg.iblock = int(s_ablocks.size() - 1);
+	return p;
+}
 static const uint32_t* arenaRunMtx(const ArenaRef& ref, const uint8_t* verts, uint32_t n, uint32_t stride,
                                    uint32_t mtxOff) {
 	uint32_t* info = &s_aidx[ref.iOff - kRunInfo];
@@ -3755,15 +3871,27 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
 		s_abytes += bytes;
 	}
 	ArenaPage& pg = s_apages[size_t(pi)];
+	const uint32_t nstore = (nidx & 1) ? nidx + 3 : nidx;
+	uint16_t* ix = arenaIdxAlloc(pg, nstore);
+	if (!ix) {
+		s_afull++;
+		s_aNoRoomVerts += n;
+		s_aresetDue = true;
+		return false;
+	}
 	const uint32_t vb = pg.used;
+	for (uint32_t i = 0; i < nidx; i++) ix[i] = uint16_t(idx[i] + vb);
+	for (uint32_t i = nidx; i < nstore; i++) ix[i] = ix[nidx - 1];
+	pica_flush(ix, nstore * 2);
 	uint8_t* dst = pg.base + size_t(vb) * stride;
 	memcpy(dst, verts, size_t(n) * stride);
 	pica_flush(dst, n * stride);
 	pg.used += n;
 	const size_t io = s_aidx.size() + kRunInfo;
-	s_aidx.resize(io + nidx);
+	s_aidx.resize(io);
 	s_aidx[io - kRunInfo] = 0;  // its matrices: not worked out yet (arenaRunMtx)
-	for (uint32_t i = 0; i < nidx; i++) s_aidx[io + i] = idx[i] + vb;
+	s_aidx[io - 2] = uint32_t(uintptr_t(ix));
+	s_aidx[io - 1] = nstore;
 	out.gen = s_agen;
 	out.baseVertex = int32_t((uint32_t(pi) << 16) | vb);
 	out.iOff = io;
@@ -3805,9 +3933,11 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& r
 		s_bmin = std::min(s_bmin, vb);
 		s_bmax = std::max(s_bmax, vb + n);
 	}
-	const size_t at = s_idx.size();
-	s_idx.resize(at + nidx);
-	memcpy(&s_idx[at], &s_aidx[ref.iOff], size_t(nidx) * 4);
+	const uint16_t* ix = reinterpret_cast<const uint16_t*>(uintptr_t(s_aidx[ref.iOff - 2]));
+	const uint32_t ns = s_aidx[ref.iOff - 1];
+	if (!s_bSpans.empty() && s_bSpans.back().idx + s_bSpans.back().n == ix) s_bSpans.back().n += ns;
+	else s_bSpans.push_back(IdxSpan{ix, ns});
+	s_bSpanIdx += ns;
 }
 
 // The batch reads its indices from s_aidx's copy, never from the front half's runs.
@@ -3828,6 +3958,8 @@ static void arenaFrameEnd() {
 	pica_gpu_idle();  // every queued frame done with the pages
 	for (const ArenaPage& p : s_apages) pica_linear_free_block(p.base);
 	s_apages.clear();
+	for (const IdxBlock& b : s_ablocks) pica_linear_free_block(b.base);
+	s_ablocks.clear();
 	for (int& p : s_apageFor) p = -1;
 	s_aidx.clear();
 	s_aidx.shrink_to_fit();
@@ -4059,6 +4191,8 @@ static void streamStart() {
 }
 
 static bool streamOn() { return s_streamOn; }
+extern "C" uint64_t GXPC_OpTicks[10];
+extern "C" uint32_t GXPC_OpTimed[10], GXPC_OpAll[10];
 // The profiler window's GX-thread numbers (render thread, at the window's end): the game thread's
 // wait for it, then, with print, the line (which starts the next window).
 static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
@@ -4078,6 +4212,31 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 	        double(w[1]) * perMs, double(w[2]) * perMs, double(w[3]) * perMs, unsigned(s_dlWaits - dlWaits0),
 	        unsigned(s_sHead.load() - s_sTail.load()), (s_dlCopies - dlCopies0) * perFrame,
 	        (s_dlCopyBytes - dlCopyBytes0) * perFrame / 1024.0);
+	{
+		// Its top-level commands by kind (patch 0020): count a frame and estimated ms a frame, from
+		// the one in 16 timed.
+		static const char* const kKind[10] = {"BP", "CP", "XF", "indexed XF", "list call", "primitives",
+		                                      "stream list call", "stream list-copy call", "flush", "other stream"};
+		static uint64_t t0[10];
+		static uint32_t n0[10], a0[10];
+		char line[640];
+		int at = 0;
+		double sum = 0;
+		for (int k = 0; k < 10; k++) {
+			const uint64_t t = GXPC_OpTicks[k] - t0[k];
+			const uint32_t timed = GXPC_OpTimed[k] - n0[k], all = GXPC_OpAll[k] - a0[k];
+			t0[k] += t;
+			n0[k] += timed;
+			a0[k] += all;
+			if (!all) continue;
+			const double ms = timed ? double(t) / timed * all * perMs : 0.0;
+			sum += ms;
+			at += snprintf(line + at, sizeof line - at, "%s %s %.0f/%.1f ms", at ? " |" : "", kKind[k], all * perFrame,
+			               ms);
+		}
+		fprintf(stderr, "[perf]   GX thread by command (count/frame, ms/frame estimated from 1 in 16 timed; %.1f ms "
+		        "in all):%s\n", sum, line);
+	}
 	for (int i = 0; i < 4; i++) w0[i] += w[i];
 	dlWaits0 = s_dlWaits;
 	dlCopies0 = s_dlCopies;

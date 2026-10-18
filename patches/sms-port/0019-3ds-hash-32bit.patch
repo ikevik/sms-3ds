@@ -1,0 +1,64 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-18 14:24:07
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-18 14:24:07
+@@ -67,7 +67,53 @@
+     abort();
+ }
+ 
++#if defined(__3DS__)
++// 3DS port: the ARM11 is a 32-bit core, where each 64-bit multiply below is several
++// instructions; display-list validation hashed about 280 KB a frame with it on Delfino Plaza.
++// The same idea on 32-bit words: four lanes over 16-byte blocks (xxHash32's round), two of the
++// lanes' finalised mixes making the 64-bit result.
++static inline uint32_t hashRotl(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
++static inline uint32_t hashMix(uint32_t h) {
++    h ^= h >> 15;
++    h *= 0x85EBCA77u;
++    h ^= h >> 13;
++    h *= 0xC2B2AE3Du;
++    h ^= h >> 16;
++    return h;
++}
+ uint64_t hashBytes(const void* data, size_t n, uint64_t seed) {
++    const uint32_t P1 = 0x9E3779B1u, P2 = 0x85EBCA77u, P3 = 0xC2B2AE3Du, P4 = 0x27D4EB2Fu;
++    const uint8_t* p = static_cast<const uint8_t*>(data);
++    const uint32_t s0 = uint32_t(seed) ^ uint32_t(n), s1 = uint32_t(seed >> 32) ^ 0x165667B1u;
++    uint32_t a = s0 + P1 + P2, b = s0 + P2, c = s1, d = s1 - P1;
++    size_t left = n;
++    while (left >= 16) {
++        uint32_t w[4];
++        memcpy(w, p, 16);
++        a = hashRotl(a + w[0] * P2, 13) * P1;
++        b = hashRotl(b + w[1] * P2, 13) * P1;
++        c = hashRotl(c + w[2] * P2, 13) * P1;
++        d = hashRotl(d + w[3] * P2, 13) * P1;
++        p += 16;
++        left -= 16;
++    }
++    while (left >= 4) {
++        uint32_t w;
++        memcpy(&w, p, 4);
++        a = hashRotl(a + w * P3, 17) * P4;
++        b ^= a;
++        p += 4;
++        left -= 4;
++    }
++    uint32_t w = 0;
++    memcpy(&w, p, left);
++    a = hashRotl(a + (w + uint32_t(left)) * P3, 17) * P4;
++    const uint32_t hi = hashMix(hashRotl(a, 1) + hashRotl(b, 7) + hashRotl(c, 12) + hashRotl(d, 18) + uint32_t(n));
++    const uint32_t lo = hashMix((a ^ hashRotl(c, 16)) * P2 + (b ^ hashRotl(d, 16)) * P3 + s1);
++    return (uint64_t(hi) << 32) | lo;
++}
++#else
++uint64_t hashBytes(const void* data, size_t n, uint64_t seed) {
+     // 64-bit multiply/xor-shift hash over 8-byte words; not cryptographic.
+     // Four independent lanes over 32-byte blocks, so the multiplies overlap
+     // instead of forming one dependency chain (textures are hashed each frame).
+@@ -108,6 +154,7 @@
+     h ^= h >> 32;
+     return h;
+ }
++#endif
+ 
+ // Default window: MEM1 mapped at the GameCube's own cached base, which is what
+ // the unmodified OSCachedToPhysical macro (addr - 0x80000000) assumes.

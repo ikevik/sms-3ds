@@ -33,6 +33,7 @@ void pad3ds_poll(void);
 void pad3ds_read(Pad3DSStatus* out);
 // Set by the main thread when quitting: the game thread stops at its next PADRead.
 extern volatile int pad3ds_quit;
+extern volatile int pad3ds_parked;  // set by the game thread once it stops for the quit
 
 // Mapping:
 //   Circle Pad -> main stick        C-stick (New 3DS) -> C-stick

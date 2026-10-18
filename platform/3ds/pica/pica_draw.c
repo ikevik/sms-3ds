@@ -1235,12 +1235,29 @@ static void gx_shortcuts(const PicaGxUniforms* u)
 	}
 }
 
+/* The setup a GX-mode draw needs (attribute loaders, state, uniforms, shortcuts, buffer): 0 when the
+ * layout cannot be expressed. */
+static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, int matrices_dirty,
+                    const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st);
+
 int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
                  const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
                  const PicaState* st)
 {
 	(void)nverts;
 	if (!s_in_frame || nidx == 0) return 1;
+	if (!gx_setup(verts, L, u, matrices_dirty, pos_rows, nrm_rows, st)) return 0;
+	s_frameDraws++;
+	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
+	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
+	gpu_check("GPU-transform draw", L, nidx, st);
+	maybe_split();
+	return 1;
+}
+
+static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, int matrices_dirty,
+                    const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st)
+{
 	if (s_mode != MODE_GX || !s_gxLayoutValid || memcmp(L, &s_gxLayout, sizeof *L) != 0) {
 		u64 perm;
 		int n = gx_attribs(L, &perm);
@@ -1278,11 +1295,6 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	vunif(s_uLD, u->LD[0], u->LD[1], u->LD[2], u->LD[3]);
 	gx_shortcuts(u);
 	set_buffer(verts, L->stride, s_gxEntries, s_gxPerm);
-	s_frameDraws++;
-	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
-	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
-	gpu_check("GPU-transform draw", L, nidx, st);
-	maybe_split();
 	return 1;
 }
 

@@ -1,0 +1,62 @@
+--- a/platform/gx/src/gx_fifo.cpp	2026-10-18 14:25:26
++++ b/platform/gx/src/gx_fifo.cpp	2026-10-18 14:25:26
+@@ -1152,6 +1152,30 @@
+ };
+ #endif
+ 
++#if defined(__3DS__)
++// 3DS port: the stream's top-level commands by kind for [perf] (gx3ds_backend.cpp): all counted,
++// one in 16 timed (a tick read costs ~250 ns), the time including whatever the command set off
++// (a display-list call's validation and replay, a batch flushed by a state change).
++// Kinds: BP, CP, XF, indexed XF, list call (0x40), primitives, stream list call, stream list-copy
++// call, stream flush, other stream commands.
++extern "C" {
++uint64_t GXPC_OpTicks[10];
++uint32_t GXPC_OpTimed[10], GXPC_OpAll[10];
++}
++static uint32_t s_opSample;
++static inline int opKind(uint8_t op) {
++    if (op == 0x61) return 0;
++    if (op == 0x08) return 1;
++    if (op == 0x10) return 2;
++    if (op >= 0x20 && op <= 0x38) return 3;
++    if (op == 0x40) return 4;
++    if (op >= 0x80 && op < 0xC0) return 5;
++    if (op == kStreamOpCallDL) return 6;
++    if (op == kStreamOpCallDLCopy) return 7;
++    if (op == kStreamOpFlush) return 8;
++    return 9;
++}
++#endif
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
+     GXPC_CMD_TIMER;
+ #if defined(__3DS__)
+@@ -1169,6 +1193,10 @@
+             continue;
+         }
+         if (s_dlRec && !(op >= 0x80 && op < 0xC0)) s_dlRecFail = true;
++#if defined(__3DS__)
++        const bool opTimed = streamTop && ((++s_opSample & 15) == 0);
++        const uint64_t opT0 = opTimed ? svcGetSystemTick() : 0;
++#endif
+         if (op == 0x08) {
+             len = 6;
+             if (avail < len) break;
+@@ -1239,7 +1267,17 @@
+             logmsg("unknown FIFO opcode 0x%02X, skipping byte", op);
+             p++;
+             continue;
++        }
++#if defined(__3DS__)
++        if (streamTop) {
++            const int k = opKind(op);
++            GXPC_OpAll[k]++;
++            if (opTimed) {
++                GXPC_OpTicks[k] += svcGetSystemTick() - opT0;
++                GXPC_OpTimed[k]++;
++            }
+         }
++#endif
+         p += len;
+         continue;
+     }

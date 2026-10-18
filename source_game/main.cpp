@@ -47,6 +47,7 @@ void GX3DS_SetArena(int on);
 void GX3DS_SetRenderThread(int on);
 void GX3DS_SetGxThread(int on);
 void GX3DS_SetListCopies(int on);
+void GX3DS_SetResidentIndicesInPlace(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 // Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
 // 0008); -1 in the normal build.
@@ -392,7 +393,9 @@ static Thread s_statusThread;
 static volatile bool s_statusRun = true;
 static void status_thread(void*) {
 	while (s_statusRun) {
-		svcSleepThread(500000000LL);
+		// Twice a second, in 50 ms steps, so a quit does not wait half a second for this thread.
+		for (int i = 0; i < 10 && s_statusRun; i++) svcSleepThread(50000000LL);
+		if (!s_statusRun) break;
 		uint32_t s[7];
 		GX3DS_GetStats(s);
 		draw_status(s);
@@ -515,6 +518,13 @@ int main()
 		printf("SELECT held: display lists by address\n");
 		fprintf(stderr, "[3ds] SELECT held at launch: display-list copies off (rewrites wait for the GX thread)\n");
 	}
+	// Circle pad up at launch: resident display-list runs' indices are copied into the GPU ring each
+	// frame, rebased to the batch (the render thread's copy, as before), not drawn where stored.
+	if (launchHeld & KEY_CPAD_UP) {
+		GX3DS_SetResidentIndicesInPlace(0);
+		printf("Circle pad up: resident indices copied\n");
+		fprintf(stderr, "[3ds] circle pad up at launch: resident indices copied into the ring, rebased (not in place)\n");
+	}
 	if (launchHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
 		pica_set_big_ring(1);  // CPU-transformed vertices are larger
@@ -574,12 +584,19 @@ int main()
 		hidScanInput();
 		pad3ds_poll();  // the game's PADRead takes this reading (pad_3ds.c)
 		static u32 prevHeld = launchHeld;  // buttons held through launch are not presses
-		u32 held = hidKeysHeld(), pressed = held & ~prevHeld;
+		u32 held = hidKeysHeld(), pressed = held & ~prevHeld, released = prevHeld & ~held;
 		prevHeld = held;
 		if ((held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT))
 			break;
-		if ((pressed & KEY_SELECT) && !(held & KEY_START))
-			GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);  // material, debug, opaque
+		// SELECT on its own cycles the colours (material, debug, opaque), on its release, so the
+		// first half of a START+SELECT quit pressed SELECT first does not switch them.
+		static bool selectAlone;
+		if (pressed & KEY_SELECT) selectAlone = true;
+		if (held & KEY_START) selectAlone = false;
+		if ((released & KEY_SELECT) && selectAlone) {
+			selectAlone = false;
+			GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);
+		}
 		// Debug input stays on the touch screen, which the game does not use (its buttons all
 		// reach the game through pad_3ds.c): the top half cycles the top screen through the last
 		// frame's EFB copies, the bottom half logs the next frame's draws to sdmc:/sms/log.txt.
@@ -636,7 +653,7 @@ int main()
 	// Park the game thread at its next PADRead (once a frame; a slow frame is ~200 ms), so it is not
 	// running game or GX code while the services and the heap go away.
 	pad3ds_quit = 1;
-	svcSleepThread(400000000LL);
+	for (int i = 0; i < 40 && !pad3ds_parked; i++) svcSleepThread(10000000LL);  // at most 400 ms
 	pica_request_stop();
 	svcSleepThread(100000000LL);
 	// _exit, not a return from main: exit's atexit handlers and static destructors can wait on

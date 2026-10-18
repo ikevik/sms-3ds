@@ -47,6 +47,7 @@ static void read_now(Pad3DSStatus* out)
 static Pad3DSStatus s_latest;
 static LightLock s_lock = 1; /* 1: unlocked */
 volatile int pad3ds_quit;
+volatile int pad3ds_parked;
 
 void pad3ds_poll(void)
 {
