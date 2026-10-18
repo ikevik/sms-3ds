@@ -36,6 +36,7 @@ void pica_set_gpu_check(int on);
 void pica_set_split(int on);
 void pica_set_vram_textures(int on);
 void pica_set_vram_check(int on);
+void pica_set_readback_dumps(int on);
 void pica_set_overlap(int on);
 void pica_set_big_ring(int on);
 extern "C" void SMS3DS_ProfRequest(void);
@@ -439,11 +440,13 @@ int main()
 		printf("Y held: GPU check after every draw (slow)\n");
 		fprintf(stderr, "[3ds] Y held at launch: GPU check after every draw\n");
 	}
-	// Holding X at launch logs each new TEV setup, unsupported TEV pattern and EFB copy kind.
+	// Holding X at launch logs each new TEV setup, unsupported TEV pattern and EFB copy kind, and
+	// writes the goop map readbacks to the SD card.
 	if (launchHeld & KEY_X) {
 		GX3DS_SetVerboseLog(1);
+		pica_set_readback_dumps(1);
 		printf("X held: detailed renderer log\n");
-		fprintf(stderr, "[3ds] X held at launch: [tevdump]/[tev]/[copy] lines on\n");
+		fprintf(stderr, "[3ds] X held at launch: [tevdump]/[tev]/[copy] lines and goop map files on\n");
 	}
 	// Holding R at launch sends frames to the GPU in parts as they are made (experimental: GSP
 	// stopped reporting GPU completions with it, at level loads).

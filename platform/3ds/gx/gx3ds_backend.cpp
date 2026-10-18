@@ -250,10 +250,13 @@ static bool renderThreaded();    // the render thread runs (else records are dra
 static uint64_t gameWaitTicks(); // the profiler window's game-thread wait for the render thread
 static void renderThreadPerf(double frames);
 
+static uint64_t s_perfEnd0[PICA_END_COUNT];
+
 static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
 	if (!s_perfWindowStart) {
 		s_perfWindowStart = now;
+		pica_end_ticks(s_perfEnd0);
 		s_perfCmd0 = GXPC_CmdTicks;
 		s_perfMain0 = GX3DS_MainBusyTicks;
 		s_perfIdle0 = port_idle_seconds();
@@ -294,6 +297,22 @@ static void perfFrameEnd() {
 	        s_perfAvgMs[PERF_XFORM], s_perfAvgMs[PERF_SUBMIT], s_perfAvgMs[PERF_COPY], s_perfAvgMs[PERF_PRESENT],
 	        s_perfAvgMs[PERF_DECODE], s_perfAvgMs[PERF_BATCH], s_perfAvgMs[PERF_APPEND], s_perfAvgMs[PERF_COUNT + 1],
 	        s_perfAvgBatches, s_perfAvgVerts);
+	{
+		// present split up: pica_present's frame end
+		uint64_t end[PICA_END_COUNT];
+		double ms[PICA_END_COUNT];
+		pica_end_ticks(end);
+		for (int i = 0; i < PICA_END_COUNT; i++) {
+			ms[i] = double(end[i] - s_perfEnd0[i]) / frames / kTicksPerMs;
+			s_perfEnd0[i] = end[i];
+		}
+		fprintf(stderr,
+		        "[perf]   present: pass %.2f, ring flush %.2f, parts wait %.2f, submit %.2f, heap flush %.2f, gpu wait "
+		        "%.2f, readback invalidate %.2f convert %.2f fetch %.2f, run %.2f ms/frame\n",
+		        ms[PICA_END_PASS], ms[PICA_END_RINGS], ms[PICA_END_PARTS], ms[PICA_END_SUBMIT], ms[PICA_END_HEAP_FLUSH],
+		        ms[PICA_END_WAIT], ms[PICA_END_RB_INVAL], ms[PICA_END_RB_CONVERT], ms[PICA_END_RB_FETCH],
+		        ms[PICA_END_RUN]);
+	}
 	char fb[256];
 	int at = 0;
 	for (int i = 0; i < FB_COUNT && at < int(sizeof fb) - 48; i++)

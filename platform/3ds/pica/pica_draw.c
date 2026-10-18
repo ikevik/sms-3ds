@@ -653,6 +653,18 @@ static uint64_t s_waitTicks;      /* C3D_FrameBegin waits (pica_wait_ticks) */
 uint64_t pica_wait_ticks(void) { return s_waitTicks; }
 static double s_gpuMsSum;          /* citro3d's GPU time of each finished frame (pica_gpu_ms_sum) */
 double pica_gpu_ms_sum(void) { return s_gpuMsSum; }
+/* The frame's end split up (pica_end_ticks): each mark adds the ticks since the last one to its
+ * part. Only frames ended by pica_present are timed (s_endTimed). */
+static uint64_t s_endTicks[PICA_END_COUNT], s_endT;
+static int s_endTimed;
+static void end_mark(int part)
+{
+	if (!s_endTimed) return;
+	const u64 t = svcGetSystemTick();
+	s_endTicks[part] += t - s_endT;
+	s_endT = t;
+}
+void pica_end_ticks(uint64_t out[PICA_END_COUNT]) { memcpy(out, s_endTicks, sizeof s_endTicks); }
 
 /* GPU test (pica_cycle_gpu_test): 1 scissors every game draw to 8x8 pixels, so the GPU still
  * transforms every vertex but shades almost no pixels. Comparing its GPU time with the normal
@@ -802,15 +814,20 @@ static void ovl_frame_end(void)
 	u32 size;
 	if (C3Di_SplitFrame(&buf, &size)) GX_ProcessCommandList(buf, size * 4, GX_CMDLIST_FLUSH);
 	GPUCMD_SetBuffer(NULL, 0, 0);
+	end_mark(PICA_END_SUBMIT);
 	{
 		/* As C3D_FrameEnd(0): write back the whole linear heap. */
 		extern u32 __ctru_linear_heap, __ctru_linear_heap_size;
 		GSPGPU_FlushDataCache((void*)__ctru_linear_heap, __ctru_linear_heap_size);
 	}
+	end_mark(PICA_END_HEAP_FLUSH);
 	s_where = "waiting for the GPU to finish the previous frame";
 	ovl_wait_running();
+	end_mark(PICA_END_WAIT);
 	readback_finish(); /* the previous frame's copies are drawn: into the game's memory */
+	end_mark(PICA_END_RB_CONVERT);
 	readback_queue();  /* this frame's, fetched from VRAM after its draws */
+	end_mark(PICA_END_RB_FETCH);
 	/* The previous frame has swapped the screens: this transfer targets the new back buffer. */
 	if (s_top->used) {
 		s_top->used = false;
@@ -821,6 +838,7 @@ static void ovl_frame_end(void)
 	gxCmdQueueRun(q);
 	s_ovRunning = q;
 	s_ovb ^= 1;
+	end_mark(PICA_END_RUN);
 }
 
 const char* pica_queue_state(void);
@@ -1661,13 +1679,21 @@ void pica_present(void)
 	if (!pica_init()) return;
 	if (!s_in_frame) frame_begin();
 
+	s_endTimed = 1;
+	s_endT = svcGetSystemTick();
 	/* The EFB texture as one quad over the whole top screen. */
 	draw_on(s_top);
 	set_cpu_proj(&s_projTop);
 	C3D_Tex* show = &s_efbTex;
 	if (s_view > 0 && s_view <= s_nLastFrameCopies) show = &s_lastFrameCopies[s_view - 1]->tex;
 	draw_efb_quad(1, show);
-	flush_rings();
+	end_mark(PICA_END_PASS);
+	/* No ring flush: the frame's end writes back the whole linear heap (ovl_frame_end, and
+	 * C3D_FrameEnd(0) without overlap), rings included. Flushed again here by range, the ring's
+	 * 0.5-1 MB took 3-4 ms; the whole heap takes about 1 (Delfino Airstrip, 17 Oct). */
+	s_vflushed = s_vused;
+	s_iflushed = s_iused;
+	end_mark(PICA_END_RINGS);
 	memcpy(s_lastFrameCopies, s_frameCopies, sizeof s_frameCopies);
 	s_nLastFrameCopies = s_nFrameCopies;
 	s_nFrameCopies = 0;
@@ -1677,8 +1703,11 @@ void pica_present(void)
 	}
 	s_where = "waiting for the GPU to finish the frame's earlier parts";
 	drain_parts();
+	end_mark(PICA_END_PARTS);
 	s_where = "C3D_FrameEnd (submitting the frame)";
 	frame_end();
+	if (!s_ovl) end_mark(PICA_END_SUBMIT);
+	s_endTimed = 0;
 	s_where = "between frames (game code)";
 	s_frameDraws = 0;
 	s_checkFramesInc();
@@ -1765,9 +1794,13 @@ static void readback_queue(void)
 	s_nrbCur = 0;
 }
 
-/* A one-byte GX texture (8x4 tiles) as a PGM image, for looking at what the readback writes. */
+/* A one-byte GX texture (8x4 tiles) as a PGM image, for looking at what the readback writes.
+ * Off unless asked for (pica_set_readback_dumps): each file cost about a second of SD writes. */
+static int s_rbDumps;
+void pica_set_readback_dumps(int on) { s_rbDumps = on; }
 static void rb_dump(const char* tag, const Readback* r)
 {
+	if (!s_rbDumps) return;
 	char path[64];
 	snprintf(path, sizeof path, "sdmc:/sms/goop-%s.pgm", tag);
 	FILE* f = fopen(path, "wb");
@@ -1780,44 +1813,82 @@ static void rb_dump(const char* tag, const Readback* r)
 	fprintf(stderr, "[pica] goop map written to %s\n", path);
 }
 
+/* Each destination column's byte within a row of the copy texture's 8x8 tiles (readback_rows). */
+#define RB_MAX_W 1024 /* GX copies are at most 1024 wide */
+static uint32_t s_rbCol[RB_MAX_W];
+
+/* Writes a readback's texels into the game's memory, in GX's one-byte tiled layout (8x4 texels
+ * a 32-byte tile). The texture holds its EFB window with the top row at t = 1, which the PICA
+ * stores first (pica_tex_upload writes the image's bottom row first): memory row v is EFB row
+ * wy + v * wh / th. The column mapping is the same on every row, so each column's byte in a tile
+ * row is worked out once (s_rbCol) and a texel costs a table read, a byte read and a share of a
+ * 32-bit store; rows that sample the source row of the row above copy it. Per texel float math
+ * took 34 ms a frame for Delfino Airstrip's 512x512 goop map. */
+static void readback_rows(const Readback* r)
+{
+	static const int byteOf[4] = {3, 2, 1, 0}; /* RGBA8 texels are stored A, B, G, R */
+	const int lum = r->chan > 3;
+	const int dw = r->dw < RB_MAX_W ? r->dw : RB_MAX_W, dh = r->dh, tw = r->tw, th = r->th;
+	const uint32_t rowBytes = (uint32_t)tw * 8 * 4, tileRow = (uint32_t)r->tilesPerRow * 32;
+	const uint32_t chanByte = lum ? 0 : (uint32_t)byteOf[r->chan];
+	const float sx = r->w / r->dw, sy = r->h / r->dh;
+	const float ku = tw / r->ww, kv = th / r->wh;
+	for (int x = 0; x < dw; x++) {
+		int u = (int)((r->x + (x + 0.5f) * sx - r->wx) * ku);
+		u = u < 0 ? 0 : u > tw - 1 ? tw - 1 : u;
+		const int ux = u & 7;
+		s_rbCol[x] = ((uint32_t)(u >> 3) * 64 + (uint32_t)((ux & 1) | (ux & 2) << 1 | (ux & 4) << 2)) * 4 + chanByte;
+	}
+	int lastV = -1;
+	const uint8_t* lastRow = NULL;
+	for (int y = 0; y < dh; y++) {
+		int v = (int)((r->y + (y + 0.5f) * sy - r->wy) * kv);
+		v = v < 0 ? 0 : v > th - 1 ? th - 1 : v;
+		uint8_t* drow = r->dest + (uint32_t)(y >> 2) * tileRow + (uint32_t)(y & 3) * 8;
+		int x = 0;
+		if (v == lastV) {
+			for (; x + 8 <= dw; x += 8) memcpy(drow + (x >> 3) * 32, lastRow + (x >> 3) * 32, 8);
+			for (; x < dw; x++) drow[(x >> 3) * 32 + (x & 7)] = lastRow[(x >> 3) * 32 + (x & 7)];
+			continue;
+		}
+		const int vy = v & 7;
+		const uint8_t* trow = r->buf + (uint32_t)(v >> 3) * rowBytes + (uint32_t)((vy & 1) << 1 | (vy & 2) << 2 | (vy & 4) << 3) * 4;
+		if (lum) {
+			for (; x < dw; x++) {
+				const uint8_t* px = trow + s_rbCol[x];
+				drow[(x >> 3) * 32 + (x & 7)] = (uint8_t)((px[3] * 77 + px[2] * 150 + px[1] * 29) >> 8);
+			}
+		} else {
+			for (; x + 8 <= dw; x += 8) {
+				const uint32_t* c = s_rbCol + x;
+				const uint32_t lo = trow[c[0]] | (uint32_t)trow[c[1]] << 8 | (uint32_t)trow[c[2]] << 16 | (uint32_t)trow[c[3]] << 24;
+				const uint32_t hi = trow[c[4]] | (uint32_t)trow[c[5]] << 8 | (uint32_t)trow[c[6]] << 16 | (uint32_t)trow[c[7]] << 24;
+				uint8_t* d = drow + (x >> 3) * 32;
+				memcpy(d, &lo, 4); /* little-endian: texel x first */
+				memcpy(d + 4, &hi, 4);
+			}
+			for (; x < dw; x++) drow[(x >> 3) * 32 + (x & 7)] = trow[s_rbCol[x]];
+		}
+		lastV = v;
+		lastRow = drow;
+	}
+}
+
 static void readback_finish(void)
 {
 	for (int i = 0; i < s_nrbRun; i++) {
 		Readback* r = &s_rbRun[i];
 		if (!r->buf) continue;
-		const uint32_t rowBytes = (uint32_t)r->tw * 8 * 4;
+		end_mark(PICA_END_RB_CONVERT);
 		GSPGPU_InvalidateDataCache(r->buf, (uint32_t)r->th * r->tw * 4);
-		static const int byteOf[4] = {3, 2, 1, 0}; /* RGBA8 texels are stored A, B, G, R */
+		end_mark(PICA_END_RB_INVAL);
 		const uint32_t bytes = (uint32_t)((r->dh + 3) / 4) * r->tilesPerRow * 32;
 		uint32_t before = 0, after = 0, maxv = 0;
 		const int logIt = s_rbDone % 150 == 0;
 		if (logIt)
 			for (uint32_t k = 0; k < bytes; k++) before += r->dest[k] > 100;
 		if (s_rbDone == 0) rb_dump("cpu", r);
-		/* The texture holds its EFB window with the top row at t = 1, which the PICA stores first
-		 * (pica_tex_upload writes the image's bottom row first): memory row v is EFB row
-		 * wy + v * wh / th. */
-		const float sx = r->w / r->dw, sy = r->h / r->dh;
-		const float ku = r->tw / r->ww, kv = r->th / r->wh;
-		for (int y = 0; y < r->dh; y++) {
-			int v = (int)((r->y + (y + 0.5f) * sy - r->wy) * kv);
-			v = v < 0 ? 0 : v > r->th - 1 ? r->th - 1 : v;
-			const uint8_t* trow = r->buf + (uint32_t)(v >> 3) * rowBytes;
-			uint8_t* drow = r->dest + ((uint32_t)(y >> 2) * r->tilesPerRow) * 32 + (y & 3) * 8;
-			const int vy = v & 7;
-			const int my = (vy & 1) << 1 | (vy & 2) << 2 | (vy & 4) << 3;
-			for (int x = 0; x < r->dw; x++) {
-				int u = (int)((r->x + (x + 0.5f) * sx - r->wx) * ku);
-				u = u < 0 ? 0 : u > r->tw - 1 ? r->tw - 1 : u;
-				const int ux = u & 7;
-				const int m = (ux & 1) | (ux & 2) << 1 | (ux & 4) << 2 | my;
-				const uint8_t* px = trow + ((u >> 3) * 64 + m) * 4;
-				uint8_t val;
-				if (r->chan < 4) val = px[byteOf[r->chan]];
-				else val = (uint8_t)((px[3] * 77 + px[2] * 150 + px[1] * 29) >> 8);
-				drow[(x >> 3) * 32 + (x & 7)] = val;
-			}
-		}
+		readback_rows(r);
 		if (s_rbDone == 0 || s_rbDone == 1 || s_rbDone == 30 || s_rbDone == 300) {
 			char tag[16];
 			snprintf(tag, sizeof tag, "gpu%u", (unsigned)s_rbDone);

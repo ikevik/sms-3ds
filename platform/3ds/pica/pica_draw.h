@@ -229,6 +229,21 @@ uint32_t pica_lost_completions(void);
 uint64_t pica_wait_ticks(void);
 /* Sum of citro3d's GPU drawing time (ms) over the frames begun so far. */
 double pica_gpu_ms_sum(void);
+/* System ticks so far in each part of pica_present's frame end (overlapped frames). */
+enum {
+	PICA_END_PASS,       /* the present pass: the EFB drawn onto the top screen */
+	PICA_END_RINGS,      /* vertex and index rings written back */
+	PICA_END_PARTS,      /* waiting for parts sent mid-frame */
+	PICA_END_SUBMIT,     /* the last command list queued */
+	PICA_END_HEAP_FLUSH, /* the whole linear heap written back */
+	PICA_END_WAIT,       /* waiting for the GPU's previous frame */
+	PICA_END_RB_INVAL,   /* readback buffers' cache invalidated */
+	PICA_END_RB_CONVERT, /* readbacks converted into the game's memory */
+	PICA_END_RB_FETCH,   /* readback buffers allocated, copies from VRAM queued */
+	PICA_END_RUN,        /* screen transfer queued, the queue started */
+	PICA_END_COUNT
+};
+void pica_end_ticks(uint64_t out[PICA_END_COUNT]);
 /* Cycles the GPU test mode (0 normal, 1 game draws scissored to 8x8 pixels); returns the new mode. */
 int pica_cycle_gpu_test(void);
 int pica_gpu_test(void);
@@ -239,6 +254,8 @@ void pica_set_draw_cut(int cut);
 void pica_set_vram_textures(int on);
 /* Checks VRAM texture copies against their originals now and then ([vram] log lines). */
 void pica_set_vram_check(int on);
+/* Writes the goop map readbacks as sdmc:/sms/goop-*.pgm files at readbacks 0, 1, 30 and 300. */
+void pica_set_readback_dumps(int on);
 uint32_t pica_vram_copies(void);
 uint32_t pica_vram_evicted(void);
 uint32_t pica_vram_animated(void);
