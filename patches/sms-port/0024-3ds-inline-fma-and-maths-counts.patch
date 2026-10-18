@@ -1,0 +1,307 @@
+--- a/src/port_fma.h
++++ b/src/port_fma.h
+@@ -36,11 +36,35 @@
+ 	return (float)s;
+ }
+ 
++/* 3DS port: 32-bit ARM without an FMA instruction (the 3DS's VFPv2). newlib's
++ * fmaf there is (float)((double)a * c + b) and its fma is a * c + b, unfused,
++ * each a library call (321 call sites in the MTX/VEC routines and MSL's
++ * maths). These are the same operations inline: the same bits, no call.
++ * fmaf's sum rounds twice, so it differs from the Gekko's single rounding
++ * where port_fmas_soft's check fires, as it did before. */
++#if defined(__arm__) && !defined(__aarch64__) && !defined(__ARM_FEATURE_FMA)
++#define PORT_FMA_VFP 1
++static inline float port_fmaf_vfp(float a, float c, float b) { return (float)((double)a * c + b); }
++static inline double port_fma_vfp(double a, double c, double b) { return a * c + b; }
++#endif
++
+ #if defined(__x86_64__) || defined(__i386__)
+ #define PORT_OPAQUE(x) __asm__("" : "+x"(x))
+ #elif defined(__aarch64__)
+ #define PORT_OPAQUE(x) __asm__("" : "+w"(x))
++#elif defined(__arm__) && defined(__ARM_FP)
++/* 3DS port: in a VFP register ("t" single, "w" double), not through memory
++ * ("+m" stored and reloaded the value at every negated multiply-add). */
++#ifdef __cplusplus
++static inline void port_opaque_vfp(float& x) { __asm__("" : "+t"(x)); }
++static inline void port_opaque_vfp(double& x) { __asm__("" : "+w"(x)); }
++#define PORT_OPAQUE(x) port_opaque_vfp(x)
+ #else
++static inline void port_opaque_vfp_f(float* x) { __asm__("" : "+t"(*x)); }
++static inline void port_opaque_vfp_d(double* x) { __asm__("" : "+w"(*x)); }
++#define PORT_OPAQUE(x) _Generic((x), float: port_opaque_vfp_f, double: port_opaque_vfp_d)(&(x))
++#endif
++#else
+ #define PORT_OPAQUE(x) __asm__("" : "+m"(x))
+ #endif
+ 
+--- a/platform/mtx/mtx.cpp
++++ b/platform/mtx/mtx.cpp
+@@ -144,7 +144,11 @@
+ #else
+ // Other hosts (on arm64 fmaf is an instruction), and the qemu test build.
+ namespace mtx_host {
++#if defined(PORT_FMA_VFP) && !defined(MTX_TEST_QEMU)
++#define FMA(a, c, b) port_fmaf_vfp(a, c, b) // 3DS port: newlib's fmaf, inline (port_fma.h)
++#else
+ #define FMA(a, c, b) fmaf(a, c, b)
++#endif
+ #include "mtx_ps.inc"
+ #include "jsys_ps.inc"
+ #undef FMA
+@@ -152,11 +156,102 @@
+ #define CALL(fn, args) (mtx_host::fn args)
+ #endif
+ 
++#if defined(__3DS__)
++// 3DS port: calls per routine (a PS routine and its C_ name share a count), which
++// platform/3ds/prof_3ds.cpp reports with each routine's cost on sample data
++// (sms_mtx_bench), to show what this exact arithmetic costs a frame.
++enum { kMtxMax = 48 };
++extern "C" {
++unsigned sms_mtx_calls[kMtxMax];
++const char* sms_mtx_names[kMtxMax];
++int sms_mtx_n;
++}
++static void (*s_mtxBench[kMtxMax])();
++static int mtx_reg(int i, const char* name, void (*bench)())
++{
++	sms_mtx_names[i] = name;
++	s_mtxBench[i]    = bench;
++	if (i >= sms_mtx_n)
++		sms_mtx_n = i + 1;
++	return i;
++}
++
++// Sample arguments: each pointer gets a slot of its own in the pool (a few matrices
++// of a rotation with a translation), index arrays are zeros, scalars differ.
++static f32 s_bPool[6][64];
++static const u16 s_bIdx[16] = {};
++static int s_bSlot, s_bScalar;
++static volatile f32 s_bSink;
++template <typename T> struct BArg;
++template <typename T> struct BArg<T*> {
++	static T* get() { return (T*)(void*)s_bPool[s_bSlot++ % 6]; }
++};
++template <> struct BArg<const u16*> {
++	static const u16* get() { return s_bIdx; }
++};
++template <> struct BArg<f32> {
++	static f32 get() { return 0.25f * (f32)(++s_bScalar); }
++};
++template <> struct BArg<char> {
++	static char get() { return 'y'; }
++};
++template <> struct BArg<u32> {
++	static u32 get() { return 4; }
++};
++template <typename R> struct BRun {
++	template <typename F> static void run(F f) { s_bSink = (f32)f(); }
++};
++template <> struct BRun<void> {
++	template <typename F> static void run(F f) { f(); }
++};
++template <typename R, typename... A> static void mtx_benchCall(R (*fn)(A...))
++{
++	s_bSlot = s_bScalar = 0;
++	BRun<R>::run([&] { return fn(BArg<A>::get()...); });
++}
++
++// Runs routine i n times on fresh sample data.
++extern "C" void sms_mtx_bench(int i, int n)
++{
++	static const f32 m[12] = { 0.8f, -0.36f, 0.48f, 12.5f, 0.6f, 0.48f, -0.64f, -3.25f, 0.0f, 0.8f, 0.6f, 7.75f };
++	if (i < 0 || i >= sms_mtx_n || !s_mtxBench[i])
++		return;
++	for (int k = 0; k < 6 * 64; k++)
++		s_bPool[k / 64][k % 64] = m[k % 12];
++	while (n-- > 0)
++		s_mtxBench[i]();
++}
++
++#define DEF(ret, ps, c, fn, params, args) DEF_I(__COUNTER__, ret, ps, c, fn, params, args)
++#define DEF_I(i, ret, ps, c, fn, params, args)                                  \
++	extern "C" ret ps params                                                     \
++	{                                                                            \
++		sms_mtx_calls[i]++;                                                      \
++		return (ret)CALL(fn, args);                                              \
++	}                                                                            \
++	extern "C" ret c params                                                      \
++	{                                                                            \
++		sms_mtx_calls[i]++;                                                      \
++		return (ret)CALL(fn, args);                                              \
++	}                                                                            \
++	static void bench_##fn() { mtx_benchCall(&ps); }                             \
++	static const int reg_##fn = mtx_reg(i, #ps, bench_##fn);
++#define DEF1(ret, name, fn, params, args) DEF1_I(__COUNTER__, ret, name, fn, params, args)
++#define DEF1_I(i, ret, name, fn, params, args)                                  \
++	extern "C" ret name params                                                   \
++	{                                                                            \
++		sms_mtx_calls[i]++;                                                      \
++		return (ret)CALL(fn, args);                                              \
++	}                                                                            \
++	static void bench_##fn() { mtx_benchCall(&name); }                           \
++	static const int reg_##fn = mtx_reg(i, #name, bench_##fn);
++#else
+ #define DEF(ret, ps, c, fn, params, args)                        \
+ 	extern "C" ret ps params { return (ret)CALL(fn, args); }      \
+ 	extern "C" ret c params { return (ret)CALL(fn, args); }
+ #define DEF1(ret, name, fn, params, args) \
+ 	extern "C" ret name params { return (ret)CALL(fn, args); }
++#endif
+ 
+ // --- mtx.c ---
+ DEF(void, PSMTXIdentity, C_MTXIdentity, gMTXIdentity, (Mtx m), (m))
+@@ -220,3 +315,7 @@
+      (t, time0, value0, tangent0, time1, value1, tangent1))
+ DEF1(f32, port_MsVECMag2, gMsVECMag2, (const f32* v), (v))
+ DEF1(void, port_MsVECNormalize, gMsVECNormalize, (const f32* v1, f32* v2), (v1, v2))
++
++#if defined(__3DS__)
++static_assert(__COUNTER__ <= kMtxMax, "kMtxMax: more MTX/VEC routines than counters");
++#endif
+--- a/platform/misc/msl_math.c
++++ b/platform/misc/msl_math.c
+@@ -88,9 +88,25 @@
+  * rounded result, as the Gekko does: fnmsubs gives -0 where a * c == b. */
+ #if (defined(__x86_64__) || defined(__i386__)) && !defined(MSL_MATH_TEST_FMA)
+ #define FMAS(a, c, b) port_fmas_soft(a, c, b)
++#elif defined(PORT_FMA_VFP)
++/* 3DS port: newlib's fmaf and fma, inline (src/port_fma.h). */
++#define FMAS(a, c, b) port_fmaf_vfp(a, c, b)
++#define fma(a, c, b) port_fma_vfp(a, c, b)
+ #else
+ #define FMAS(a, c, b) fmaf(a, c, b)
+ #endif
++
++#if defined(__3DS__)
++/* 3DS port: calls per function, which platform/3ds/prof_3ds.cpp reports with
++ * each function's cost on sample arguments (sms_msl_bench). */
++enum { MSL_COSF, MSL_SINF, MSL_TANF, MSL_ATANF, MSL_ACOSF, MSL_ATAN, MSL_EXPF, MSL_POWF, MSL_FMODF, MSL_SQRTF, MSL_MS_SQRTF, MSL_N };
++unsigned sms_msl_calls[MSL_N];
++const char* const sms_msl_names[MSL_N] = { "cosf", "sinf", "tanf", "atanf", "acosf", "atan", "expf", "powf", "fmodf", "sqrtf", "MsSqrtf" };
++const int sms_msl_n = MSL_N;
++#define MSL_COUNT(k) (sms_msl_calls[k]++)
++#else
++#define MSL_COUNT(k) ((void)0)
++#endif
+ static inline float fmadds(float a, float c, float b) { return FMAS(a, c, b); }
+ static inline float fnmadds(float a, float c, float b)
+ {
+@@ -189,10 +205,15 @@
+ float sms_msl_cosf(float x) { return msl_have_fma() ? sms_msl_cosf_hw(x) : sms_msl_cosf_soft(x); }
+ float sms_msl_sinf(float x) { return msl_have_fma() ? sms_msl_sinf_hw(x) : sms_msl_sinf_soft(x); }
+ #endif
++#if defined(__3DS__)
++float sms_msl_cosf(float x) { MSL_COUNT(MSL_COSF); return sms_msl_cosf_3ds(x); }
++float sms_msl_sinf(float x) { MSL_COUNT(MSL_SINF); return sms_msl_sinf_3ds(x); }
++#endif
+ 
+ /* tanf calls cos(float), then sin(float), and divides. */
+ float sms_msl_tanf(float x)
+ {
++	MSL_COUNT(MSL_TANF);
+ 	float c = sms_msl_cosf(x);
+ 	float s = sms_msl_sinf(x);
+ 	return s / c; /* fdivs */
+@@ -233,6 +254,7 @@
+ 
+ float sms_msl_atanf(float x)
+ {
++	MSL_COUNT(MSL_ATANF);
+ 	const uint32_t sign = f2u(x) & 0x80000000;
+ 	const float ax      = u2f(f2u(x) & 0x7fffffff);
+ 	int index = -1, inv = 0;
+@@ -315,6 +337,7 @@
+ 
+ float sms_msl_acosf(float x)
+ {
++	MSL_COUNT(MSL_ACOSF);
+ 	float r = msl_inv_sqrtf(fnmsubs(x, x, 1.0f));
+ 	return half_pi.f - sms_msl_atanf(x * r);
+ }
+@@ -357,6 +380,7 @@
+ 
+ double sms_msl_atan(double x)
+ {
++	MSL_COUNT(MSL_ATAN);
+ 	const int32_t hx = (int32_t)(d2u(x) >> 32);
+ 	const int32_t ix = hx & 0x7fffffff;
+ 	double z, w, s1, s2, t0, t1, t2, t3, t4;
+@@ -590,6 +614,37 @@
+ #if MSL_FMA_DISPATCH
+ float sms_msl_expf(float x) { return msl_have_fma() ? sms_msl_expf_hw(x) : sms_msl_expf_soft(x); }
+ float sms_msl_powf(float x, float y) { return msl_have_fma() ? sms_msl_powf_hw(x, y) : sms_msl_powf_soft(x, y); }
++#endif
++#if defined(__3DS__)
++float sms_msl_expf(float x) { MSL_COUNT(MSL_EXPF); return sms_msl_expf_3ds(x); }
++float sms_msl_powf(float x, float y) { MSL_COUNT(MSL_POWF); return sms_msl_powf_3ds(x, y); }
++
++/* Runs function k n times on sample arguments. */
++static volatile float s_mslSink;
++void sms_msl_bench(int k, int n)
++{
++	volatile float a = 1.3f, b = 2.3f;
++	float x = a, y = b, r = 0.0f;
++	int i;
++	for (i = 0; i < n; i++) {
++		float v = x + (float)(i & 7) * 0.0625f;
++		switch (k) {
++		case MSL_COSF: r += sms_msl_cosf(v); break;
++		case MSL_SINF: r += sms_msl_sinf(v); break;
++		case MSL_TANF: r += sms_msl_tanf(v * 0.5f); break;
++		case MSL_ATANF: r += sms_msl_atanf(v - 1.0f); break;
++		case MSL_ACOSF: r += sms_msl_acosf(v - 1.0f); break;
++		case MSL_ATAN: r += (float)sms_msl_atan((double)v - 1.0); break;
++		case MSL_EXPF: r += sms_msl_expf(v); break;
++		case MSL_POWF: r += sms_msl_powf(v, y); break;
++		case MSL_FMODF: r += sms_msl_fmodf(v * 5.0f, y); break;
++		case MSL_SQRTF: r += sms_msl_sqrtf(v * 10.0f); break;
++		case MSL_MS_SQRTF: r += sms_ms_sqrtf(v * 10.0f); break;
++		default: return;
++		}
++	}
++	s_mslSink = r;
++}
+ #endif
+ 
+ /* ---- MSL's inline std::fmodf (the weak 0x80109AFC in wireTrap.cpp) ----- */
+@@ -604,6 +659,7 @@
+  * (koopajr.cpp) is the same machine code. */
+ float sms_msl_fmodf(float x, float y)
+ {
++	MSL_COUNT(MSL_FMODF);
+ 	float q, n;
+ 	if (fabsf(y) > fabsf(x))
+ 		return x;
+@@ -628,6 +684,7 @@
+  * 0 * inf is invalid). */
+ float sms_msl_sqrtf(float x)
+ {
++	MSL_COUNT(MSL_SQRTF);
+ 	if (x > 0.0f) {
+ 		if (x < float_huge.f)
+ 			return sqrtf(x);
+@@ -700,6 +757,7 @@
+  * 3.4% (sqrt) and 3.5% (inv_sqrt) of them. */
+ float sms_ms_sqrtf(float x)
+ {
++	MSL_COUNT(MSL_MS_SQRTF);
+ 	if (x > 0.0f) {
+ 		double g = frsqrte((double)x), gg, h, t;
+ 		gg = g * g;
+--- a/platform/misc/msl_math_hot.h
++++ b/platform/misc/msl_math_hot.h
+@@ -25,7 +25,11 @@
+ #undef HOT_FNMADDS
+ #undef HOT_FNMSUBS
+ #else
++#if defined(__3DS__)
++#define MSL_HOT(name) name##_3ds /* 3DS port: msl_math.c counts the calls, then calls these */
++#else
+ #define MSL_HOT(name) name
++#endif
+ #define MSL_HOT_ATTR
+ #define HOT_FMADDS fmadds
+ #define HOT_FNMADDS fnmadds

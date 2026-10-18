@@ -38,6 +38,16 @@ void SMS3DS_ProfRequest(void);
 int SMS3DS_ProfState(void);
 volatile int SMS3DS_ProfCutActive;
 int SMS3DS_ProfCutNow(void);
+// The GameCube's MTX/VEC routines and MSL's maths (patch 0024): calls per routine, and a run of
+// one routine on sample data.
+extern unsigned sms_mtx_calls[];
+extern const char* sms_mtx_names[];
+extern int sms_mtx_n;
+void sms_mtx_bench(int i, int n);
+extern unsigned sms_msl_calls[];
+extern const char* const sms_msl_names[];
+extern const int sms_msl_n;
+void sms_msl_bench(int k, int n);
 }
 
 namespace {
@@ -78,6 +88,14 @@ uint32_t s_phasePuts[PHASES], s_phaseP0;
 // (calibrate): a slow-path call (GXPC_Write8, as the register writers make two or three of) and
 // a byte through the inline path (GXPC_Put8, the vertex writers).
 double s_putUs, s_byteUs;
+// What one call of each maths routine costs on sample data (calibrate), and the call counts at
+// the start of the window.
+enum { kMathMax = 64 };
+double s_mathUs[kMathMax];
+uint32_t s_math0[kMathMax];
+int s_nMath;
+const char* mathName(int i) { return i < sms_mtx_n ? sms_mtx_names[i] : sms_msl_names[i - sms_mtx_n]; }
+uint32_t mathCalls(int i) { return i < sms_mtx_n ? sms_mtx_calls[i] : sms_msl_calls[i - sms_mtx_n]; }
 uint32_t s_phaseEntries[PHASES];
 int s_phase;
 uint64_t s_calls;
@@ -121,6 +139,7 @@ void resetCpu() {
 	s_phaseP0 = GXPC_StreamPuts;
 	s_calls = 0;
 	s_depth = 0;
+	for (int i = 0; i < s_nMath; i++) s_math0[i] = mathCalls(i);
 }
 
 // Writes 4096 NOPs (GX opcode 0x00) to the stream each way and times them. Called with the stream
@@ -137,6 +156,53 @@ void calibrate() {
 	const uint64_t t2 = svcGetSystemTick();
 	s_putUs = double(t1 - t0) / n / kTicksPerMs * 1000.0;
 	s_byteUs = double(t2 - t1) / n / kTicksPerMs * 1000.0;
+	// Each maths routine, 1000 runs (the call counts these add are before the window).
+	s_nMath = sms_mtx_n + sms_msl_n < kMathMax ? sms_mtx_n + sms_msl_n : kMathMax;
+	for (int i = 0; i < s_nMath; i++) {
+		s_mathUs[i] = 0;
+		if (!mathName(i)) continue;
+		const uint64_t a = svcGetSystemTick();
+		if (i < sms_mtx_n) sms_mtx_bench(i, 1000);
+		else sms_msl_bench(i - sms_mtx_n, 1000);
+		s_mathUs[i] = double(svcGetSystemTick() - a) / 1000.0 / kTicksPerMs * 1000.0;
+	}
+}
+
+// Maths routines by estimated time: calls in the window times the cost of a call on sample data.
+void reportMath(double frames) {
+	int order[kMathMax], n = 0;
+	double ms[kMathMax], calls[kMathMax], all = 0, allCalls = 0;
+	for (int i = 0; i < s_nMath; i++) {
+		if (!mathName(i)) continue;
+		calls[i] = double(uint32_t(mathCalls(i) - s_math0[i])) / frames;
+		ms[i] = calls[i] * s_mathUs[i] / 1000.0;
+		all += ms[i];
+		allCalls += calls[i];
+		order[n++] = i;
+	}
+	for (int a = 1; a < n; a++)  // by ms, largest first
+		for (int b = a; b > 0 && ms[order[b]] > ms[order[b - 1]]; b--) {
+			const int t = order[b];
+			order[b] = order[b - 1];
+			order[b - 1] = t;
+		}
+	fprintf(stderr,
+	        "[prof]   maths routines (MTX/VEC and MSL, exact Gekko arithmetic): %.0f calls/frame, about %.2f "
+	        "ms/frame (calls x the cost of one call on sample data):\n",
+	        allCalls, all);
+	char line[512];
+	int at = 0, shown = 0;
+	for (int k = 0; k < n; k++) {
+		const int i = order[k];
+		if (calls[i] < 0.5) continue;
+		at += snprintf(line + at, sizeof line - at, "%s %s %.0f x %.2f us = %.2f ms", at ? " |" : "", mathName(i),
+		               calls[i], s_mathUs[i], ms[i]);
+		if (++shown % 4 == 0) {
+			fprintf(stderr, "[prof]   %s\n", line);
+			at = 0;
+		}
+	}
+	if (at) fprintf(stderr, "[prof]   %s\n", line);
 }
 
 // What the profiler's own two tick reads cost per object, measured: subtracted from the totals.
@@ -231,6 +297,7 @@ void reportCpu(double frames, double frameMs) {
 		fprintf(stderr, "[prof]   %7.0fv %6.2f ms %-15s vt %08lx \"%s\"\n", e->verts / frames, e->ticks * per,
 		        kPhaseName[e->phase], (unsigned long)uintptr_t(e->vt), name);
 	}
+	reportMath(frames);
 }
 
 // Part 3: steps alternate a normal-drawing measurement with kPerBase targets; nullptr in
