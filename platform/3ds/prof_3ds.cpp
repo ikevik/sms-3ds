@@ -82,11 +82,12 @@ uint32_t s_phaseEntries[PHASES];
 int s_phase;
 uint64_t s_calls;
 
-// state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part, 4 GPU by object
+// state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 5 GPU
+// part (positions collapsed), 6 GPU part (no draws), 4 GPU by object
 volatile int s_request;
 int s_state, s_frame;
 uint64_t s_winStart;
-double s_gpu0, s_cpuFrameMs, s_cpuGpuMs;
+double s_gpu0, s_cpuFrameMs, s_cpuGpuMs, s_gpuCutMs, s_gpuCollapsedMs, s_cutFrame, s_collapsedFrame;
 
 Entry* lookup(const void* vt, int phase, const char* name) {
 	// JDrama::TDrawBufObj (every "DrawBuf ..." object) draws a whole buffer of models: one entry
@@ -317,7 +318,9 @@ void SMS3DS_ProfRequest(void) {
 }
 
 // 0 idle, 1 CPU part, 2 GPU part (for the status screen)
-int SMS3DS_ProfState(void) { return s_state == 4 ? 3 : s_state == 3 ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0; }
+int SMS3DS_ProfState(void) {
+	return s_state == 4 ? 3 : (s_state == 3 || s_state == 5 || s_state == 6) ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0;
+}
 
 void SMS3DS_ProfPhase(int phase) {
 	const uint64_t now = svcGetSystemTick();
@@ -382,8 +385,8 @@ void SMS3DS_ProfFrame(void) {
 		s_state = 2;
 		s_frame = 0;
 		fprintf(stderr,
-		        "[prof] profile run: %d frames timed, then %d with pixels cut to 8x8, then objects' pixels cut one at a "
-		        "time (stand still)\n",
+		        "[prof] profile run: %d frames timed, then %d each with pixels cut to 8x8, positions collapsed and no "
+		        "draws, then objects' pixels cut one at a time (stand still)\n",
 		        kFrames, kFrames);
 		return;
 	case 2:  // CPU part
@@ -405,17 +408,40 @@ void SMS3DS_ProfFrame(void) {
 		}
 		return;
 	case 3:  // GPU part, pixels cut to 8x8
+	case 5:  // positions collapsed
+	case 6:  // no draws
 		if (++s_frame == kSettle) {
 			s_winStart = now;
 			s_gpu0 = pica_gpu_ms_sum();
 		} else if (s_frame == kSettle + kFrames) {
 			const double frameMs = double(now - s_winStart) / kFrames / kTicksPerMs;
-			const double gpuCut = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
+			const double gpuMs = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
+			if (s_state == 3) {
+				s_gpuCutMs = gpuMs;
+				s_cutFrame = frameMs;
+				pica_set_gpu_test(2);
+				s_state = 5;
+				s_frame = 0;
+				return;
+			}
+			if (s_state == 5) {
+				s_gpuCollapsedMs = gpuMs;
+				s_collapsedFrame = frameMs;
+				pica_set_gpu_test(3);
+				s_state = 6;
+				s_frame = 0;
+				return;
+			}
 			pica_set_gpu_test(0);
+			const double gpuCut = s_gpuCutMs;
 			fprintf(stderr,
 			        "[prof] GPU: %.1f ms/frame drawing normally (frame %.1f ms), %.1f with pixels cut to 8x8 (frame %.1f "
-			        "ms): pixels about %.1f ms, vertices and triangle setup about %.1f ms\n",
-			        s_cpuGpuMs, s_cpuFrameMs, gpuCut, frameMs, s_cpuGpuMs - gpuCut, gpuCut);
+			        "ms), %.1f with positions collapsed (frame %.1f), %.1f with no draws (frame %.1f)\n",
+			        s_cpuGpuMs, s_cpuFrameMs, gpuCut, s_cutFrame, s_gpuCollapsedMs, s_collapsedFrame, gpuMs, frameMs);
+			fprintf(stderr,
+			        "[prof] GPU split: pixels %.1f ms | clipping, triangle setup, rasterising %.1f ms | vertex fetch and "
+			        "shading %.1f ms | the rest (state, commands, copies, the present) %.1f ms\n",
+			        s_cpuGpuMs - gpuCut, gpuCut - s_gpuCollapsedMs, s_gpuCollapsedMs - gpuMs, gpuMs);
 			// Part 3 needs the objects' open/close calls (the entries stay as part 1 left them).
 			pickTargets();
 			fprintf(stderr,

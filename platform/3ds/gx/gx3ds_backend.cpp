@@ -334,7 +334,7 @@ static void perfFrameEnd() {
 	s_gpuMs0 = pica_gpu_ms_sum();
 	fprintf(stderr, "[perf]   gpu wait (%s): %.1f ms/frame, counted in the renderer's own time | GPU drawing "
 	        "%.1f ms/frame after the last part | %.1f parts sent mid-frame, %lu lost completions so far | test: %s, "
-	        "colours %s\n", pica_overlap() ? "frame end, frames overlapped" : "C3D_FrameBegin", waitMs, gpuMs, splits, (unsigned long)pica_lost_completions(), pica_gpu_test() ? "pixels cut to 8x8" : "off",
+	        "colours %s\n", pica_overlap() ? "frame end, frames overlapped" : "C3D_FrameBegin", waitMs, gpuMs, splits, (unsigned long)pica_lost_completions(), pica_gpu_test() == 1 ? "pixels cut to 8x8" : pica_gpu_test() == 2 ? "positions collapsed" : pica_gpu_test() == 3 ? "no draws" : "off",
 	        debugColorMode() == 1 ? "debug (no textures)" : debugColorMode() == 2 ? "opaque (no blending)" : "material");
 	fprintf(stderr,
 	        "[perf] frame %.1f ms (%.1f fps) | tex %.2f tev %.2f xform %.2f submit %.2f copy %.2f present %.2f | "
@@ -460,6 +460,16 @@ static void perfFrameEnd() {
 		        unsigned(ringPeak >> 10), unsigned(pica_ring_capacity() >> 10), unsigned(pica_cmd_peak() >> 10),
 		        unsigned(pica_cmd_capacity() >> 10), (unsigned long)pica_dropped(),
 		        (unsigned long)dropRing, (unsigned long)dropCmd, unsigned(pica_linear_free() >> 10));
+		{
+			static uint32_t st0[6];
+			uint32_t st[6];
+			pica_state_stats(st);
+			fprintf(stderr, "[perf]   GPU state sent per frame: %.0f draws, %.0f texture binds, %.0f combiner stages, %.0f "
+			        "matrix rows, %.0f other uniform vectors, %.0f bool uniforms\n", (st[5] - st0[5]) / frames,
+			        (st[0] - st0[0]) / frames, (st[1] - st0[1]) / frames, (st[2] - st0[2]) / frames,
+			        (st[3] - st0[3]) / frames, (st[4] - st0[4]) / frames);
+			memcpy(st0, st, sizeof st0);
+		}
 		{
 			uint32_t vKB, vN, lKB, lN, vFree, aUsed, aPeak, aSize;
 			pica_tex_stats(&vKB, &vN, &lKB, &lN, &vFree);

@@ -9,11 +9,17 @@
 ; cpu = false: GameCube vertices as the GX front half decoded them, transformed here.
 ;   v0 position (x, y, z), v1 normal, v2 the colour channel's colour (0..255), v3-v5 up to three
 ;   texture coordinate attributes (s, t), v6 the position matrix row index (GX PNMTX: 0, 3, ..27).
-;   P: position matrix rows 0-29 (XF memory words 0-119), N: normal matrix rows 0-29 (3x3, w 0).
+;   P: position matrix rows 0-29 (XF memory words 0-119). N[3k]: matrix k's light vector (the
+;   CPU's: the light direction LD taken into model space through normal matrix k, divided by its
+;   scale, times 0.65 LD.w), so N[3k] . normal is 0.65 LD.w (N.LD)/|N| for the unit model normals
+;   of models scaled alike on every axis; N[3k+1], N[3k+2] are unused.
 ;   F: view space -> clip (GX projection, viewport and the PICA projection, composed on the CPU).
 ;   Texture unit u: source = W[2u].x pos + W[2u].y normal + W[2u].z v3 + W[2u].w v4 + W[2u+1].x v5,
 ;   coordinate = (T[2u] . source, T[2u+1] . source) (texgen, texture/post matrix, EFB copy rect).
-;   Colour = v2 / 255 * CS + CM, rgb times the shade 1 + LD.w * (0.35 + 0.65 max(N.LD, 0) - 1).
+;   Colour = v2 / 255 * CS + CM, rgb times the shade 1 + LD.w * (0.35 + 0.65 max(N.LD, 0) - 1),
+;   computed as LD.x + max(N[idx] . normal, 0) with LD.x = 1 - 0.65 LD.w (one dp3: the normal's
+;   transform, its normalisation and the shade's 17 dependent instructions cost the GPU ~14 ns an
+;   index, as much as the rest of the shader).
 ;   Per draw, work that would not change the result is skipped (most of the shader's cost): lit
 ;   (the shade, else 1), tuN (texture unit N is used, else its coordinate is 0) and tdN (unit N's
 ;   source is exactly attribute v(3+N), so the coordinate is (T[2N] . v, T[2N+1] . v)).
@@ -83,22 +89,9 @@
 
 		; shade from the view-space normal (one fixed light, as the CPU path)
 		ifu lit
-			mov r2.xyz, v1
-			mov r2.w, k0.y
-			dp4 r3.x, N[a0.x], r2
-			dp4 r3.y, N[a0.x+1], r2
-			dp4 r3.z, N[a0.x+2], r2
-			dp3 r4.x, r3, r3
-			max r4.x, k1.yyyy, r4.x
-			rsq r4.x, r4.x
-			mul r3.xyz, r4.xxx, r3.xyz
-			dp3 r4.y, LD, r3
+			dp3 r4.y, N[a0.x], v1
 			max r4.y, k0.yyyy, r4.y
-			mul r4.y, k0.wwww, r4.y
-			add r4.y, k0.zzzz, r4.y
-			add r4.y, -k0.xxxx, r4.y
-			mul r4.y, LD.wwww, r4.y
-			add r4.y, k0.xxxx, r4.y
+			add r4.y, LD.xxxx, r4.y
 			mul r5.xyz, r4.yyy, r5.xyz
 		.end
 		mov outclr, r5

@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include "gx_pass_shbin.h"
+#include "vshader_shbin.h" /* the bring-up shader: [vbench] I1 (two outputs) */
 
 #define DISPLAY_TRANSFER_FLAGS                                                                     \
 	(GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |                 \
@@ -672,9 +673,11 @@ static void end_mark(int part)
 }
 void pica_end_ticks(uint64_t out[PICA_END_COUNT]) { memcpy(out, s_endTicks, sizeof s_endTicks); }
 
-/* GPU test (pica_cycle_gpu_test): 1 scissors every game draw to 8x8 pixels, so the GPU still
- * transforms every vertex but shades almost no pixels. Comparing its GPU time with the normal
- * mode's tells vertex work from pixel work. */
+/* GPU test (pica_cycle_gpu_test, the profiler): 1 scissors every game draw to 8x8 pixels, so the
+ * GPU still transforms every vertex but shades almost no pixels; 2 (GX-mode draws) puts every
+ * vertex at one point, so they are still fetched and shaded but nothing is clipped, set up or
+ * drawn; 3 sends every GX-mode draw's setup but not the draw. The steps between their GPU times
+ * are pixels, clipping and triangle setup, vertex work, and what is left (state, copies). */
 static int s_gpuTest;
 int pica_cycle_gpu_test(void)
 {
@@ -1179,10 +1182,20 @@ static u64 s_gxPerm;
 /* Sets a vertex shader uniform only if it changed: citro3d uploads every vector marked dirty, and
  * a draw used to rewrite all 60 matrix rows and 19 other vectors (about 1.3 KB of GPU commands)
  * though usually one matrix had moved. C3D_FVUnif holds the values last set. */
+/* GPU state sent, for [perf] (pica_state_stats): texture binds, combiner stages, matrix-row
+ * uniforms, other uniform vectors, bool uniforms, draws (second passes too). */
+enum { ST_TEXBIND, ST_STAGE, ST_ROWS, ST_UNIF, ST_BOOL, ST_DRAW, ST_COUNT };
+static uint32_t s_stat[ST_COUNT];
+void pica_state_stats(uint32_t out[6]) { memcpy(out, s_stat, sizeof s_stat); }
+
 static inline void vunif(int id, float x, float y, float z, float w)
 {
 	const C3D_FVec* v = &C3D_FVUnif[GPU_VERTEX_SHADER][id];
-	if (v->x != x || v->y != y || v->z != z || v->w != w) C3D_FVUnifSet(GPU_VERTEX_SHADER, id, x, y, z, w);
+	if (v->x != x || v->y != y || v->z != z || v->w != w) {
+		C3D_FVUnifSet(GPU_VERTEX_SHADER, id, x, y, z, w);
+		s_stat[(id >= s_uP && id < s_uP + PICA_GX_MTX_ROWS) || (id >= s_uN && id < s_uN + PICA_GX_MTX_ROWS) ? ST_ROWS
+		                                                                                                    : ST_UNIF]++;
+	}
 }
 
 static inline int vzero(const float* v) { return v[0] == 0.f && v[1] == 0.f && v[2] == 0.f && v[3] == 0.f; }
@@ -1191,7 +1204,10 @@ static inline int vzero(const float* v) { return v[0] == 0.f && v[1] == 0.f && v
 static inline void bunif(int id, bool v)
 {
 	if (s_skipOff || (((C3D_BoolUnifs[GPU_VERTEX_SHADER] >> (id - 0x68)) & 1) != 0) != v)
+	{
 		C3D_BoolUnifSet(GPU_VERTEX_SHADER, id, v);
+		s_stat[ST_BOOL]++;
+	}
 }
 
 /* The vertex buffer for the next draws, set only if it changed: touching the setup re-sends the
@@ -1235,6 +1251,32 @@ static void gx_shortcuts(const PicaGxUniforms* u)
 	}
 }
 
+/* The shader's light vectors (gx_pass.v.pica): N[3k] = 0.65 LD.w M_k^T LD / s_k for normal matrix
+ * M_k (rows 3k..3k+2) and s_k its scale (the mean of its rows' lengths), so one dp3 with a unit model
+ * normal gives the shade's N.LD term. A slot is worked out again only when its rows or LD changed. */
+static float s_lnRows[PICA_GX_MTX_ROWS / 3][9], s_lnLD[4];
+static uint8_t s_lnValid[PICA_GX_MTX_ROWS / 3];
+static void gx_light_vectors(const float (*nrm_rows)[4], const float LD[4])
+{
+	if (memcmp(LD, s_lnLD, sizeof s_lnLD) != 0) {
+		memcpy(s_lnLD, LD, sizeof s_lnLD);
+		memset(s_lnValid, 0, sizeof s_lnValid);
+	}
+	const float a = 0.65f * LD[3];
+	for (int k = 0; k < PICA_GX_MTX_ROWS / 3; k++) {
+		float m[9];
+		for (int i = 0; i < 3; i++) memcpy(&m[3 * i], nrm_rows[3 * k + i], 12);
+		if (s_lnValid[k] && memcmp(m, s_lnRows[k], sizeof m) == 0) continue;
+		memcpy(s_lnRows[k], m, sizeof m);
+		s_lnValid[k] = 1;
+		const float s = (sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) + sqrtf(m[3] * m[3] + m[4] * m[4] + m[5] * m[5]) +
+		                 sqrtf(m[6] * m[6] + m[7] * m[7] + m[8] * m[8])) / 3.0f;
+		const float f = s > 1e-20f ? a / s : 0.0f;
+		vunif(s_uN + 3 * k, f * (LD[0] * m[0] + LD[1] * m[3] + LD[2] * m[6]), f * (LD[0] * m[1] + LD[1] * m[4] + LD[2] * m[7]),
+		      f * (LD[0] * m[2] + LD[1] * m[5] + LD[2] * m[8]), 0.0f);
+	}
+}
+
 /* The setup a GX-mode draw needs (attribute loaders, state, uniforms, shortcuts, buffer): 0 when the
  * layout cannot be expressed. */
 static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, int matrices_dirty,
@@ -1247,7 +1289,9 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	(void)nverts;
 	if (!s_in_frame || nidx == 0) return 1;
 	if (!gx_setup(verts, L, u, matrices_dirty, pos_rows, nrm_rows, st)) return 0;
+	if (s_gpuTest == 3) return 1;  /* the setup without the draw */
 	s_frameDraws++;
+	s_stat[ST_DRAW]++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
 	gpu_check("GPU-transform draw", L, nidx, st);
@@ -1277,14 +1321,17 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 		matrices_dirty = matrices_dirty || !s_gxMatricesLoaded;
 	}
 	apply_state(st);
+	if (!s_gxMatricesLoaded) memset(s_lnValid, 0, sizeof s_lnValid);  /* uniforms set elsewhere (self-test, [vbench]) */
 	if (matrices_dirty || !s_gxMatricesLoaded) {
-		for (int r = 0; r < PICA_GX_MTX_ROWS; r++) {
+		for (int r = 0; r < PICA_GX_MTX_ROWS; r++)
 			vunif(s_uP + r, pos_rows[r][0], pos_rows[r][1], pos_rows[r][2], pos_rows[r][3]);
-			vunif(s_uN + r, nrm_rows[r][0], nrm_rows[r][1], nrm_rows[r][2], 0.0f);
-		}
 		s_gxMatricesLoaded = 1;
 	}
-	for (int r = 0; r < 4; r++) vunif(s_uF + r, u->F[r][0], u->F[r][1], u->F[r][2], u->F[r][3]);
+	if (u->LD[3] != 0.0f) gx_light_vectors(nrm_rows, u->LD);
+	if (s_gpuTest == 2)
+		for (int r = 0; r < 4; r++) vunif(s_uF + r, 0.0f, 0.0f, 0.0f, r == 3 ? 1.0f : 0.0f);
+	else
+		for (int r = 0; r < 4; r++) vunif(s_uF + r, u->F[r][0], u->F[r][1], u->F[r][2], u->F[r][3]);
 	s_fIsCpu = 0;
 	for (int r = 0; r < 6; r++) {
 		vunif(s_uT + r, u->T[r][0], u->T[r][1], u->T[r][2], u->T[r][3]);
@@ -1292,7 +1339,7 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 	}
 	vunif(s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
 	vunif(s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
-	vunif(s_uLD, u->LD[0], u->LD[1], u->LD[2], u->LD[3]);
+	vunif(s_uLD, 1.0f - 0.65f * u->LD[3], 0.0f, 0.0f, u->LD[3]);  /* the shade's offset (gx_light_vectors) */
 	gx_shortcuts(u);
 	set_buffer(verts, L->stride, s_gxEntries, s_gxPerm);
 	return 1;
@@ -1323,6 +1370,7 @@ static void second_pass(GPU_Primitive_t prim, int count, const void* idx, const 
 {
 	if (!st->alpha_test2) return;
 	C3D_AlphaTest(true, (GPU_TESTFUNC)st->alpha_func2, st->alpha_ref2);
+	s_stat[ST_DRAW]++;
 	C3D_DrawElements(prim, count, C3D_UNSIGNED_SHORT, idx);
 	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
 }
@@ -1391,6 +1439,7 @@ static void apply_state(const PicaState* st)
 		}
 		if (s_boundValid[u] && s_boundGen[u] == s_texGen && memcmp(tex, &s_boundTex[u], sizeof *tex) == 0) continue;
 		C3D_TexBind(u, tex);
+		s_stat[ST_TEXBIND]++;
 		s_boundTex[u] = *tex;
 		s_boundGen[u] = s_texGen;
 		s_boundValid[u] = 1;
@@ -1416,7 +1465,10 @@ static void apply_state(const PicaState* st)
 		}
 	} else {
 		for (int i = 0; i < n; i++)
-			if (i >= ln || memcmp(&st->stage[i], &L->stage[i], sizeof st->stage[i]) != 0) set_stage(i, &st->stage[i]);
+			if (i >= ln || memcmp(&st->stage[i], &L->stage[i], sizeof st->stage[i]) != 0) {
+				set_stage(i, &st->stage[i]);
+				s_stat[ST_STAGE]++;
+			}
 		const int to = L ? (ln > n ? ln : n) : PICA_MAX_STAGES;
 		for (int i = n; i < to; i++) C3D_TexEnvInit(C3D_GetTexEnv(i));
 		if (ln <= 0 || st->buf_rgb != L->buf_rgb || st->buf_alpha != L->buf_alpha) {
@@ -1463,6 +1515,7 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 	cpu_mode();
 	set_buffer(verts, sizeof(PicaVtx), 5, 0x43210);
 	s_frameDraws++;
+	s_stat[ST_DRAW]++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
 	gpu_check("CPU-path draw", NULL, nidx, st);
@@ -2256,6 +2309,7 @@ enum { VB_GRID = 128, VB_VERTS = VB_GRID * VB_GRID, VB_IDX = (VB_GRID - 1) * (VB
 enum { VB_UNIQUE_TRIS = 10922 };
 
 struct VbField { int reg, fmt, count, bytes; };
+static C3D_Tex s_vbTex[2];  /* setup G3's two textures */
 
 /* Attribute loaders for fields in memory order (no gaps), the rest of the GX registers fixed. */
 static int vb_attribs(const struct VbField* f, int nf, u64* perm)
@@ -2352,7 +2406,26 @@ static void vb_run(const char* name, const void* verts, int stride, const struct
 	for (int r = 0; r < reps; r++)
 		for (int at = 0; at < nidx; at += chunk) {
 			if (!cmd_room()) break;
-			if (touch) C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCM, 0, 0, 0, (float)(draws & 1) * (1.0f / 512));
+			if (touch == 1) C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCM, 0, 0, 0, (float)(draws & 1) * (1.0f / 512));
+			if (touch == 2) /* a matrix's rows, as each object's draw loads PNMTX0 */
+				for (int r = 0; r < 3; r++) {
+					const float k = 1.0f + (float)(draws & 1) * (1.0f / 4096);
+					C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uP + r, (r == 0) * k * pscale, (r == 1) * k * pscale,
+					              (r == 2) * k * pscale, 0.0f);
+					C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uN + r, r == 0, r == 1, r == 2, 0.0f);
+				}
+			if (touch == 3 && s_vbTex[0].data) { /* a texture bound and the combiner set, as a material change */
+				C3D_TexBind(0, &s_vbTex[draws & 1]);
+				C3D_TexEnv* env = C3D_GetTexEnv(0);
+				C3D_TexEnvInit(env);
+				if (draws & 1) {
+					C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR, 0);
+					C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+				} else {
+					C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, 0, 0);
+					C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+				}
+			}
 			const int n = nidx - at < chunk ? nidx - at : chunk;
 			C3D_DrawElements(GPU_TRIANGLES, n, C3D_UNSIGNED_SHORT, idx + at);
 			draws++;
@@ -2366,6 +2439,54 @@ static void vb_run(const char* name, const void* verts, int stride, const struct
 		fprintf(stderr, "[vbench] %-44s %6.2f ms  %5.0f ns/index  (%d draws, %.0fK indices, stride %d)\n", name, ms,
 		        ms * 1e6 / n, draws, n / 1000.0, stride);
 	fflush(stderr);
+}
+
+/* I1: the bring-up shader (position and colour in, the same out) over 16-byte vertices (f32
+ * position, u8 colour), its projection uniform the EFB projection: what fewer outputs save. */
+static void vb_run_min(const char* name, const void* verts, const uint16_t* idx, int nidx, int reps)
+{
+	DVLB_s* dvlb = DVLB_ParseFile((u32*)vshader_shbin, vshader_shbin_size);
+	if (!dvlb) return;
+	shaderProgram_s prog;
+	shaderProgramInit(&prog);
+	shaderProgramSetVsh(&prog, &dvlb->DVLE[0]);
+	C3D_BindProgram(&prog);
+	C3D_AttrInfo* ai = C3D_GetAttrInfo();
+	AttrInfo_Init(ai);
+	AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3);
+	AttrInfo_AddLoader(ai, 1, GPU_UNSIGNED_BYTE, 4);
+	PicaGxUniforms u;
+	memset(&u, 0, sizeof u);
+	static const float ident[4][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+	pica_gx_projection(ident, &u);
+	const int l = shaderInstanceGetUniformLocation(prog.vertexShader, "projection");
+	for (int r = 0; r < 4 && l >= 0; r++) C3D_FVUnifSet(GPU_VERTEX_SHADER, l + r, u.F[r][0], u.F[r][1], u.F[r][2], u.F[r][3]);
+	PicaState st;
+	memset(&st, 0, sizeof st);
+	st.write_mask = 0x0F;
+	st.depth_func = GPU_ALWAYS;
+	st.alpha_func = GPU_ALWAYS;
+	st.cull = GPU_CULL_NONE;
+	st.blend_eq = st.blend_aeq = GPU_BLEND_ADD;
+	st.blend_src = st.blend_asrc = GPU_ONE;
+	st.blend_dst = st.blend_adst = GPU_ZERO;
+	s_last_valid = 0;
+	apply_state(&st);
+	s_bufValid = 0;
+	set_buffer(verts, 16, 2, 0x10);
+	for (int r = 0; r < reps; r++) C3D_DrawElements(GPU_TRIANGLES, nidx, C3D_UNSIGNED_SHORT, idx);
+	selftest_end();
+	const double ms = vb_wait();
+	fprintf(stderr, "[vbench] %-44s %6.2f ms  %5.0f ns/index  (%d draws, %.0fK indices, stride 16)\n", name, ms,
+	        ms * 1e6 / ((double)nidx * reps), reps, nidx * reps / 1000.0);
+	fflush(stderr);
+	C3D_BindProgram(&s_prog);
+	shaderProgramFree(&prog);
+	DVLB_Free(dvlb);
+	s_mode = MODE_NONE;
+	s_gxLayoutValid = 0;
+	s_gxMatricesLoaded = 0;
+	s_fIsCpu = 0;
 }
 
 void pica_vertex_bench(void)
@@ -2386,6 +2507,9 @@ void pica_vertex_bench(void)
 	struct V24m { float pos[3]; int8_t nrm[4]; uint8_t clr[4]; int16_t t0[2]; };
 	/* the game's usual decoded layout without matrix indices: f32 position, normal, colour, one coordinate (36) */
 	struct V36 { float pos[3], nrm[3]; uint8_t clr[4]; float t0[2]; };
+	/* position and colour only (16): I1, I2 */
+	struct V16 { float pos[3]; uint8_t clr[4]; };
+	static const struct VbField f16[] = {{REG_POS, GPU_FLOAT, 3, 12}, {REG_CLR, GPU_UNSIGNED_BYTE, 4, 4}};
 	static const struct VbField f24m[] = {{REG_POS, GPU_FLOAT, 3, 12}, {REG_NRM, GPU_BYTE, 4, 4},
 	                                      {REG_CLR, GPU_UNSIGNED_BYTE, 4, 4}, {REG_TA, GPU_SHORT, 2, 4}};
 	static const struct VbField f36[] = {{REG_POS, GPU_FLOAT, 3, 12}, {REG_NRM, GPU_FLOAT, 3, 12},
@@ -2400,9 +2524,10 @@ void pica_vertex_bench(void)
 	struct V56* uniq56 = (struct V56*)linearAlloc(uniqueVerts * sizeof(struct V56));
 	struct V24m* lin24m = (struct V24m*)linearAlloc(VB_VERTS * sizeof(struct V24m));
 	struct V36* lin36 = (struct V36*)linearAlloc(VB_VERTS * sizeof(struct V36));
+	struct V16* lin16 = (struct V16*)linearAlloc(VB_VERTS * sizeof(struct V16));
 	uint16_t* idx = (uint16_t*)linearAlloc(VB_IDX * 2);
 	uint16_t* seq = (uint16_t*)linearAlloc(uniqueVerts * 2);
-	if (!lin56 || !lin24 || !vram56 || !vram24 || !uniq56 || !lin24m || !lin36 || !idx || !seq) {
+	if (!lin56 || !lin24 || !vram56 || !vram24 || !uniq56 || !lin24m || !lin36 || !lin16 || !idx || !seq) {
 		fprintf(stderr, "[vbench] not enough memory; skipped\n");
 		goto out;
 	}
@@ -2441,6 +2566,8 @@ void pica_vertex_bench(void)
 			memcpy(d->nrm, a->nrm, 12);
 			memcpy(d->clr, a->clr, 4);
 			memcpy(d->t0, a->t0, 8);
+			memcpy(lin16[y * VB_GRID + x].pos, a->pos, 12);
+			memcpy(lin16[y * VB_GRID + x].clr, a->clr, 4);
 		}
 	{
 		int n = 0;
@@ -2461,6 +2588,7 @@ void pica_vertex_bench(void)
 	GSPGPU_FlushDataCache(uniq56, uniqueVerts * sizeof(struct V56));
 	GSPGPU_FlushDataCache(lin24m, VB_VERTS * sizeof(struct V24m));
 	GSPGPU_FlushDataCache(lin36, VB_VERTS * sizeof(struct V36));
+	GSPGPU_FlushDataCache(lin16, VB_VERTS * sizeof(struct V16));
 	GSPGPU_FlushDataCache(idx, VB_IDX * 2);
 	GSPGPU_FlushDataCache(seq, uniqueVerts * 2);
 	s_mode = MODE_NONE;
@@ -2482,14 +2610,34 @@ void pica_vertex_bench(void)
 	vb_run("D2 f32 pos + s8/s16 24B, FCRAM (game packed)", lin24m, 24, f24m, 4, idx, VB_IDX, R, 0, 0, 1.0f, 1, 1,
 	       GPU_CULL_NONE);
 	vb_run("D3 f32 36B, FCRAM (game decoded)", lin36, 36, f36, 4, idx, VB_IDX, R, 0, 0, 1.0f, 1, 1, GPU_CULL_NONE);
+	vb_run("D3s as D3, shortest shader (no light, no tex)", lin36, 36, f36, 4, idx, VB_IDX, R, 0, 0, 1.0f, 0, 0,
+	       GPU_CULL_NONE);
+	vb_run("D3l as D3, light only", lin36, 36, f36, 4, idx, VB_IDX, R, 0, 0, 1.0f, 1, 0, GPU_CULL_NONE);
+	vb_run("D3t as D3, tex0 only", lin36, 36, f36, 4, idx, VB_IDX, R, 0, 0, 1.0f, 0, 1, GPU_CULL_NONE);
 	vb_run("D4 as D2, draws of 252, uniform set each", lin24m, 24, f24m, 4, idx, VB_IDX, R, 252, 1, 1.0f, 1, 1,
 	       GPU_CULL_NONE);
 	vb_run("D5 as D3, draws of 252, uniform set each", lin36, 36, f36, 4, idx, VB_IDX, R, 252, 1, 1.0f, 1, 1,
 	       GPU_CULL_NONE);
+	vb_run("I2 f32 pos + colour 16B, game shader (6 outputs)", lin16, 16, f16, 2, idx, VB_IDX, R, 0, 0, 1.0f, 0, 0,
+	       GPU_CULL_NONE);
+	vb_run_min("I1 the same, a 2-output shader", lin16, idx, VB_IDX, R);
 	vb_run("F  no vertex shared (no reuse)", uniq56, 56, f56, 7, seq, (int)uniqueVerts, R * 3, 0, 0, 1.0f, 1, 1,
 	       GPU_CULL_NONE);
 	vb_run("G  draws of 252 indices, uniform set each", lin56, 56, f56, 7, idx, VB_IDX, R, 252, 1, 1.0f, 1, 1,
 	       GPU_CULL_NONE);
+	vb_run("G2 as G, a matrix's 6 rows set each", lin56, 56, f56, 7, idx, VB_IDX, R, 252, 2, 1.0f, 1, 1, GPU_CULL_NONE);
+	if (C3D_TexInit(&s_vbTex[0], 64, 64, GPU_RGBA8) && C3D_TexInit(&s_vbTex[1], 64, 64, GPU_RGBA8)) {
+		memset(s_vbTex[0].data, 0x80, s_vbTex[0].size);
+		memset(s_vbTex[1].data, 0xC0, s_vbTex[1].size);
+		GSPGPU_FlushDataCache(s_vbTex[0].data, s_vbTex[0].size);
+		GSPGPU_FlushDataCache(s_vbTex[1].data, s_vbTex[1].size);
+		vb_run("G3 as G, a texture bound + combiner set each", lin56, 56, f56, 7, idx, VB_IDX, R, 252, 3, 1.0f, 1, 1,
+		       GPU_CULL_NONE);
+		C3D_TexDelete(&s_vbTex[0]);
+		C3D_TexDelete(&s_vbTex[1]);
+		memset(s_vbTex, 0, sizeof s_vbTex);
+		passthrough_from(0);
+	}
 	vb_run("H  every triangle culled (back faces)", lin56, 56, f56, 7, idx, VB_IDX, R, 0, 0, 1.0f, 1, 1,
 	       GPU_CULL_BACK_CCW);
 	vb_run("H' every triangle culled (front faces)", lin56, 56, f56, 7, idx, VB_IDX, R, 0, 0, 1.0f, 1, 1,
@@ -2503,6 +2651,7 @@ out:
 	if (uniq56) linearFree(uniq56);
 	if (lin24m) linearFree(lin24m);
 	if (lin36) linearFree(lin36);
+	if (lin16) linearFree(lin16);
 	if (idx) linearFree(idx);
 	if (seq) linearFree(seq);
 	/* the GPU state, buffer and uniforms here were the benchmark's own */

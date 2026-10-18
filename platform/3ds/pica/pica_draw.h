@@ -274,6 +274,9 @@ int pica_selftest(void);
 /* Times the GPU's per-vertex cost under several vertex setups ([vbench] lines, about a second).
  * Call after pica_selftest, before frames overlap. Touch held at launch (main.cpp). */
 void pica_vertex_bench(void);
+/* GPU state sent so far: texture binds, combiner stages, matrix-row uniforms, other uniform
+ * vectors, bool uniforms, draws. */
+void pica_state_stats(uint32_t out[6]);
 /* On: every draw is submitted and waited for on its own, and one the GPU never finishes is logged
  * ([gpucheck] lines) with its layout, textures and combiner stages. Very slow. */
 void pica_set_gpu_check(int on);
