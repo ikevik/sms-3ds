@@ -9,3 +9,4 @@ rom/*
 *.gcm
 *.ciso
 build3ds/
+build3ds-*/

@@ -23,6 +23,7 @@ int pica_view(void);
 int pica_view_count(void);
 void GX3DS_SetDebugColors(int on);
 void GX3DS_TraceNextFrame(void);
+void GX3DS_TraceState(int out[2]);  // armed or tracing, traces written
 int GX3DS_GetDebugColors(void);
 void GX3DS_GetCopyStats(uint32_t out[3]);
 void GX3DS_GetPerf(float out[11]);
@@ -33,10 +34,22 @@ uint32_t pica_frame_draws(void);
 int pica_selftest(void);
 void pica_set_gpu_check(int on);
 void pica_set_split(int on);
+void pica_set_vram_textures(int on);
+void pica_set_vram_check(int on);
 void pica_set_overlap(int on);
+void pica_set_big_ring(int on);
+extern "C" void SMS3DS_ProfRequest(void);
+extern "C" int SMS3DS_ProfState(void);
 void GX3DS_SetArena(int on);
 void GX3DS_SetRenderThread(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
+// Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
+// 0008); -1 in the normal build.
+#ifndef SMS_DEMO_STAGE
+#define SMS_DEMO_STAGE -1
+#endif
+extern "C" int SMS3DS_DemoStage;
+int SMS3DS_DemoStage = SMS_DEMO_STAGE;
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
 extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
@@ -235,6 +248,46 @@ static void flush_log(void)
 	fsync(fileno(stderr));
 }
 
+// sdmc:/sms/settings.txt as first written: the settings that do something on the 3DS, at its
+// defaults. sms-pc-port reads the file at start (port_runtime.cpp, load_settings); any other
+// sms-pc-port setting can be added by name.
+static const char kDefaultSettings[] =
+    "# Super Mario Sunshine (3DS) settings: one \"name = value\" a line, read at start.\n"
+    "# Lines starting with # are ignored. Delete this file to get the defaults back.\n"
+    "\n"
+    "# Gameplay frame rate: 30 (the game's own) or 60. At 60 the game's logic runs twice as\n"
+    "# often, which the 3DS cannot keep up with.\n"
+    "frame_rate = 30\n"
+    "\n"
+    "# The heat-wave shimmer in sunny places (a screen copy and a full-screen pass each frame):\n"
+    "# on or off. Off on the 3DS for speed.\n"
+    "heat_haze = off\n"
+    "\n"
+    "# Skip the game's movies: on or off.\n"
+    "skip_movies = off\n";
+
+// Whether settings.txt gives `name` a value (a line "name = value").
+static bool setting_given(const char* path, const char* name)
+{
+	FILE* f = fopen(path, "r");
+	if (!f) return false;
+	char line[256];
+	const size_t n = strlen(name);
+	bool found = false;
+	while (!found && fgets(line, sizeof line, f)) {
+		const char* p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, name, n) != 0) continue;
+		p += n;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p++ != '=') continue;
+		while (*p == ' ' || *p == '\t') p++;
+		found = *p && *p != '\n' && *p != '\r' && *p != '#';
+	}
+	fclose(f);
+	return found;
+}
+
 static void* game_thread(void*)
 {
 	static char a0[] = "sms3ds";
@@ -245,11 +298,6 @@ static void* game_thread(void*)
 	// and the game thread is never scheduled again (seen as a freeze on entering the title
 	// stage). Run silently until there is an ndsp backend and a cheaper mixer.
 	setenv("SMS_NO_AUDIO", "1", 0);
-	// Gameplay at the game's own 30 fps. sms-pc-port defaults to 60, which runs the game's logic
-	// twice as often: on a New 3DS that doubled the CPU work per second of play and halved the
-	// speed of a game that already cannot keep up. (An environment variable wins over
-	// settings.txt's frame_rate.)
-	setenv("SMS_FRAME_RATE", "30", 0);
 	// Everything the game keeps lives under sdmc:/sms/, next to the disc image: the memory card
 	// (sms-pc-port's card.cpp: SMS_SAVE_DIR), settings.txt (port_runtime.cpp: SMS_SETTINGS), and,
 	// through the working directory, the relative lookups (mods/, mods/languages/,
@@ -257,7 +305,24 @@ static void* game_thread(void*)
 	mkdir(SMS_DIR, 0777);
 	chdir(SMS_DIR "/");
 	setenv("SMS_SAVE_DIR", SMS_DIR "/card-a", 0);
-	setenv("SMS_SETTINGS", SMS_DIR "/settings.txt", 0);
+	static const char kSettingsPath[] = SMS_DIR "/settings.txt";
+	setenv("SMS_SETTINGS", kSettingsPath, 0);
+	// settings.txt with the 3DS's defaults when there is none, so they can be seen and changed.
+	if (FILE* f = fopen(kSettingsPath, "r")) {
+		fclose(f);
+	} else if ((f = fopen(kSettingsPath, "w"))) {
+		fputs(kDefaultSettings, f);
+		fclose(f);
+		fprintf(stderr, "[3ds] wrote %s with the 3DS defaults\n", kSettingsPath);
+	}
+	// Gameplay at the game's own 30 fps unless settings.txt says otherwise. sms-pc-port defaults
+	// to 60, which runs the game's logic twice as often: on a New 3DS that doubled the CPU work
+	// per second of play and halved the speed of a game that already cannot keep up. (An
+	// environment variable wins over settings.txt, so it is only set when the file has none.)
+	if (!setting_given(kSettingsPath, "frame_rate")) setenv("SMS_FRAME_RATE", "30", 0);
+	// No heat-wave shimmer unless settings.txt asks for it: a screen copy and a full-screen
+	// distortion pass every frame in the sunny stages (Delfino Airstrip and Plaza among them).
+	if (!setting_given(kSettingsPath, "heat_haze")) setenv("SMS_HEAT_HAZE", "0", 0);
 	g_phase = 1;
 	port_init(2, argv);
 	g_phase = 2;
@@ -266,6 +331,67 @@ static void* game_thread(void*)
 	fprintf(stderr, "[3ds] SMS_main returned\n");
 	g_phase = 3;
 	return NULL;
+}
+
+// The bottom screen's status text. Drawing it takes tens of milliseconds (the console draws
+// every glyph with the CPU): on the game's core, at the main thread's priority, each redraw held
+// the game thread that long, twice a second. It runs on core 1 (status_thread) when it can.
+static void draw_status(const uint32_t* s) {
+	static const char* const phase[] = {"waiting", "port_init", "SMS_main (running)", "SMS_main returned"};
+	printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
+	       (unsigned long)s[0], (unsigned long)s[1], (unsigned long)s[2], (unsigned long)s[3]);
+	if (g_phase == 2) {
+		SceneState sc = read_scene();
+		printf("\nscene: %-9s area %2u-%-2u next %2u-%-2u\nmovie %u  director %08lx\n",
+		       app_state_name(sc.state), sc.curr_stage, sc.curr_scen, sc.next_stage, sc.next_scen,
+		       sc.movie, (unsigned long)sc.director_vtbl);
+	}
+	printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
+	       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
+	uint32_t cs[3];
+	GX3DS_GetCopyStats(cs);
+	printf("draws: %3lu before copy, %3lu after\ntexture copies/frame: %lu  \n", (unsigned long)cs[0],
+	       (unsigned long)cs[1], (unsigned long)cs[2]);
+	uint32_t ts[3];
+	GX3DS_GetTexStats(ts);
+	{
+		int tst[2];
+		GX3DS_TraceState(tst);
+		printf("\x1b[23;0Htrace: %-8s %d written (sms/trace-N.txt)  ", tst[0] ? "ARMED" : "idle", tst[1]);
+		static const char* const profState[] = {"idle (touch bottom right)", "timing the CPU...", "GPU, pixels cut...", "GPU, object by object..."};
+		printf("\x1b[24;0Hprofile: %-28s", profState[SMS3DS_ProfState()]);
+	}
+	printf("\x1b[22;0Htop shows: %s %d of %d  (touch top: next)\n", pica_view() ? "EFB copy" : "frame",
+	       pica_view(), pica_view_count());
+	printf("\x1b[20;0Htextures: %lu uploads, %lu KB\nEFB-copy texture draws: %lu   \n", (unsigned long)ts[0],
+	       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);
+	float pf[11];
+	GX3DS_GetPerf(pf);
+	// Renderer profile (ms per frame, averaged over 60 frames): see gx3ds_backend.cpp.
+	printf("\x1b[24;0Hframe %5.1fms %4.1ffps dec%5.1f oth%5.1f\n"
+	       "tex %4.1f tev %4.1f xform %4.1f sub %4.1f\n"
+	       "copy %4.1f present %4.1f  %4.0f draws  \n",
+	       pf[6], pf[6] > 0 ? 1000.0f / pf[6] : 0.0f, pf[10], pf[7], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], pf[8]);
+	uint32_t ps2[2];
+	GX3DS_GetPathStats(ps2);
+	printf("transform: %s  gpu %lu cpu %lu   \n", GX3DS_GetGpuTransform() ? "GPU" : "CPU", (unsigned long)ps2[0],
+	       (unsigned long)ps2[1]);
+	// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
+	// single-buffered, so writing back the CPU cache is enough.
+	gfxFlushBuffers();
+}
+
+static Thread s_statusThread;
+static volatile bool s_statusRun = true;
+static void status_thread(void*) {
+	while (s_statusRun) {
+		svcSleepThread(500000000LL);
+		uint32_t s[7];
+		GX3DS_GetStats(s);
+		draw_status(s);
+		static unsigned n;
+		if (++n % 2 == 0) flush_log();  // the log's SD write, once a second, off the game's core too
+	}
 }
 
 int main()
@@ -338,6 +464,7 @@ int main()
 	// vertices off, to compare).
 	if (launchHeld & KEY_DUP) {
 		GX3DS_SetArena(0);
+		pica_set_big_ring(1);  // every vertex copied each frame
 		printf("Up held: resident vertices off\n");
 		fprintf(stderr, "[3ds] Up held at launch: cached geometry copied every frame (no resident vertices)\n");
 	}
@@ -347,8 +474,21 @@ int main()
 		printf("Left held: no render thread\n");
 		fprintf(stderr, "[3ds] Left held at launch: renderer on the game thread (no render thread)\n");
 	}
+	// Holding ZL at launch keeps every texture in FCRAM, as before VRAM textures (to compare).
+	if (launchHeld & KEY_ZL) {
+		pica_set_vram_textures(0);
+		printf("ZL held: textures in FCRAM only\n");
+		fprintf(stderr, "[3ds] ZL held at launch: textures in FCRAM only (no VRAM textures)\n");
+	}
+	// Holding ZR at launch checks VRAM texture copies against their originals ([vram] lines).
+	if (launchHeld & KEY_ZR) {
+		pica_set_vram_check(1);
+		printf("ZR held: VRAM copy self-check\n");
+		fprintf(stderr, "[3ds] ZR held at launch: VRAM texture copies checked against their originals\n");
+	}
 	if (launchHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
+		pica_set_big_ring(1);  // CPU-transformed vertices are larger
 		printf("B held: CPU vertex path\n");
 		fprintf(stderr, "[3ds] B held at launch: starting on the CPU vertex path\n");
 	}
@@ -385,8 +525,12 @@ int main()
 		fprintf(stderr, "[3ds] pthread_create failed\n");
 	}
 	pthread_attr_destroy(&attr);
+	// Status text on core 1 (the system core lends apps up to 80% when asked), below everything
+	// else there; on the game's core only when core 1 is not available.
+	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)))
+		s_statusThread = threadCreate(status_thread, NULL, 32u << 10, 0x3F, 1, false);
+	fprintf(stderr, "[3ds] status screen %s\n", s_statusThread ? "redrawn on core 1" : "redrawn on the game's core");
 
-	static const char* const phase[] = {"waiting", "port_init", "SMS_main (running)", "SMS_main returned"};
 	while (aptMainLoop()) {
 		// Edges are detected on the held state (the game's PADRead once scanned HID too, consuming
 		// presses before hidKeysDown() saw them). START alone is the game's Start button, so quitting
@@ -406,6 +550,9 @@ int main()
 		if (pressed & KEY_TOUCH) {
 			touchPosition tp;
 			hidTouchRead(&tp);
+			fprintf(stderr, "[touch] %d,%d: %s\n", tp.px, tp.py,
+			        tp.py < 120 ? "top half (view)" : tp.px < 107 ? "bottom left (trace)" :
+			        tp.px < 213 ? "bottom middle (GPU transform)" : "bottom right (profile run)");
 			if (tp.py < 120)
 				pica_cycle_view();
 			else if (tp.px < 107)
@@ -413,7 +560,7 @@ int main()
 			else if (tp.px < 213)
 				GX3DS_SetGpuTransform(!GX3DS_GetGpuTransform());
 			else
-				pica_cycle_gpu_test();  // GPU test: pixels cut to 8x8 ([perf] gpu wait line)
+				SMS3DS_ProfRequest();  // [prof] lines: CPU by phase and class, then GPU pixels vs vertices
 		}
 		uint32_t s[7];
 		GX3DS_GetStats(s);
@@ -425,45 +572,12 @@ int main()
 		// game thread's core, and redrawing it 60 times a second took a large share of the
 		// frame on a New 3DS. Only the redraw is timed, for the [perf] "status screen" figure.
 		static unsigned statusTick;
-		if (++statusTick % 30 != 0) {
+		if (s_statusThread || ++statusTick % 30 != 0) {
 			gspWaitForVBlank();
 			continue;
 		}
 		const u64 busy0 = svcGetSystemTick();
-		printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
-		       (unsigned long)s[0], (unsigned long)s[1], (unsigned long)s[2], (unsigned long)s[3]);
-		if (g_phase == 2) {
-			SceneState sc = read_scene();
-			printf("\nscene: %-9s area %2u-%-2u next %2u-%-2u\nmovie %u  director %08lx\n",
-			       app_state_name(sc.state), sc.curr_stage, sc.curr_scen, sc.next_stage, sc.next_scen,
-			       sc.movie, (unsigned long)sc.director_vtbl);
-		}
-		printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
-		       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
-		uint32_t cs[3];
-		GX3DS_GetCopyStats(cs);
-		printf("draws: %3lu before copy, %3lu after\ntexture copies/frame: %lu  \n", (unsigned long)cs[0],
-		       (unsigned long)cs[1], (unsigned long)cs[2]);
-		uint32_t ts[3];
-		GX3DS_GetTexStats(ts);
-		printf("\x1b[22;0Htop shows: %s %d of %d  (touch top: next)\n", pica_view() ? "EFB copy" : "frame",
-		       pica_view(), pica_view_count());
-		printf("\x1b[20;0Htextures: %lu uploads, %lu KB\nEFB-copy texture draws: %lu   \n", (unsigned long)ts[0],
-		       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);
-		float pf[11];
-		GX3DS_GetPerf(pf);
-		// Renderer profile (ms per frame, averaged over 60 frames): see gx3ds_backend.cpp.
-		printf("\x1b[24;0Hframe %5.1fms %4.1ffps dec%5.1f oth%5.1f\n"
-		       "tex %4.1f tev %4.1f xform %4.1f sub %4.1f\n"
-		       "copy %4.1f present %4.1f  %4.0f draws  \n",
-		       pf[6], pf[6] > 0 ? 1000.0f / pf[6] : 0.0f, pf[10], pf[7], pf[0], pf[1], pf[2], pf[3], pf[4], pf[5], pf[8]);
-		uint32_t ps2[2];
-		GX3DS_GetPathStats(ps2);
-		printf("transform: %s  gpu %lu cpu %lu   \n", GX3DS_GetGpuTransform() ? "GPU" : "CPU", (unsigned long)ps2[0],
-		       (unsigned long)ps2[1]);
-		// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
-		// single-buffered, so writing back the CPU cache is enough.
-		gfxFlushBuffers();
+		draw_status(s);
 		GX3DS_MainBusyTicks += svcGetSystemTick() - busy0;
 		static u64 lastFlush;
 		if (osGetTime() - lastFlush >= 1000) {
@@ -473,6 +587,11 @@ int main()
 		gspWaitForVBlank();
 	}
 
+	if (s_statusThread) {
+		s_statusRun = false;
+		threadJoin(s_statusThread, U64_MAX);
+		threadFree(s_statusThread);
+	}
 	fprintf(stderr, "[3ds] exiting\n");
 	flush_log();
 	// The game thread may be mid-frame: stop it submitting GPU work and let what is in flight

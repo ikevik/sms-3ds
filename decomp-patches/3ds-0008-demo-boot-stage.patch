@@ -1,0 +1,33 @@
+--- a/src/System/Application.cpp	2026-10-17 13:11:21
++++ b/src/System/Application.cpp	2026-10-17 13:11:21
+@@ -38,6 +38,12 @@
+ #include <System/ProcessMeter.hpp>
+ #include <System/CardManager.hpp>
+ #include <System/ScenarioArchiveName.hpp>
++
++#if defined(__3DS__)
++// 3DS demo builds (sms3ds-<stage>.3dsx): the stage every scene change goes to after the
++// Nintendo logo; -1 in the normal build. Defined in source_game/main.cpp.
++extern "C" int SMS3DS_DemoStage;
++#endif
+ #include <System/MarNameRefGen.hpp>
+ #include <System/StageUtil.hpp>
+ #include <System/GCLogoDir.hpp>
+@@ -777,6 +783,17 @@
+ 			((void (*)())sms_mod_t_)();
+ 		} else
+ #endif
++#if defined(__3DS__)
++		// Demo build: skip the intro movie and the title, and send every scene change (a
++		// stage exit, a death, a reset) back to the demo stage, scenario 0. The secret
++		// course's first-visit movie is marked as seen.
++		if (SMS3DS_DemoStage >= 0 && mAppState != APP_STATE_BOOT
++		    && nextState != APP_STATE_QUIT && nextState != APP_STATE_DEFAULT) {
++			nextState = APP_STATE_GAMEPLAY;
++			mNextArea.set(SMS3DS_DemoStage, 0, 0);
++			TFlagManager::getInstance()->setBool(true, 0x3000D);
++		}
++#endif
+ 		mAppState = nextState;
+ 		mPrevArea = mCurrArea;
+ 		mCurrArea = mNextArea;

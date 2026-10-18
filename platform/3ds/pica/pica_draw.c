@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "gx_pass_shbin.h"
 
@@ -16,7 +17,10 @@
 
 /* A frame's vertices and indices live in one half of each ring; the other half belongs to the
  * frame the GPU may still be drawing. */
-#define VTX_RING_BYTES (3584u << 10) /* per frame; Delfino Plaza peaks near 2.4 MB (the rest of linear memory goes to resident vertices) */
+/* Per frame. Delfino Plaza peaks near 2.4 MB with resident vertices (the rest of linear memory goes
+ * to them); without them, or on the CPU vertex path, it needs 5 MB (pica_set_big_ring). */
+static uint32_t s_vringBytes = 3584u << 10;
+#define VTX_RING_BYTES s_vringBytes
 #define IDX_RING_BYTES (1u << 20)
 #define CMDBUF_BYTES   (1u << 20)
 /* Command-buffer words a draw may not eat into: the rest of the frame's state and its end. */
@@ -29,6 +33,7 @@
 #define EFB_TEX_H 256
 
 static int s_ready, s_failed, s_in_frame;
+void pica_set_big_ring(int on) { if (!s_ready) s_vringBytes = (on ? 5120u : 3584u) << 10; }
 static C3D_RenderTarget* s_top;
 static C3D_RenderTarget* s_efb;
 static C3D_Tex s_efbTex;
@@ -36,6 +41,8 @@ static DVLB_s* s_dvlb;
 static shaderProgram_s s_prog;
 /* Vertex shader uniforms (shaders/gx_pass.v.pica) and the vertex mode they are set up for. */
 static int s_uF, s_uP, s_uN, s_uT, s_uW, s_uCS, s_uCM, s_uLD, s_bCpu;
+static int s_bLit, s_bTu[3], s_bTd[3], s_bPj; /* the GX shader's per-draw shortcuts */
+static C3D_Tex s_projTex; /* unit 0's texture in projection mode (PicaState.proj0) */
 enum { MODE_NONE = -1, MODE_CPU = 0, MODE_GX = 1 };
 static int s_mode = MODE_NONE;
 static const C3D_Mtx* s_cpuProj; /* what F holds in CPU mode */
@@ -95,13 +102,25 @@ static LightLock s_linLock = 1; /* 1: unlocked */
 #define LIN_LOCK() LightLock_Lock(&s_linLock)
 #define LIN_UNLOCK() LightLock_Unlock(&s_linLock)
 
+/* VRAM for the EFB-copy textures, taken whole at start-up and handed out in power-of-two runs
+ * of 4 KB units at multiples of their own size (copy_arena_alloc), so freed runs join up again.
+ * Made from VRAM at large, a copy texture could find it free but split into smaller pieces by
+ * texture copies (vram_try), and one that gets no VRAM leaves the game sampling raw memory at
+ * its address (noise on screen). */
+#define COPY_ARENA_BYTES (2u << 20)
+#define COPY_UNIT 4096u
+#define COPY_UNITS (COPY_ARENA_BYTES / COPY_UNIT)
+static uint8_t* s_copyArena;
+static uint8_t s_copyUnitUsed[COPY_UNITS];
+static uint32_t s_copyUnits, s_copyUnitsPeak;
+
 int pica_init(void)
 {
 	if (s_stopping) return 0;
 	if (s_ready) return 1;
 	if (s_failed) return 0;
 	if (!C3D_Init(CMDBUF_BYTES)) goto fail;
-	s_top = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH24_STENCIL8);
+	s_top = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, -1); /* no depth: the present pass needs none */
 	if (!s_top) goto fail;
 	C3D_RenderTargetSetOutput(s_top, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
 
@@ -121,6 +140,14 @@ int pica_init(void)
 		s_uCM = shaderInstanceGetUniformLocation(vs, "CM");
 		s_uLD = shaderInstanceGetUniformLocation(vs, "LD");
 		s_bCpu = shaderInstanceGetUniformLocation(vs, "cpu");
+		s_bLit = shaderInstanceGetUniformLocation(vs, "lit");
+		s_bPj = shaderInstanceGetUniformLocation(vs, "pj");
+		for (int k = 0; k < 3; k++) {
+			char n[4] = {'t', 'u', (char)('0' + k), 0};
+			s_bTu[k] = shaderInstanceGetUniformLocation(vs, n);
+			n[1] = 'd';
+			s_bTd[k] = shaderInstanceGetUniformLocation(vs, n);
+		}
 	}
 
 	if (!C3D_TexInitVRAM(&s_efbTex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) goto fail;
@@ -128,6 +155,9 @@ int pica_init(void)
 	if (!s_efb) goto fail;
 	C3D_TexSetFilter(&s_efbTex, GPU_LINEAR, GPU_LINEAR);
 	C3D_TexSetWrap(&s_efbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+	s_copyArena = (uint8_t*)vramAlloc(COPY_ARENA_BYTES);
+	if (!s_copyArena)
+		fprintf(stderr, "[pica] no %u KB of VRAM for the EFB-copy textures: each takes its own\n", COPY_ARENA_BYTES >> 10);
 
 	/* EFB pixels (y down). Depth: z = -(GameCube depth), so the default depth map (-z/w) stores
 	 * the GameCube's own depth and its compare modes carry over. */
@@ -159,7 +189,7 @@ int pica_init(void)
 		if (!s_queue) fprintf(stderr, "[pica] citro3d queue not as expected: no mid-frame GPU submission\n");
 	}
 	fprintf(stderr, "[pica] citro3d ready: EFB %dx%d drawn into a %dx%d texture -> top screen 400x240, "
-	        "rings %u+%u KB x2\n", PICA_EFB_WIDTH, PICA_EFB_HEIGHT, EFB_TEX_W, EFB_TEX_H, VTX_RING_BYTES >> 10,
+	        "rings %u+%u KB x2\n", PICA_EFB_WIDTH, PICA_EFB_HEIGHT, EFB_TEX_W, EFB_TEX_H, (unsigned)(VTX_RING_BYTES >> 10),
 	        IDX_RING_BYTES >> 10);
 	return 1;
 fail:
@@ -172,7 +202,14 @@ fail:
 struct PicaTex {
 	C3D_Tex tex;
 	uint32_t bytes;
+	int fmt; /* PICA_TF_* (pica_tex_upload's packing) */
 	C3D_RenderTarget* rt; /* EFB copy textures are drawn into */
+	void* vram;           /* non-null: a copy of tex.data in VRAM (vram_copy) */
+	C3D_Tex vtex;         /* tex, pointing at the VRAM copy (bound once vready) */
+	uint8_t vready, vpending, dead, noVram;
+	uint16_t arenaUnit, arenaUnits; /* EFB copy textures: their run in s_copyArena (0 units: own VRAM) */
+	float wx, wy, ww, wh;           /* EFB copy textures: the EFB window (EFB pixels) of their latest copy */
+	uint32_t lastUse, vramUse, vcopyFrame, vtryFrame; /* frame numbers (s_frameNo) */
 };
 
 /* A texture freed while a frame may still be drawing with it waits for two frame starts. */
@@ -180,6 +217,11 @@ struct PicaTex {
 static PicaTex* s_dead[2][MAX_DEFERRED];
 static int s_ndead[2];
 
+static void tex_count(const PicaTex* t, int sign);
+static void vram_unpend(PicaTex* t);
+static void vram_drop(PicaTex* t);
+static void copy_tex_mem_free(PicaTex* t);
+static int s_copyTexCount; /* EFB-copy textures in VRAM (copy_reserve, below) */
 static int s_dead_due = 1; /* a frame has started since release_dead last ran */
 
 static void release_dead(void)
@@ -189,10 +231,22 @@ static void release_dead(void)
 	 * freed two frames ago; the C3D_FrameBegin of the last frame waited for the GPU to finish
 	 * the frame that could still draw with them, so they can go. */
 	for (int i = 0; i < s_ndead[1]; i++) {
-		if (s_dead[1][i]->rt) C3D_RenderTargetDelete(s_dead[1][i]->rt);
-		LIN_LOCK();
-		C3D_TexDelete(&s_dead[1][i]->tex);
-		LIN_UNLOCK();
+		PicaTex* t = s_dead[1][i];
+		if (t->vram) vram_drop(t);
+		if (t->vpending) vram_unpend(t);
+		if (t->rt) {
+			C3D_RenderTargetDelete(t->rt);
+			s_copyTexCount--;
+		} else {
+			tex_count(t, -1);
+		}
+		if (t->rt) {
+			copy_tex_mem_free(t);
+		} else {
+			LIN_LOCK();
+			C3D_TexDelete(&t->tex);
+			LIN_UNLOCK();
+		}
 		free(s_dead[1][i]);
 	}
 	memcpy(s_dead[1], s_dead[0], sizeof(PicaTex*) * (size_t)s_ndead[0]);
@@ -200,28 +254,276 @@ static void release_dead(void)
 	s_ndead[0] = 0;
 }
 
+/* VRAM copies of textures. The GPU reads VRAM faster than FCRAM, where its reads also compete
+ * with the CPU's; but the CPU may not write VRAM (a data abort), so each texture stays in linear
+ * FCRAM, where it is written, and the GPU copies it into VRAM (GX TextureCopy) at the head of
+ * the frame's GX queue, before the frame's draws, which then bind the VRAM copy. Only with
+ * overlapped frames, whose queue is filled while stopped (ovl_frame_begin); copies that do not
+ * fit in this frame's queue wait for the next frame start, drawn from FCRAM meanwhile.
+ * A texture gets its VRAM copy when a draw first binds it (vram_try), so VRAM holds what the
+ * current scene draws with; copies of textures no draw has bound for a while make room
+ * (vram_evict), for other textures and for the EFB-copy textures (pica_copy_tex_create). */
+/* VRAM kept free for EFB-copy textures that do not fit in the arena (s_copyArena), or for all of
+ * them when it could not be made: at most 6 (the back end's kMaxEfbCopies), one more while a
+ * replaced one waits out its two frames, each at most a whole-EFB texture. */
+#define COPY_TEX_BYTES (EFB_TEX_W * EFB_TEX_H * 4u)
+static uint32_t copy_reserve(void)
+{
+	const int left = 7 - s_copyTexCount;
+	return (!s_copyArena && left > 0 ? (uint32_t)left * COPY_TEX_BYTES : 0) + (64u << 10);
+}
+#define VRAM_IDLE 30 /* frames a texture goes unbound before its VRAM copy may go */
+#define VRAM_MAX 1024
+static uint32_t s_frameNo;
+static PicaTex* s_vlist[VRAM_MAX]; /* textures with a VRAM copy */
+static int s_nvlist;
+static uint32_t s_vramEvicted, s_vramAnimated;
+#define VRAM_PENDING 1024
+static int s_vramTex = 1;
+static uint32_t s_vramTexBytes, s_vramTexCount, s_linTexBytes, s_linTexCount, s_vramCopies;
+static PicaTex* s_vpend[VRAM_PENDING];
+static int s_nvpend;
+static int ovl_queue_room(void);
+static int s_ovl; /* overlapped frames (defined with them, below) */
+void pica_set_vram_textures(int on) { s_vramTex = on; }
+void pica_tex_stats(uint32_t* vramKB, uint32_t* vramCount, uint32_t* linKB, uint32_t* linCount, uint32_t* vramFreeKB)
+{
+	*vramKB = s_vramTexBytes >> 10;
+	*vramCount = s_vramTexCount;
+	*linKB = s_linTexBytes >> 10;
+	*linCount = s_linTexCount;
+	*vramFreeKB = (uint32_t)(vramSpaceFree() >> 10);
+}
+uint32_t pica_vram_copies(void) { return s_vramCopies; }
+uint32_t pica_vram_evicted(void) { return s_vramEvicted; }
+uint32_t pica_vram_animated(void) { return s_vramAnimated; }
+static void tex_count(const PicaTex* t, int sign)
+{
+	if (t->vram) {
+		s_vramTexBytes += sign * (int)t->bytes;
+		s_vramTexCount += sign;
+	} else {
+		s_linTexBytes += sign * (int)t->bytes;
+		s_linTexCount += sign;
+	}
+}
+static bool tex_init(C3D_Tex* tex, uint32_t w, uint32_t h, int maxLevel, GPU_TEXCOLOR fmt)
+{
+	C3D_TexInitParams p = {(u16)w, (u16)h, (u8)maxLevel, fmt, GPU_TEX_2D, false};
+	LIN_LOCK();
+	const bool ok = C3D_TexInitWithParams(tex, NULL, p);
+	LIN_UNLOCK();
+	return ok;
+}
+/* Frees VRAM copies of textures no draw has bound in VRAM_IDLE frames (and with no copy into
+ * them still possibly queued), least recently used first, until `want` bytes are free. */
+static bool vram_evict(uint32_t want, uint32_t minAge)
+{
+	while (vramSpaceFree() < want) {
+		int best = -1;
+		uint32_t bestAge = 0;
+		for (int i = 0; i < s_nvlist; i++) {
+			const PicaTex* t = s_vlist[i];
+			const uint32_t age = s_frameNo - t->vramUse; /* frames since a draw last bound the VRAM copy */
+			if (age >= minAge && s_frameNo - t->vcopyFrame > 2 && !t->vpending && age > bestAge) {
+				best = i;
+				bestAge = age;
+			}
+		}
+		if (best < 0) return false;
+		vram_drop(s_vlist[best]);
+		s_vramEvicted++;
+	}
+	return true;
+}
+static void vram_copy(PicaTex* t);
+/* A draw binds t: give it a VRAM copy if there is (or can be made) room. */
+static void vram_try(PicaTex* t)
+{
+	if (t->noVram) return;
+	if (t->vtryFrame && s_frameNo - t->vtryFrame < VRAM_IDLE) return; /* no room lately */
+	t->vtryFrame = s_frameNo;
+	if (s_nvlist >= VRAM_MAX) return;
+	const uint32_t need = t->bytes + copy_reserve() + 4096;
+	if (vramSpaceFree() < need && !vram_evict(need, VRAM_IDLE)) return;
+	void* p = vramAlloc(t->bytes);
+	if (!p) return;
+	tex_count(t, -1);
+	t->vram = p;
+	t->vramUse = s_frameNo;
+	tex_count(t, 1);
+	s_vlist[s_nvlist++] = t;
+	t->vtryFrame = 0;
+	vram_copy(t);
+}
+static void vram_drop(PicaTex* t)
+{
+	for (int i = 0; i < s_nvlist; i++)
+		if (s_vlist[i] == t) {
+			s_vlist[i] = s_vlist[--s_nvlist];
+			break;
+		}
+	if (t->vpending) vram_unpend(t);
+	tex_count(t, -1);
+	vramFree(t->vram);
+	t->vram = NULL;
+	t->vready = 0;
+	tex_count(t, 1);
+}
+/* For the EFB-copy textures: room for `bytes` more in VRAM, made by evicting the VRAM copies of
+ * textures no frame the GPU may still be drawing has bound (3 frames). */
+static void vram_make_room(uint32_t bytes) { vram_evict(bytes + 4096, 3); }
+static void vram_unpend(PicaTex* t)
+{
+	for (int i = 0; i < s_nvpend; i++)
+		if (s_vpend[i] == t) {
+			s_vpend[i] = s_vpend[--s_nvpend];
+			break;
+		}
+	t->vpending = 0;
+}
+/* Queues the copy into VRAM if this frame's queue has room, else for the next frame start. */
+static void vram_copy(PicaTex* t)
+{
+	/* Rewritten again within a few frames (animated: water, movies): such a texture stays in
+	 * FCRAM. Its copies cost a DMA every frame, and a copy could read the FCRAM original while
+	 * the CPU rewrites it for the next frame. Its VRAM copy goes unbound and is evicted later. */
+	if (t->vcopyFrame && s_frameNo - t->vcopyFrame < 8) {
+		t->noVram = 1;
+		t->vready = 0;
+		if (t->vpending) vram_unpend(t);
+		s_vramAnimated++;
+		return;
+	}
+	if (s_in_frame && s_ovl && ovl_queue_room()) {
+		GX_TextureCopy((u32*)t->tex.data, 0, (u32*)t->vram, 0, t->bytes, 8);
+		t->vready = 1;
+		t->vcopyFrame = s_frameNo;
+		s_vramCopies++;
+		if (t->vpending) vram_unpend(t);
+	} else {
+		t->vready = 0;
+		if (!t->vpending && s_nvpend < VRAM_PENDING) {
+			t->vpending = 1;
+			s_vpend[s_nvpend++] = t;
+		}
+	}
+}
+/* At a frame start, with the frame's queue bound and empty. */
+static void vram_drain(void)
+{
+	for (int i = s_nvpend - 1; i >= 0 && ovl_queue_room(); i--) {
+		PicaTex* t = s_vpend[i];
+		if (t->dead || t->noVram) continue;
+		vram_copy(t);
+	}
+}
+/* Self-check of the VRAM copies (each run, one texture at a time): the GPU copies a texture's
+ * VRAM copy back into FCRAM, and two frame starts later (its queue has run by then) it is
+ * compared with the FCRAM original it was copied from. Mismatches are logged with the texture's
+ * size and format, as are the totals now and then. */
+#define VFY_BYTES (1024u << 10)
+static uint8_t* s_vfyBuf;
+static PicaTex* s_vfyTex;
+static uint32_t s_vfyFrame, s_vfyBytes, s_vfyNext, s_vfyOk, s_vfyBad, s_vfyLog;
+static int s_vfyOn; /* off unless asked for (pica_set_vram_check) */
+void pica_set_vram_check(int on) { s_vfyOn = on; }
+static void vram_verify(void)
+{
+	if (!s_vfyBuf) {
+		LIN_LOCK();
+		s_vfyBuf = (uint8_t*)linearAlloc(VFY_BYTES);
+		LIN_UNLOCK();
+		if (!s_vfyBuf) return;
+	}
+	if (s_vfyTex) {
+		if (s_frameNo - s_vfyFrame < 2) return;
+		PicaTex* t = s_vfyTex;
+		s_vfyTex = NULL;
+		bool live = false;
+		for (int i = 0; i < s_nvlist && !live; i++) live = s_vlist[i] == t;
+		/* Gone, or copied again since (its original may have changed): no verdict. */
+		if (!live || t->dead || t->vpending || (int32_t)(t->vcopyFrame - s_vfyFrame) >= 0) return;
+		GSPGPU_InvalidateDataCache(s_vfyBuf, s_vfyBytes);
+		const uint8_t* a = (const uint8_t*)t->tex.data;
+		uint32_t first = s_vfyBytes, diff = 0;
+		for (uint32_t i = 0; i < s_vfyBytes; i++)
+			if (a[i] != s_vfyBuf[i]) {
+				if (first == s_vfyBytes) first = i;
+				diff++;
+			}
+		if (!diff) {
+			s_vfyOk++;
+		} else {
+			s_vfyBad++;
+			if (s_vfyLog++ < 40)
+				fprintf(stderr,
+				        "[vram] copy differs: %ux%u fmt %d levels %d, %lu bytes, %lu differ from offset %lu | vram %p "
+				        "fcram %p, copied frame %lu, now %lu\n",
+				        t->tex.width, t->tex.height, t->fmt, t->tex.maxLevel + 1, (unsigned long)s_vfyBytes,
+				        (unsigned long)diff, (unsigned long)first, t->vram, t->tex.data, (unsigned long)t->vcopyFrame,
+				        (unsigned long)s_frameNo);
+		}
+		if ((s_vfyOk + s_vfyBad) % 100 == 0)
+			fprintf(stderr, "[vram] self-check: %lu copies match, %lu differ\n", (unsigned long)s_vfyOk,
+			        (unsigned long)s_vfyBad);
+		return;
+	}
+	if (!s_nvlist || !ovl_queue_room()) return;
+	for (int n = 0; n < s_nvlist; n++) {
+		PicaTex* t = s_vlist[(s_vfyNext + n) % s_nvlist];
+		if (!t->vready || t->bytes > VFY_BYTES || s_frameNo - t->vcopyFrame <= 2) continue;
+		s_vfyNext = (s_vfyNext + n + 1) % s_nvlist;
+		GX_TextureCopy((u32*)t->vram, 0, (u32*)s_vfyBuf, 0, t->bytes, 8);
+		s_vfyTex = t;
+		s_vfyFrame = s_frameNo;
+		s_vfyBytes = t->bytes;
+		return;
+	}
+}
+
+static void tex_flush(PicaTex* t)
+{
+	GSPGPU_FlushDataCache(t->tex.data, t->bytes);
+	if (t->vram && !t->noVram) vram_copy(t);
+}
+
 static PicaTex* tex_create(uint32_t w, uint32_t h, GPU_TEXCOLOR fmt, uint32_t bpp)
 {
 	if (!pica_init()) return NULL;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
 	if (!t) return NULL;
-	LIN_LOCK();
-	const bool ok = C3D_TexInit(&t->tex, (u16)w, (u16)h, fmt);
-	LIN_UNLOCK();
+	const bool ok = tex_init(&t->tex, w, h, 0, fmt);
 	if (!ok) {
 		free(t);
 		return NULL;
 	}
 	t->bytes = w * h * bpp;
+	tex_count(t, 1);
 	return t;
 }
 
 PicaTex* pica_tex_create(uint32_t w, uint32_t h) { return tex_create(w, h, GPU_RGBA8, 4); }
-PicaTex* pica_tex_create_la8(uint32_t w, uint32_t h) { return tex_create(w, h, GPU_LA8, 2); }
+PicaTex* pica_tex_create_fmt(uint32_t w, uint32_t h, int fmt)
+{
+	static const GPU_TEXCOLOR kGpu[] = {GPU_RGBA8, GPU_RGB565, GPU_RGBA5551, GPU_RGBA4, GPU_LA8, GPU_L8};
+	static const uint8_t kBpp[] = {4, 2, 2, 2, 2, 1};
+	if (fmt < 0 || fmt > PICA_TF_L8) fmt = PICA_TF_RGBA8;
+	PicaTex* t = tex_create(w, h, kGpu[fmt], kBpp[fmt]);
+	if (t) t->fmt = fmt;
+	return t;
+}
+int pica_tex_format(const PicaTex* t) { return t ? t->fmt : PICA_TF_RGBA8; }
+PicaTex* pica_tex_create_la8(uint32_t w, uint32_t h)
+{
+	PicaTex* t = tex_create(w, h, GPU_LA8, 2);
+	if (t) t->fmt = PICA_TF_LA8;
+	return t;
+}
 void* pica_tex_data(PicaTex* t) { return t ? t->tex.data : NULL; }
 void pica_tex_written(PicaTex* t)
 {
-	if (t) GSPGPU_FlushDataCache(t->tex.data, t->bytes);
+	if (t) tex_flush(t);
 }
 
 /* The PICA stores textures in 8x8 tiles, texels in Morton (Z) order inside a tile, tile rows
@@ -232,11 +534,8 @@ static inline uint32_t morton8(uint32_t x, uint32_t y)
 	return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
 }
 
-void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
+static void tex_swizzle(uint32_t* dst, uint32_t w, uint32_t h, const uint8_t* rgba)
 {
-	if (!t) return;
-	uint32_t w = t->tex.width, h = t->tex.height;
-	uint32_t* dst = (uint32_t*)t->tex.data;
 	for (uint32_t y = 0; y < h; y++) {
 		const uint8_t* row = rgba + (size_t)(h - 1 - y) * w * 4;
 		uint32_t tileRow = (y >> 3) * (w >> 3) * 64;
@@ -247,12 +546,71 @@ void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
 			    ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 		}
 	}
-	GSPGPU_FlushDataCache(t->tex.data, t->bytes);
+}
+
+/* tex_swizzle for the 16- and 8-bit formats: the same tiling, each texel packed from RGBA8. */
+static void tex_swizzle_small(void* dst, uint32_t w, uint32_t h, const uint8_t* rgba, int fmt)
+{
+	uint16_t* d16 = (uint16_t*)dst;
+	uint8_t* d8 = (uint8_t*)dst;
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t* row = rgba + (size_t)(h - 1 - y) * w * 4;
+		const uint32_t tileRow = (y >> 3) * (w >> 3) * 64;
+		for (uint32_t x = 0; x < w; x++) {
+			const uint8_t* p = row + x * 4;
+			const uint32_t i = tileRow + (x >> 3) * 64 + morton8(x & 7, y & 7);
+			switch (fmt) {
+			case PICA_TF_RGB565: d16[i] = (uint16_t)((p[0] >> 3) << 11 | (p[1] >> 2) << 5 | p[2] >> 3); break;
+			case PICA_TF_RGBA5551:
+				d16[i] = (uint16_t)((p[0] >> 3) << 11 | (p[1] >> 3) << 6 | (p[2] >> 3) << 1 | p[3] >> 7);
+				break;
+			case PICA_TF_RGBA4: d16[i] = (uint16_t)((p[0] >> 4) << 12 | (p[1] >> 4) << 8 | (p[2] >> 4) << 4 | p[3] >> 4); break;
+			case PICA_TF_LA8: d16[i] = (uint16_t)(p[0] << 8 | p[3]); break;
+			default: d8[i] = p[0]; break; /* L8 */
+			}
+		}
+	}
+}
+
+void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
+{
+	if (!t) return;
+	if (t->fmt == PICA_TF_RGBA8)
+		tex_swizzle((uint32_t*)t->tex.data, t->tex.width, t->tex.height, rgba);
+	else
+		tex_swizzle_small(t->tex.data, t->tex.width, t->tex.height, rgba, t->fmt);
+	tex_flush(t);
+}
+
+PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias)
+{
+	if (!pica_init() || levels < 1) return NULL;
+	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
+	if (!t) return NULL;
+	const bool ok = tex_init(&t->tex, w, h, levels - 1, GPU_RGBA8);
+	if (!ok) {
+		free(t);
+		return NULL;
+	}
+	C3D_TexSetFilterMipmap(&t->tex, GPU_LINEAR);
+	C3D_TexSetLodBias(&t->tex, lodBias);
+	t->bytes = C3D_TexCalcTotalSize(t->tex.size, levels - 1);
+	tex_count(t, 1);
+	return t;
+}
+
+void pica_tex_upload_level(PicaTex* t, int level, const uint8_t* rgba)
+{
+	if (!t || level > t->tex.maxLevel) return;
+	tex_swizzle((uint32_t*)C3D_Tex2DGetImagePtr(&t->tex, level, NULL), t->tex.width >> level, t->tex.height >> level,
+	            rgba);
+	if (level == t->tex.maxLevel) tex_flush(t);
 }
 
 void pica_tex_free(PicaTex* t)
 {
 	if (!t) return;
+	t->dead = 1;
 	if (s_ndead[0] < MAX_DEFERRED) {
 		s_dead[0][s_ndead[0]++] = t;
 	} else {
@@ -307,6 +665,14 @@ int pica_cycle_gpu_test(void)
 	return s_gpuTest;
 }
 int pica_gpu_test(void) { return s_gpuTest; }
+void pica_set_gpu_test(int mode) { s_gpuTest = mode; }
+/* One object's draws cut to 8x8 pixels (the profiler's per-object part). */
+static int s_drawCut;
+void pica_set_draw_cut(int cut)
+{
+	if (cut != s_drawCut) s_last_valid = 0;
+	s_drawCut = cut;
+}
 
 /* Where the game thread is in the renderer, for the main thread's hang report (pica_where). */
 static const char* volatile s_where = "not started";
@@ -334,7 +700,8 @@ uint32_t pica_frame_draws(void) { return s_frameDraws; }
  * that is not running only stores the command. citro3d's frame calls are replaced here: its
  * C3D_FrameBegin would wait, and C3D_FrameDrawOn/C3D_FrameSplit need its own in-frame flag. */
 bool C3Di_SplitFrame(u32** pBuf, u32* pSize); /* citro3d internal (base.c), exported */
-#define OVL_ENTRIES 32
+#define OVL_ENTRIES 96
+#define OVL_COPY_LIMIT 64 /* entries texture copies may fill; the rest for the frame's own */
 static int s_ovlWanted;           /* pica_set_overlap */
 static int s_ovl;                 /* frames are overlapped from the next frame start on */
 static gxCmdQueue_s s_ovq[2];
@@ -423,6 +790,10 @@ static void ovl_frame_begin(void)
 	GX_BindQueue(q);
 	GPUCMD_SetBuffer(s_ovCmd[s_ovb], s_ovCmdWords, 0);
 }
+static int ovl_queue_room(void) { return s_ovq[s_ovb].numEntries < OVL_COPY_LIMIT; }
+
+static void readback_finish(void);
+static void readback_queue(void);
 
 static void ovl_frame_end(void)
 {
@@ -438,6 +809,8 @@ static void ovl_frame_end(void)
 	}
 	s_where = "waiting for the GPU to finish the previous frame";
 	ovl_wait_running();
+	readback_finish(); /* the previous frame's copies are drawn: into the game's memory */
+	readback_queue();  /* this frame's, fetched from VRAM after its draws */
 	/* The previous frame has swapped the screens: this transfer targets the new back buffer. */
 	if (s_top->used) {
 		s_top->used = false;
@@ -544,6 +917,7 @@ static int frame_begin_ex(u8 flags)
 	}
 	s_where = "in a frame (game code or drawing)";
 	s_dead_due = 1;
+	s_frameNo++;
 	s_cmdFrameStart = gpuCmdBuf;
 	s_splitAtWords = 0;
 	s_partEntries = 0;
@@ -558,6 +932,8 @@ static int frame_begin_ex(u8 flags)
 	draw_on(s_efb);
 	set_cpu_proj(&s_projEfb);
 	s_in_frame = 1;
+	if (s_ovl) vram_drain(); /* VRAM copies that did not fit in the last frame's queue */
+	if (s_ovl && s_vfyOn) vram_verify();
 	return 1;
 }
 
@@ -687,6 +1063,7 @@ int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
 }
 
 static void apply_state(const PicaState* st);
+static void second_pass(GPU_Primitive_t prim, int count, const void* idx, const PicaState* st);
 static void gpu_check(const char* kind, const PicaGxLayout* L, uint32_t nidx, const PicaState* st);
 
 void* pica_ring_tail(uint32_t* avail)
@@ -783,6 +1160,29 @@ static inline void vunif(int id, float x, float y, float z, float w)
 	if (v->x != x || v->y != y || v->z != z || v->w != w) C3D_FVUnifSet(GPU_VERTEX_SHADER, id, x, y, z, w);
 }
 
+static inline int vzero(const float* v) { return v[0] == 0.f && v[1] == 0.f && v[2] == 0.f && v[3] == 0.f; }
+
+/* The shader's shortcuts for this draw (gx_pass.v.pica): each only skips work whose result the
+ * uniforms already fix. Unshaded draws skip the normal and the shade; a unit whose rows T are zero
+ * has the coordinate 0 either way; a unit whose source is exactly its own attribute (unit N from
+ * v(3+N), the usual case) skips building the source. */
+static void gx_shortcuts(const PicaGxUniforms* u)
+{
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bLit, u->LD[3] != 0.f);
+	for (int k = 0; k < 3; k++) {
+		const float* w0 = u->W[2 * k];
+		const float* w1 = u->W[2 * k + 1];
+		int direct;
+		if (k < 2)
+			direct = w0[0] == 0.f && w0[1] == 0.f && w0[2] == (k == 0 ? 1.f : 0.f) &&
+			         w0[3] == (k == 1 ? 1.f : 0.f) && vzero(w1);
+		else
+			direct = vzero(w0) && w1[0] == 1.f && w1[1] == 0.f && w1[2] == 0.f && w1[3] == 0.f;
+		C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bTu[k], !(vzero(u->T[2 * k]) && vzero(u->T[2 * k + 1])));
+		C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bTd[k], direct);
+	}
+}
+
 int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
                  const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
                  const PicaState* st)
@@ -824,11 +1224,13 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	vunif(s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
 	vunif(s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
 	vunif(s_uLD, u->LD[0], u->LD[1], u->LD[2], u->LD[3]);
+	gx_shortcuts(u);
 	C3D_BufInfo* bi = C3D_GetBufInfo();
 	BufInfo_Init(bi);
 	BufInfo_Add(bi, verts, L->stride, s_gxEntries, s_gxPerm);
 	s_frameDraws++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
+	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
 	gpu_check("GPU-transform draw", L, nidx, st);
 	maybe_split();
 	return 1;
@@ -853,16 +1255,47 @@ static void passthrough_from(int first)
 	C3D_TexEnvBufUpdate(C3D_Both, 0);
 }
 
+/* A GameCube alpha test passing two alpha ranges (a <= r1 or a >= r0, the sea's waves) is two
+ * PICA draws, one per range: no pixel passes both, so the result is the same. */
+static void second_pass(GPU_Primitive_t prim, int count, const void* idx, const PicaState* st)
+{
+	if (!st->alpha_test2) return;
+	C3D_AlphaTest(true, (GPU_TESTFUNC)st->alpha_func2, st->alpha_ref2);
+	C3D_DrawElements(prim, count, C3D_UNSIGNED_SHORT, idx);
+	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
+}
+
 static void apply_state(const PicaState* st)
 {
 	if (s_last_valid && memcmp(st, &s_last, sizeof *st) == 0) return;
 	for (int u = 0; u < PICA_MAX_TEX; u++) {
 		if (!st->tex[u]) continue;
-		C3D_Tex* tex = &st->tex[u]->tex;
+		PicaTex* pt = st->tex[u];
+		C3D_Tex* tex = &pt->tex;
 		C3D_TexSetWrap(tex, (GPU_TEXTURE_WRAP_PARAM)st->wrap_s[u], (GPU_TEXTURE_WRAP_PARAM)st->wrap_t[u]);
 		C3D_TexSetFilter(tex, st->linear[u] ? GPU_LINEAR : GPU_NEAREST, st->linear[u] ? GPU_LINEAR : GPU_NEAREST);
+		C3D_TexSetLodBias(tex, st->lod_bias[u] / 256.0f);
+		pt->lastUse = s_frameNo;
+		if (!pt->vram && !pt->rt && s_vramTex && s_ovl && s_in_frame) vram_try(pt);
+		if (pt->vready && !pt->noVram) { /* the VRAM copy is queued ahead of this frame's draws */
+			pt->vramUse = s_frameNo;
+			pt->vtex = pt->tex;
+			pt->vtex.data = pt->vram;
+			tex = &pt->vtex;
+		}
+		if (u == 0 && st->proj0) { /* (s, t) divided by q (texcoord0w) per pixel */
+			s_projTex = *tex;
+			s_projTex.param = (s_projTex.param & ~GPU_TEXTURE_MODE(7)) | GPU_TEXTURE_MODE(GPU_TEX_PROJECTION);
+			tex = &s_projTex;
+		}
 		C3D_TexBind(u, tex);
 	}
+	if (!s_last_valid || st->proj0 != s_last.proj0) C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bPj, st->proj0 != 0);
+	/* Depth is the GameCube's own (-z/w); a decal drawn on the surface under it (the goop layer)
+	 * is moved toward the camera by a few steps of the PICA's float24 depth, which is coarser near
+	 * 1 than the GameCube's 24-bit fixed point and lets the two fight. */
+	if (!s_last_valid || st->depth_bias != s_last.depth_bias)
+		C3D_DepthMap(true, -1.0f, st->depth_bias ? -1.0f / 16384.0f : 0.0f);
 	if (st->nstages == 0) {
 		C3D_TexEnv* env = C3D_GetTexEnv(0);
 		C3D_TexEnvInit(env);
@@ -890,7 +1323,7 @@ static void apply_state(const PicaState* st)
 	}
 	C3D_AlphaTest(st->alpha_test, (GPU_TESTFUNC)st->alpha_func, st->alpha_ref);
 	C3D_CullFace((GPU_CULLMODE)st->cull);
-	if (s_gpuTest == 1) {
+	if (s_gpuTest == 1 || s_drawCut) {
 		C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 8, 8);
 	} else if (st->scissor) {
 		/* The EFB texture holds the EFB with its bottom row first (pica_efb_uv); scissor
@@ -924,6 +1357,7 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 	BufInfo_Add(bi, verts, sizeof(PicaVtx), 5, 0x43210);
 	s_frameDraws++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
+	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
 	gpu_check("CPU-path draw", NULL, nidx, st);
 	maybe_split();
 }
@@ -999,28 +1433,144 @@ void pica_efb_uv(float x, float y, float* s, float* t)
 	*t = 1.0f - y * (1.0f / PICA_EFB_HEIGHT);
 }
 
-PicaTex* pica_copy_tex_create(void)
+static void* copy_arena_alloc(uint32_t bytes, PicaTex* t)
+{
+	uint32_t n = 1;
+	while (n * COPY_UNIT < bytes) n <<= 1;
+	if (!s_copyArena || n > COPY_UNITS) return NULL;
+	for (uint32_t at = 0; at + n <= COPY_UNITS; at += n) {
+		uint32_t k = 0;
+		while (k < n && !s_copyUnitUsed[at + k]) k++;
+		if (k < n) continue;
+		memset(&s_copyUnitUsed[at], 1, n);
+		t->arenaUnit = (uint16_t)at;
+		t->arenaUnits = (uint16_t)n;
+		s_copyUnits += n;
+		if (s_copyUnits > s_copyUnitsPeak) s_copyUnitsPeak = s_copyUnits;
+		return s_copyArena + at * COPY_UNIT;
+	}
+	return NULL;
+}
+
+static void copy_tex_mem_free(PicaTex* t)
+{
+	if (t->arenaUnits) {
+		memset(&s_copyUnitUsed[t->arenaUnit], 0, t->arenaUnits);
+		s_copyUnits -= t->arenaUnits;
+		t->arenaUnits = 0;
+	} else if (t->tex.data) {
+		vramFree(t->tex.data);
+	}
+	t->tex.data = NULL;
+}
+
+/* The nearest power of two to v (by ratio), 8 to max. */
+static uint32_t near_pow2(float v, uint32_t max)
+{
+	uint32_t p = 8;
+	while (p < max && v > (float)p * 1.41421356f) p <<= 1;
+	return p;
+}
+
+void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, uint16_t* tw, uint16_t* th,
+                          float win[4])
+{
+	const float kx = (float)EFB_TEX_W / PICA_EFB_WIDTH, ky = (float)EFB_TEX_H / PICA_EFB_HEIGHT;
+	if (exact) {
+		/* The rectangle's EFB texels as they are, in a window of the EFB texture of power-of-two
+		 * sides: drawn back into the EFB and copied again, it comes back unchanged. */
+		int tx0 = (int)(x * kx), ty0 = (int)(y * ky);
+		int tx1 = (int)ceilf((x + w) * kx), ty1 = (int)ceilf((y + h) * ky);
+		tx1 = tx1 > EFB_TEX_W ? EFB_TEX_W : tx1;
+		ty1 = ty1 > EFB_TEX_H ? EFB_TEX_H : ty1;
+		uint32_t pw = 8, ph = 8;
+		while ((int)pw < tx1 - tx0 && pw < EFB_TEX_W) pw <<= 1;
+		while ((int)ph < ty1 - ty0 && ph < EFB_TEX_H) ph <<= 1;
+		if (tx0 + (int)pw > EFB_TEX_W) tx0 = EFB_TEX_W - (int)pw;
+		if (ty0 + (int)ph > EFB_TEX_H) ty0 = EFB_TEX_H - (int)ph;
+		*tw = (uint16_t)pw;
+		*th = (uint16_t)ph;
+		win[0] = tx0 / kx;
+		win[1] = ty0 / ky;
+		win[2] = pw / kx;
+		win[3] = ph / ky;
+		return;
+	}
+	/* The rectangle stretched over the texture: at the EFB texture's resolution, or the GX copy's
+	 * own size when smaller. */
+	const float ew = w * kx, eh = h * ky;
+	const float gw = half ? w * 0.5f : w, gh = half ? h * 0.5f : h;
+	*tw = (uint16_t)near_pow2(ew < gw ? ew : gw, EFB_TEX_W);
+	*th = (uint16_t)near_pow2(eh < gh ? eh : gh, EFB_TEX_H);
+	win[0] = x;
+	win[1] = y;
+	win[2] = w;
+	win[3] = h;
+}
+
+int pica_copy_tex_fits(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565)
+{
+	return t && t->tex.width == tw && t->tex.height == th && (t->tex.fmt == GPU_RGB565) == (rgb565 != 0);
+}
+
+PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
 {
 	if (!pica_init()) return NULL;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
 	if (!t) return NULL;
-	if (!C3D_TexInitVRAM(&t->tex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) {
+	const GPU_TEXCOLOR fmt = rgb565 ? GPU_RGB565 : GPU_RGBA8;
+	const uint32_t bytes = tw * th * (rgb565 ? 2u : 4u);
+	void* mem = copy_arena_alloc(bytes, t);
+	if (!mem) mem = vramAlloc(bytes);
+	if (!mem) {
+		vram_make_room(bytes);
+		mem = vramAlloc(bytes);
+	}
+	if (!mem) {
+		fprintf(stderr, "[pica] no VRAM for a %lux%lu EFB-copy texture (%lu KB free)\n", (unsigned long)tw,
+		        (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10));
 		free(t);
 		return NULL;
 	}
+	/* A 2D texture's mode and filters as the EFB texture's, at mem. */
+	t->tex = s_efbTex;
+	t->tex.data = mem;
+	t->tex.fmt = fmt;
+	t->tex.size = bytes;
+	t->tex.width = (u16)tw;
+	t->tex.height = (u16)th;
+	t->tex.lodParam = 0;
 	t->rt = C3D_RenderTargetCreateFromTex(&t->tex, GPU_TEXFACE_2D, 0, -1);
 	if (!t->rt) {
-		C3D_TexDelete(&t->tex);
+		copy_tex_mem_free(t);
 		free(t);
 		return NULL;
 	}
-	t->bytes = EFB_TEX_W * EFB_TEX_H * 4;
+	t->bytes = bytes;
+	s_copyTexCount++;
 	return t;
 }
 
-/* Draws the EFB texture over the whole of the bound target (EFB pixel space), as the present
- * pass and EFB copies do. alpha_one: alpha 1 instead of the EFB's (formats without alpha). */
+void pica_copy_arena(uint32_t* usedKB, uint32_t* peakKB, uint32_t* totalKB)
+{
+	*usedKB = s_copyUnits * (COPY_UNIT >> 10);
+	*peakKB = s_copyUnitsPeak * (COPY_UNIT >> 10);
+	*totalKB = s_copyArena ? COPY_ARENA_BYTES >> 10 : 0;
+}
+
+/* Draws the rectangle (x, y, w, h) of the EFB texture (EFB pixels) over the whole of the bound
+ * target, as the present pass (the whole EFB) and EFB copies (their source rectangle) do.
+ * alpha_one: alpha 1 instead of the EFB's (formats without alpha). */
+static void draw_efb_quad_ch(int alpha_one, C3D_Tex* src, int chan, float x, float y, float w, float h);
 static void draw_efb_quad(int alpha_one, C3D_Tex* src)
+{
+	draw_efb_quad_ch(alpha_one, src, -1, 0.0f, 0.0f, PICA_EFB_WIDTH, PICA_EFB_HEIGHT);
+}
+
+/* chan: -1 the texels as they are; 0-3 that channel (r, g, b, a) in all four, as GX reads a
+ * one-channel copy (R8 or I8 as I8: intensity and alpha); 5 red in rgb and alpha kept (RA4,
+ * RA8 as IA4, IA8). */
+static void draw_efb_quad_ch(int alpha_one, C3D_Tex* src, int chan, float x, float y, float w, float h)
 {
 	PicaVtx* v;
 	uint16_t* idx;
@@ -1036,7 +1586,8 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 		v[i].z = 0.0f;
 		v[i].w = 1.0f;
 		memset(v[i].tc, 0, sizeof v[i].tc);
-		pica_efb_uv(corners[i][0], corners[i][1], &v[i].tc[0][0], &v[i].tc[0][1]);
+		pica_efb_uv(x + corners[i][0] * (w / PICA_EFB_WIDTH), y + corners[i][1] * (h / PICA_EFB_HEIGHT), &v[i].tc[0][0],
+		            &v[i].tc[0][1]);
 		v[i].rgba[0] = v[i].rgba[1] = v[i].rgba[2] = v[i].rgba[3] = 255;
 	}
 	static const uint16_t q[6] = {0, 1, 2, 0, 2, 3};
@@ -1053,6 +1604,19 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 		C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, 0, 0);
 	}
 	C3D_TexEnvFunc(env, C3D_Alpha, GPU_REPLACE);
+	if (chan >= 0 && chan <= 3) {
+		static const int rgbOp[4] = {GPU_TEVOP_RGB_SRC_R, GPU_TEVOP_RGB_SRC_G, GPU_TEVOP_RGB_SRC_B, GPU_TEVOP_RGB_SRC_ALPHA};
+		static const int aOp[4] = {GPU_TEVOP_A_SRC_R, GPU_TEVOP_A_SRC_G, GPU_TEVOP_A_SRC_B, GPU_TEVOP_A_SRC_ALPHA};
+		if (chan == 3 && alpha_one) { /* alpha of an EFB without one: 1 */
+			C3D_TexEnvSrc(env, C3D_Both, GPU_CONSTANT, 0, 0);
+		} else {
+			C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, 0, 0);
+			C3D_TexEnvOpRgb(env, (GPU_TEVOP_RGB)rgbOp[chan], 0, 0);
+			C3D_TexEnvOpAlpha(env, (GPU_TEVOP_A)aOp[chan], 0, 0);
+		}
+	} else if (chan == 5) {
+		C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_R, 0, 0);
+	}
 	passthrough_from(1);
 	C3D_TexBind(0, src);
 	C3D_SetScissor(GPU_SCISSOR_DISABLE, 0, 0, 0, 0);
@@ -1068,14 +1632,19 @@ static void draw_efb_quad(int alpha_one, C3D_Tex* src)
 	s_last_valid = 0;
 }
 
-void pica_efb_copy_to(PicaTex* dst, int alpha_one)
+void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[4])
 {
 	if (!dst || !dst->rt || !pica_init()) return;
+	const float x = win[0], y = win[1], w = win[2], h = win[3];
+	dst->wx = x;
+	dst->wy = y;
+	dst->ww = w;
+	dst->wh = h;
 	if (!s_in_frame) frame_begin();
 	/* A draw pass, not a texture copy: it stays in the frame's command list (no CPU wait) and
 	 * can fix alpha, as the GameCube's copy does for EFB formats without alpha. */
 	draw_on(dst->rt);
-	draw_efb_quad(alpha_one, &s_efbTex);
+	draw_efb_quad_ch(alpha_one, &s_efbTex, chan, x, y, w, h);
 	draw_on(s_efb);
 	{
 		char what[96];
@@ -1117,6 +1686,162 @@ void pica_present(void)
 	s_last_valid = 0;
 	s_clear_pending = 1; /* the GameCube clears the EFB as it copies it out */
 }
+
+/* EFB copy readback. The CPU reads some copies back (the goop map: TPollutionLayer reads its
+ * R8 copy to tell where the floor is polluted), but copies live in VRAM snapshots. A copy asked
+ * for here is fetched into linear memory by a GPU transfer queued after its frame's draws
+ * (overlapped frames only), and once that frame has finished, converted to the GX tiled layout
+ * of a one-byte format (8x4 texel tiles) and written to the copy's destination: two frames
+ * late. Several copies to one destination in a frame: the last one is written. */
+typedef struct {
+	PicaTex* tex;
+	uint8_t* dest;
+	uint16_t dw, dh, tilesPerRow;
+	uint8_t chan; /* 0-3: r, g, b, a; 4: luminance */
+	uint16_t tw, th; /* the copy texture's size (RGBA8) */
+	float x, y, w, h; /* the source rectangle, EFB pixels */
+	float wx, wy, ww, wh; /* the texture's EFB window (its latest copy's) */
+	uint8_t* buf;
+} Readback;
+#define MAX_READBACK 8
+static Readback s_rbCur[MAX_READBACK], s_rbRun[MAX_READBACK];
+static int s_nrbCur, s_nrbRun;
+static uint32_t s_rbDone, s_rbSkipped;
+
+void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, int chan, float x, float y, float w,
+                       float h)
+{
+	if (!t || !dest || dw <= 0 || dh <= 0 || w <= 0 || h <= 0 || t->tex.fmt != GPU_RGBA8 || t->ww <= 0 || t->wh <= 0)
+		return;
+	if (!s_ovl) {
+		if (!s_rbSkipped++) fprintf(stderr, "[pica] EFB copy readback needs overlapped frames: skipped\n");
+		return;
+	}
+	Readback* r = NULL;
+	for (int i = 0; i < s_nrbCur; i++)
+		if (s_rbCur[i].dest == dest) r = &s_rbCur[i];
+	if (!r) {
+		if (s_nrbCur == MAX_READBACK) return;
+		r = &s_rbCur[s_nrbCur++];
+	}
+	r->tex = t;
+	r->dest = (uint8_t*)dest;
+	r->dw = (uint16_t)dw;
+	r->dh = (uint16_t)dh;
+	r->tilesPerRow = (uint16_t)tilesPerRow;
+	r->chan = (uint8_t)chan;
+	r->tw = t->tex.width;
+	r->th = t->tex.height;
+	r->x = x;
+	r->y = y;
+	r->w = w;
+	r->h = h;
+	r->wx = t->wx;
+	r->wy = t->wy;
+	r->ww = t->ww;
+	r->wh = t->wh;
+	r->buf = NULL;
+}
+
+static void readback_queue(void)
+{
+	/* Pixels cut to 8x8 (GPU test): the copies hold nothing real, so they must not reach the
+	 * game's memory (the goop map would lose its goop). */
+	if (s_gpuTest) {
+		s_nrbCur = s_nrbRun = 0;
+		return;
+	}
+	for (int i = 0; i < s_nrbCur; i++) {
+		Readback* r = &s_rbCur[i];
+		const uint32_t size = (uint32_t)r->tw * r->th * 4;
+		LIN_LOCK();
+		r->buf = (uint8_t*)linearAlloc(size);
+		LIN_UNLOCK();
+		if (!r->buf) continue;
+		GX_TextureCopy((u32*)r->tex->tex.data, 0, (u32*)r->buf, 0, size, 8);
+	}
+	memcpy(s_rbRun, s_rbCur, sizeof(Readback) * (size_t)s_nrbCur);
+	s_nrbRun = s_nrbCur;
+	s_nrbCur = 0;
+}
+
+/* A one-byte GX texture (8x4 tiles) as a PGM image, for looking at what the readback writes. */
+static void rb_dump(const char* tag, const Readback* r)
+{
+	char path[64];
+	snprintf(path, sizeof path, "sdmc:/sms/goop-%s.pgm", tag);
+	FILE* f = fopen(path, "wb");
+	if (!f) return;
+	fprintf(f, "P5 %u %u 255\n", r->dw, r->dh);
+	for (int y = 0; y < r->dh; y++)
+		for (int x = 0; x < r->dw; x++)
+			fputc(r->dest[((uint32_t)(y >> 2) * r->tilesPerRow + (x >> 3)) * 32 + (y & 3) * 8 + (x & 7)], f);
+	fclose(f);
+	fprintf(stderr, "[pica] goop map written to %s\n", path);
+}
+
+static void readback_finish(void)
+{
+	for (int i = 0; i < s_nrbRun; i++) {
+		Readback* r = &s_rbRun[i];
+		if (!r->buf) continue;
+		const uint32_t rowBytes = (uint32_t)r->tw * 8 * 4;
+		GSPGPU_InvalidateDataCache(r->buf, (uint32_t)r->th * r->tw * 4);
+		static const int byteOf[4] = {3, 2, 1, 0}; /* RGBA8 texels are stored A, B, G, R */
+		const uint32_t bytes = (uint32_t)((r->dh + 3) / 4) * r->tilesPerRow * 32;
+		uint32_t before = 0, after = 0, maxv = 0;
+		const int logIt = s_rbDone % 150 == 0;
+		if (logIt)
+			for (uint32_t k = 0; k < bytes; k++) before += r->dest[k] > 100;
+		if (s_rbDone == 0) rb_dump("cpu", r);
+		/* The texture holds its EFB window with the top row at t = 1, which the PICA stores first
+		 * (pica_tex_upload writes the image's bottom row first): memory row v is EFB row
+		 * wy + v * wh / th. */
+		const float sx = r->w / r->dw, sy = r->h / r->dh;
+		const float ku = r->tw / r->ww, kv = r->th / r->wh;
+		for (int y = 0; y < r->dh; y++) {
+			int v = (int)((r->y + (y + 0.5f) * sy - r->wy) * kv);
+			v = v < 0 ? 0 : v > r->th - 1 ? r->th - 1 : v;
+			const uint8_t* trow = r->buf + (uint32_t)(v >> 3) * rowBytes;
+			uint8_t* drow = r->dest + ((uint32_t)(y >> 2) * r->tilesPerRow) * 32 + (y & 3) * 8;
+			const int vy = v & 7;
+			const int my = (vy & 1) << 1 | (vy & 2) << 2 | (vy & 4) << 3;
+			for (int x = 0; x < r->dw; x++) {
+				int u = (int)((r->x + (x + 0.5f) * sx - r->wx) * ku);
+				u = u < 0 ? 0 : u > r->tw - 1 ? r->tw - 1 : u;
+				const int ux = u & 7;
+				const int m = (ux & 1) | (ux & 2) << 1 | (ux & 4) << 2 | my;
+				const uint8_t* px = trow + ((u >> 3) * 64 + m) * 4;
+				uint8_t val;
+				if (r->chan < 4) val = px[byteOf[r->chan]];
+				else val = (uint8_t)((px[3] * 77 + px[2] * 150 + px[1] * 29) >> 8);
+				drow[(x >> 3) * 32 + (x & 7)] = val;
+			}
+		}
+		if (s_rbDone == 0 || s_rbDone == 1 || s_rbDone == 30 || s_rbDone == 300) {
+			char tag[16];
+			snprintf(tag, sizeof tag, "gpu%u", (unsigned)s_rbDone);
+			rb_dump(tag, r);
+		}
+		if (logIt) {
+			for (uint32_t k = 0; k < bytes; k++) {
+				after += r->dest[k] > 100;
+				if (r->dest[k] > maxv) maxv = r->dest[k];
+			}
+			fprintf(stderr, "[pica] readback %u: %p %ux%u chan %u, texels over 100: %lu before, %lu after (max %lu)\n",
+			        (unsigned)s_rbDone, (void*)r->dest, r->dw, r->dh, r->chan, (unsigned long)before,
+			        (unsigned long)after, (unsigned long)maxv);
+		}
+		LIN_LOCK();
+		linearFree(r->buf);
+		LIN_UNLOCK();
+		r->buf = NULL;
+		s_rbDone++;
+	}
+	s_nrbRun = 0;
+}
+
+uint32_t pica_readbacks(void) { return s_rbDone; }
 
 uint32_t pica_copies(void) { return s_copies; }
 

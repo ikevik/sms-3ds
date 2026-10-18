@@ -27,6 +27,18 @@ ROMFS       := romfs
 GFXBUILD    := $(ROMFS)/gfx
 
 APP_TITLE       := Super Mario Sunshine
+# DEMO=slide: a separate demo app (sms3ds-slide.3dsx) that boots past the intro straight into
+# Delfino Plaza's secret slide and returns there on every scene change (decomp patch 0008).
+DEMO_STAGE_slide := 21
+ifneq ($(strip $(DEMO)),)
+DEMO_STAGE  := $(DEMO_STAGE_$(DEMO))
+ifeq ($(DEMO_STAGE),)
+$(error unknown DEMO=$(DEMO); known: slide)
+endif
+TARGET      := sms3ds-$(DEMO)
+BUILD       := build3ds-$(DEMO)
+APP_TITLE   := Super Mario Sunshine ($(DEMO) demo)
+endif
 APP_DESCRIPTION := Native 3DS port (WIP) - requires your own GMSE01 disc image
 APP_AUTHOR      := ikevik
 # ICON := gfx/icon.png   (uncomment once you have a 48x48 icon)
@@ -35,6 +47,9 @@ APP_AUTHOR      := ikevik
 ARCH     := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 CFLAGS   := -g -Wall -O2 -mword-relocations -ffunction-sections $(ARCH)
 CFLAGS   += $(INCLUDE) -D__3DS__ -DSMS_PLATFORM_3DS=1
+ifneq ($(strip $(DEMO_STAGE)),)
+CFLAGS   += -DSMS_DEMO_STAGE=$(DEMO_STAGE)
+endif
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
@@ -42,6 +57,8 @@ ifeq ($(MODE),game)
 # Route the game's renamed operator new/new[] through platform/3ds/game_new_3ds.cpp,
 # which logs allocations the game heap could not satisfy.
 SMSLIBS  := -Wl,--wrap=__sms_game_new -Wl,--wrap=__sms_game_new_array
+# Movie frames decode on core 2 (platform/3ds/thp_3ds.cpp).
+SMSLIBS  += -Wl,--wrap=THPVideoDecode
 # The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
 # and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
 SMSLIBS  += -Wl,--no-enum-size-warning

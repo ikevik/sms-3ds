@@ -1,0 +1,162 @@
+--- a/libs/JSystem/src/JDrama/JDRViewObj.cpp	2026-10-17 13:15:50
++++ b/libs/JSystem/src/JDrama/JDRViewObj.cpp	2026-10-17 13:16:09
+@@ -1,5 +1,13 @@
+ #include <JSystem/JDrama/JDRViewObj.hpp>
+ 
++#if defined(__3DS__)
++// 3DS profiler (platform/3ds/prof_3ds.cpp): during a profile run, each object's perform is
++// timed, less the objects it performs in turn, and summed by class (vtable) and frame phase.
++extern "C" int SMS3DS_ProfOn;
++extern "C" void SMS3DS_ProfObjBegin(const void* vtable, const char* name);
++extern "C" void SMS3DS_ProfObjEnd(void);
++#endif
++
+ void JDrama::TViewObj::testPerform(u32 cue, JDrama::TGraphics* graphics)
+ {
+ 	if (((cue & CUE_MOVEMENT_GATE_A) != 0) && unkC.check(CUE_MOVEMENT_GATE_A)) {
+@@ -10,6 +18,14 @@
+ 	}
+ 	cue &= ~unkC.get();
+ 	if (cue) {
++#if defined(__3DS__)
++		if (SMS3DS_ProfOn) {
++			SMS3DS_ProfObjBegin(*(const void* const*)this, getName());
++			perform(cue, graphics);
++			SMS3DS_ProfObjEnd();
++			return;
++		}
++#endif
+ 		perform(cue, graphics);
+ 	}
+ }
+--- a/src/System/MarDirectorDirect.cpp	2026-10-17 13:15:50
++++ b/src/System/MarDirectorDirect.cpp	2026-10-17 13:16:09
+@@ -1,4 +1,13 @@
+ #include <System/MarDirector.hpp>
++
++#if defined(__3DS__)
++// 3DS profiler (platform/3ds/prof_3ds.cpp): timed only during a profile run.
++extern "C" int SMS3DS_ProfOn;
++extern "C" void SMS3DS_ProfPhase(int phase);
++#define SMS3DS_PROF_PHASE(p) do { if (SMS3DS_ProfOn) SMS3DS_ProfPhase(p); } while (0)
++#else
++#define SMS3DS_PROF_PHASE(p) do { } while (0)
++#endif
+ #include <JSystem/JDrama/JDRNameRefGen.hpp>
+ #include <JSystem/JKernel/JKRFileLoader.hpp>
+ #include <JSystem/JDrama/JDRCamera.hpp>
+@@ -196,11 +205,13 @@
+ 			if ((unk58 & 1) || (unk58 & 2))
+ 				bVar1 = false;
+ 
++			SMS3DS_PROF_PHASE(3);  // hit check
+ 			if (bVar1)
+ 				gpObjHitCheck->checkActorsHit();
+ 			else
+ 				gpObjHitCheck->clearHitNum();
+ 
++			SMS3DS_PROF_PHASE(4);  // movement list
+ 			u32 movementCue = ~blacklistedCues;
+ 			if (unk58 & 1)
+ 				movementCue &= ~CUE_MOVEMENT_GATE_A;
+@@ -215,8 +226,11 @@
+ 			if (!checkFlag(DIRECTOR_FLAG_LAST_SIMULATION_TICK))
+ 				someCue |= CUE_CALC_ANIM;
+ 			u32 unk30Cue = ~someCue;
++			SMS3DS_PROF_PHASE(5);  // list unk30
+ 			unk30->perform(unk30Cue, &local_140);
++			SMS3DS_PROF_PHASE(6);  // director movement()
+ 			movement();
++			SMS3DS_PROF_PHASE(7);  // calc-anim list
+ 			if (!(blacklistedCues & CUE_CALC_ANIM)) {
+ 				if (checkDemoFlag(DEMO_FLAG_SHINE_GET_STOP_THE_WORLD))
+ 					mShinePfLstAnm->perform(~blacklistedCues, &local_140);
+@@ -226,15 +240,19 @@
+ 
+ 			if (checkFlag(DIRECTOR_FLAG_LAST_SIMULATION_TICK)) {
+ 				local_140.unk0 = 0;
++				SMS3DS_PROF_PHASE(8);  // last-tick list unk34
+ 				unk34->perform(CUE_ALL, &local_140);
+ 				break;
+ 			}
+ 		} else {
+ 			local_140.unk0 = 0;
++			SMS3DS_PROF_PHASE(9);  // pre-draw lists
+ 			unk40->perform(CUE_ALL, &local_140);
+ 			unk38->perform(CUE_ALL, &local_140);
+ 			unk3C->perform(CUE_ALL, &local_140);
++			SMS3DS_PROF_PHASE(10);  // GX list
+ 			mPerformListGX->perform(CUE_ALL, &local_140);
++			SMS3DS_PROF_PHASE(11);  // silhouette list
+ 			if ((gpSilhouetteManager->unk48 > 0.0f ? true : false)
+ 			    || gpCamera->unk2C8 != -1) {
+ 				mPerformListSilhouette->perform(CUE_ALL, &local_140);
+@@ -247,6 +265,7 @@
+ 			u32 sms_mod_cue_ = CUE_ALL;
+ 			if (sms_mod_word(0x80299CF0, &sms_mod_w_) && (sms_mod_w_ >> 16) == 0x3880)
+ 				sms_mod_cue_ = (u32)(s32)(s16)sms_mod_w_;
++			SMS3DS_PROF_PHASE(12);  // GX post list
+ 			mPerformListGXPost->perform(sms_mod_cue_, &local_140);
+ 		}
+ #else
+@@ -254,6 +273,7 @@
+ #endif
+ 			GXInvalidateTexAll();
+ 		}
++		SMS3DS_PROF_PHASE(13);  // change state
+ 		desiredAppState = ({ typedef __typeof__(changeState()) sms_mod_r_; void* sms_mod_t_ = SMS_MOD_SITE(0x80299D0C); sms_mod_t_ ? ((__typeof__(sms_mod_as_free(static_cast<sms_mod_r_ (TMarDirector::*)()>(&TMarDirector::changeState))))sms_mod_t_)(this) : changeState(); });
+ 		offFlag(DIRECTOR_FLAG_LAST_SIMULATION_TICK
+ 		        | DIRECTOR_FLAG_FIRST_SIMULATION_TICK);
+--- a/src/System/Application.cpp	2026-10-17 13:15:50
++++ b/src/System/Application.cpp	2026-10-17 13:16:09
+@@ -38,6 +38,16 @@
+ #include <System/ProcessMeter.hpp>
+ #include <System/CardManager.hpp>
+ #include <System/ScenarioArchiveName.hpp>
++
++#if defined(__3DS__)
++// 3DS profiler (platform/3ds/prof_3ds.cpp): timed only during a profile run.
++extern "C" int SMS3DS_ProfOn;
++extern "C" void SMS3DS_ProfPhase(int phase);
++#define SMS3DS_PROF_PHASE(p) do { if (SMS3DS_ProfOn) SMS3DS_ProfPhase(p); } while (0)
++extern "C" void SMS3DS_ProfFrame(void);
++#else
++#define SMS3DS_PROF_PHASE(p) do { } while (0)
++#endif
+ 
+ #if defined(__3DS__)
+ // 3DS demo builds (sms3ds-<stage>.3dsx): the stage every scene change goes to after the
+@@ -1300,7 +1310,12 @@
+ #ifdef TARGET_PC
+ 		ApplicationSaveStateFrame(this);
+ #endif
++#if defined(__3DS__)
++		SMS3DS_ProfFrame();  // a profile run starts and ends on frame boundaries
++#endif
++		SMS3DS_PROF_PHASE(0);  // start rendering
+ 		mDisplay->startRendering();
++		SMS3DS_PROF_PHASE(1);  // pads
+ 
+ 		ApplicationStartTimerTwice(mDisplay->getVideo()->mLastRetraceTime, 0);
+ 		TTimeRec::snapGxTimeStatic(0);
+@@ -1351,8 +1366,12 @@
+ 					nextState = ((s32(*)(JDrama::TDirector*))sms_mod_t_)(mDirector);
+ 				else
+ #endif
++				{
++				SMS3DS_PROF_PHASE(2);  // director (setup, other directors)
+ 				nextState = mDirector->direct();
++				}
+ 			}
++			SMS3DS_PROF_PHASE(14);  // fader, sound
+ 
+ 			JDrama::TGraphics graphics;
+ 			graphics.unk0 = 0;
+@@ -1385,6 +1404,7 @@
+ 		ApplicationWarpFrame(this);
+ #endif
+ 		TTimeRec::endTimer();
++		SMS3DS_PROF_PHASE(15);  // end rendering
+ 
+ 		({ typedef __typeof__(THPPlayerDrawDone()) sms_mod_r_; void* sms_mod_t_ = SMS_MOD_SITE(0x802A630C); if (sms_mod_t_) ((__typeof__(&THPPlayerDrawDone))sms_mod_t_)(); else THPPlayerDrawDone(); });
+ 		mDisplay->endRendering();

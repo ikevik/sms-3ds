@@ -53,9 +53,14 @@ typedef struct {
 	uint8_t scissor;                                  /* scissor box in EFB pixels: x0, y0 (top) to x1, y1 */
 	uint16_t sc_x0, sc_y0, sc_x1, sc_y1;
 	uint8_t alpha_test, alpha_func, alpha_ref; /* GPU_TESTFUNC */
+	uint8_t alpha_test2, alpha_func2, alpha_ref2; /* second pass for a test passing two alpha ranges */
 	PicaTex* tex[PICA_MAX_TEX];                /* texture units; null: unused */
 	uint8_t wrap_s[PICA_MAX_TEX], wrap_t[PICA_MAX_TEX]; /* GPU_TEXTURE_WRAP_PARAM */
 	uint8_t linear[PICA_MAX_TEX];              /* bilinear filtering */
+	int16_t lod_bias[PICA_MAX_TEX];            /* mip LOD bias, 1/256 units (mipmapped textures) */
+	uint8_t depth_bias;                        /* depth moved slightly toward the camera (decals) */
+	uint8_t proj0;                             /* CPU vertices: unit 0's coordinate is projective, (s q, t q) in
+	                                            * tc[0] and q in tc[2][0], divided per pixel */
 	uint8_t nstages;                           /* combiner stages used; 0: vertex colour only */
 	uint8_t buf_rgb, buf_alpha;                /* combiner buffer update masks (bit i: stage i) */
 	uint32_t buf_color;                        /* combiner buffer's initial colour (0xAABBGGRR) */
@@ -78,7 +83,17 @@ int pica_alloc(uint32_t nverts, uint32_t nidx, PicaVtx** verts, uint16_t** idx);
  * first, and tiles them for the PICA. Returns null when out of linear memory. */
 PicaTex* pica_tex_create(uint32_t w, uint32_t h);
 void pica_tex_upload(PicaTex* t, const uint8_t* rgba);
+/* The same in a smaller texel format (pica_tex_upload still takes RGBA8 and packs it): half or a
+ * quarter of the memory and of the GPU's texture reads. */
+enum { PICA_TF_RGBA8, PICA_TF_RGB565, PICA_TF_RGBA5551, PICA_TF_RGBA4, PICA_TF_LA8, PICA_TF_L8 };
+PicaTex* pica_tex_create_fmt(uint32_t w, uint32_t h, int fmt);
+int pica_tex_format(const PicaTex* t);
 void pica_tex_free(PicaTex* t);
+/* An RGBA8 texture with levels mip levels (each half the last, down to 8x8 at most), sampled with
+ * linear mipmapping and the given LOD bias. Levels are uploaded one by one, the largest first;
+ * the last one makes them visible to the GPU. */
+PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias);
+void pica_tex_upload_level(PicaTex* t, int level, const uint8_t* rgba);
 /* LA8 textures (16 bits per texel), written directly: pica_tex_data is the texture's memory in the
  * PICA's tiled layout (8x8 tiles, Morton order, rows from the image's bottom); pica_tex_written
  * makes the writes visible to the GPU. */
@@ -87,12 +102,33 @@ void* pica_tex_data(PicaTex* t);
 void pica_tex_written(PicaTex* t);
 uint32_t pica_tex_bytes(const PicaTex* t);
 
-/* EFB copies: a copy texture is a whole-EFB snapshot (texture copy of the EFB render target).
- * pica_efb_uv maps an EFB pixel position to texture coordinates in such a texture (and in the
- * EFB texture). */
-PicaTex* pica_copy_tex_create(void);
-void pica_efb_copy_to(PicaTex* dst, int alpha_one); /* alpha_one: EFB format without alpha */
+/* EFB copies: a copy texture holds a window of the EFB (EFB pixels: x, y, w, h) stretched over
+ * the whole of it, the window's top row at t = 1. pica_copy_tex_layout gives the texture's size
+ * and the window for a copy of the rectangle (x, y, w, h) (half: the GX copy halves it). exact:
+ * a window of the EFB texture's own texels around the rectangle (power-of-two sides), so a copy
+ * drawn back and copied again comes back unchanged (maps the game edits this way, as the
+ * goop's); otherwise the window is the rectangle, at the EFB texture's resolution or the GX
+ * copy's size when smaller, each side the nearest power of two. rgb565: a copy without alpha
+ * (half the bytes). pica_efb_uv maps an EFB pixel position to texture coordinates in the EFB
+ * texture. */
+void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, uint16_t* tw, uint16_t* th,
+                          float win[4]);
+PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565);
+int pica_copy_tex_fits(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565);
+/* Draws the window win (x, y, w, h; EFB pixels) of the EFB into dst. alpha_one: the EFB format
+ * has no alpha. chan: -1 as is; 0-3 that channel (r, g, b, a) in all four (one-channel copy
+ * formats, as GX reads them back); 5 red in rgb, alpha kept (RA4, RA8). */
+void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[4]);
 void pica_efb_uv(float x, float y, float* s, float* t);
+/* Asks for the copy just made into t (an RGBA8 copy texture) to be written to the game's memory
+ * at dest (two frames later): dw x dh texels of a one-byte GX format (8x4 tiles, tilesPerRow
+ * tiles a row), channel chan (0-3: r, g, b, a; 4: luminance) of the source rectangle (EFB
+ * pixels). */
+void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, int chan, float x, float y, float w,
+                       float h);
+/* The EFB-copy textures' VRAM arena: in use now, most in use so far, and its size (0: none). */
+void pica_copy_arena(uint32_t* usedKB, uint32_t* peakKB, uint32_t* totalKB);
+uint32_t pica_readbacks(void);
 uint32_t pica_copies(void);
 /* Debug viewer: cycles what the top screen shows between the EFB (0) and each EFB copy of the
  * previous frame (1..n); returns the new view. */
@@ -179,6 +215,8 @@ void* pica_linear_alloc(uint32_t bytes);
 void pica_linear_free_block(void* p);
 void pica_flush(const void* p, uint32_t bytes);
 void pica_gpu_idle(void);
+/* Before the first frame: the 5 MB vertex ring (for the CPU vertex path or no resident vertices). */
+void pica_set_big_ring(int on);
 /* Starts fn(arg) on another CPU core (2, else 1), detached; returns the core, or -1. Two one-shot
  * events (0, 1) for it and the thread that started it to wake each other. */
 int pica_thread_start(void (*fn)(void*), void* arg);
@@ -194,6 +232,17 @@ double pica_gpu_ms_sum(void);
 /* Cycles the GPU test mode (0 normal, 1 game draws scissored to 8x8 pixels); returns the new mode. */
 int pica_cycle_gpu_test(void);
 int pica_gpu_test(void);
+void pica_set_gpu_test(int mode);
+/* Non-zero: the draws that follow are scissored to 8x8 pixels (per-object GPU cost). */
+void pica_set_draw_cut(int cut);
+/* Textures in VRAM while space allows (on by default). */
+void pica_set_vram_textures(int on);
+/* Checks VRAM texture copies against their originals now and then ([vram] log lines). */
+void pica_set_vram_check(int on);
+uint32_t pica_vram_copies(void);
+uint32_t pica_vram_evicted(void);
+uint32_t pica_vram_animated(void);
+void pica_tex_stats(uint32_t* vramKB, uint32_t* vramCount, uint32_t* linKB, uint32_t* linCount, uint32_t* vramFreeKB);
 /* For a hang report: what the renderer is doing on the game thread, and draws in this frame. */
 const char* pica_where(void);
 uint32_t pica_frame_draws(void);
