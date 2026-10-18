@@ -47,6 +47,10 @@ static Stats s_frame;  // the frame in progress
 static bool s_ready;
 static uint64_t s_arenaDrawVerts, s_arenaUploadBytes; // resident vertices drawn, stored (display-list arena)
 static uint64_t s_perfArenaDraw0, s_perfArenaUp0;
+// Vertices copied into batches instead: display-list runs not resident (appendDecoded) and decoded
+// draws (uncached lists, direct GXBegin/End); of the runs, those that found no room or were too
+// big for 16-bit indices (arenaUpload).
+static uint64_t s_copyRunVerts, s_copyDirectVerts, s_aNoRoomVerts, s_aTooBigVerts, s_perfCopy0[4];
 // The batch's packed vertices (layout: vtxFmtLayout(s_bfmt)). The front half decodes them straight
 // into the render queue, where the batch's draw record will be (render thread, below): flushBatch
 // writes the record's header in front of them and its indices after them, and nothing is copied.
@@ -434,6 +438,17 @@ static void perfFrameEnd() {
 		        unsigned(arenaPageCount()), unsigned(arenaBytes() >> 10),
 		        double(s_arenaUploadBytes - s_perfArenaUp0) / frames / 1024.0, (unsigned long)arenaResets(),
 		        (unsigned long)arenaFullCount(), arenaEnabled() ? "" : " (off: Up held at launch)");
+		{
+			const uint64_t c[4] = {s_copyRunVerts, s_copyDirectVerts, s_aNoRoomVerts, s_aTooBigVerts};
+			double d[4];
+			for (int i = 0; i < 4; i++) {
+				d[i] = double(c[i] - s_perfCopy0[i]) / frames;
+				s_perfCopy0[i] = c[i];
+			}
+			fprintf(stderr, "[perf]   copied into batches instead: %.0f verts/frame of display-list runs (no room %.0f, "
+			        "over 65535 %.0f, the rest lines and points), %.0f decoded (uncached lists, direct draws) | "
+			        "linear free %u KB\n", d[0], d[2], d[3], d[1], unsigned(pica_linear_free() >> 10));
+		}
 		s_perfArenaDraw0 = s_arenaDrawVerts;
 		s_perfArenaUp0 = s_arenaUploadBytes;
 		s_perfDlCalls0 = GXPC_DlCalls;
@@ -3625,6 +3640,7 @@ void primitiveEnd(uint8_t op, uint32_t n) {
 	uint32_t base = s_bcount;
 	s_bcount += n;
 	GX3DS_GameVerts += n;
+	s_copyDirectVerts += n;
 	s_vdata.resize(size_t(s_bcount) * s_bstride);
 	size_t at = s_idx.size();
 	s_idx.resize(at + size_t(n) * 3);  // no primitive makes more than 3 indices per vertex
@@ -3646,6 +3662,7 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 	uint32_t base = s_bcount;
 	s_bcount += n;
 	GX3DS_GameVerts += n;
+	s_copyRunVerts += n;
 	size_t at = s_idx.size();
 	s_idx.resize(at + nidx);
 	for (uint32_t i = 0; i < nidx; i++) s_idx[at + i] = idx[i] + base;
@@ -3656,7 +3673,8 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 // map and most scenery) are stored once in linear memory the GPU reads, and batches draw them
 // where they are: no per-frame copy into the ring (append was ~25-30 ms a frame in Delfino Plaza)
 // and no per-frame cache write-back. One page per vertex stride at a time, at most 65535
-// vertices so 16-bit indices reach them all; runs on the same page still merge into one draw.
+// vertices so 16-bit indices reach them all; runs on the same page still merge into one draw. A
+// run too large for a shared page gets a page of its own.
 // Their indices, already relative to the page, stay on the heap and are copied into the batch.
 // When the pages may take no more linear memory, uploads stop and, between two frames (the GPU
 // done with everything that drew from them), the pages are emptied and the runs stored again as
@@ -3711,21 +3729,30 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
 		for (int& p : s_apageFor) p = -1;
 		s_apagesInit = true;
 	}
-	int& pi = s_apageFor[stride];
-	if (pi < 0 || s_apages[pi].used + n > s_apages[pi].cap) {
-		const uint32_t cap = std::min<uint32_t>(65535u, kArenaPage / stride);
-		if (n > cap) return false;
+	// A page: shared by the runs of one stride, or, for a run larger than that, its own and sized to
+	// it (Delfino Plaza's map pieces; 16-bit indices still bound it to 65535 vertices).
+	const uint32_t cap = std::min<uint32_t>(65535u, kArenaPage / stride);
+	const bool own = n > cap;
+	if (n > 65535u) {
+		s_aTooBigVerts += n;
+		return false;
+	}
+	int& cur = s_apageFor[stride];
+	int pi = cur;
+	if (own || pi < 0 || s_apages[pi].used + n > s_apages[pi].cap) {
+		const uint32_t bytes = own ? (n * stride + 4095u) & ~4095u : kArenaPage;
 		void* b = nullptr;
-		if (s_abytes + kArenaPage <= kArenaMax && pica_linear_free() > kArenaReserve + kArenaPage)
-			b = pica_linear_alloc(kArenaPage);
+		if (s_abytes + bytes <= kArenaMax && pica_linear_free() > kArenaReserve + bytes) b = pica_linear_alloc(bytes);
 		if (!b) {
 			s_afull++;
+			s_aNoRoomVerts += n;
 			s_aresetDue = true;  // between frames, if the last reset was long enough ago
 			return false;
 		}
-		s_apages.push_back(ArenaPage{static_cast<uint8_t*>(b), stride, cap, 0});
+		s_apages.push_back(ArenaPage{static_cast<uint8_t*>(b), stride, own ? n : cap, 0});
 		pi = int(s_apages.size() - 1);
-		s_abytes += kArenaPage;
+		if (!own) cur = pi;
+		s_abytes += bytes;
 	}
 	ArenaPage& pg = s_apages[size_t(pi)];
 	const uint32_t vb = pg.used;
