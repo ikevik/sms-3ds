@@ -50,6 +50,10 @@ static bool s_ready;
 static bool s_mipsOn = true;
 extern "C" void GX3DS_SetMips(int on) { s_mipsOn = on != 0; }
 static uint64_t s_arenaDrawVerts, s_arenaUploadBytes; // resident vertices drawn, stored (display-list arena)
+// [perf]: the TEV cache's hits, misses and clears, and drawTriangles' TEV time by part: the
+// registers read (readTev), the state, key and lookup, the translation (misses), the rest.
+static uint64_t s_tevHits, s_tevMisses, s_tevClears, s_tevPartTicks[4];
+static uint32_t s_tevEntries;
 // Vertex reuse in the resident runs drawn (runReuse): what the GPU's post-transform vertex cache
 // could save with duplicate vertices merged. Indices, vertices stored, then the run stats.
 enum { RS_TRIS, RS_STRIP, RS_DISTINCT, RS_C8, RS_C16, RS_C32, RS_D8, RS_D16, RS_D32, RS_T16, RS_S16, kRunStat };
@@ -378,6 +382,22 @@ static void perfFrameEnd() {
 		        ms[PICA_END_PASS], ms[PICA_END_RINGS], ms[PICA_END_PARTS], ms[PICA_END_SUBMIT], ms[PICA_END_HEAP_FLUSH],
 		        ms[PICA_END_WAIT], ms[PICA_END_RB_INVAL], ms[PICA_END_RB_CONVERT], ms[PICA_END_RB_FETCH],
 		        ms[PICA_END_RUN]);
+	}
+	{
+		// The TEV cache (drawTriangles): hits, misses and clears, and its time by part.
+		static uint64_t h0, m0, c0, p0[4];
+		const double hits = double(s_tevHits - h0) / frames, misses = double(s_tevMisses - m0) / frames;
+		double part[4];
+		for (int i = 0; i < 4; i++) {
+			part[i] = double(s_tevPartTicks[i] - p0[i]) / frames / kTicksPerMs;
+			p0[i] = s_tevPartTicks[i];
+		}
+		fprintf(stderr, "[perf]   TEV cache per frame: %.0f hits, %.0f misses, %.1f clears (%u entries) | its time: read %.2f, "
+		        "state+key+lookup %.2f, translate (misses) %.2f, rest %.2f ms\n", hits, misses,
+		        double(s_tevClears - c0) / frames, unsigned(s_tevEntries), part[0], part[1], part[2], part[3]);
+		h0 = s_tevHits;
+		m0 = s_tevMisses;
+		c0 = s_tevClears;
 	}
 	char fb[256];
 	int at = 0;
@@ -2536,8 +2556,27 @@ static bool gxCompare(uint32_t c, uint32_t a, uint32_t ref) {
 	}
 }
 
+static void alphaTestCompute(PicaState& st, uint32_t r);
+// The alpha test for BP 0xF3 (alphaTestCompute): a function of the register alone, so the results
+// of the last few values are kept. Working it out tries all 256 alpha values, and it ran for every
+// batch (~6 us each, a few ms a frame on the render thread in Delfino Plaza).
 static void alphaTest(PicaState& st) {
-	const uint32_t r = rs.bp[BP_ALPHACOMPARE];
+	const uint32_t r = rs.bp[BP_ALPHACOMPARE] & 0xFFFFFF;
+	struct Memo {
+		uint32_t r;  // the register, bit 31 set once filled
+		uint8_t test, func, ref, test2, func2, ref2;
+	};
+	static Memo memo[16];
+	Memo& m = memo[(r ^ (r >> 7) ^ (r >> 15)) & 15];
+	if (m.r == (r | 0x80000000u)) {
+		st.alpha_test = m.test, st.alpha_func = m.func, st.alpha_ref = m.ref;
+		st.alpha_test2 = m.test2, st.alpha_func2 = m.func2, st.alpha_ref2 = m.ref2;
+		return;
+	}
+	alphaTestCompute(st, r);
+	m = Memo{r | 0x80000000u, st.alpha_test, st.alpha_func, st.alpha_ref, st.alpha_test2, st.alpha_func2, st.alpha_ref2};
+}
+static void alphaTestCompute(PicaState& st, uint32_t r) {
 	const uint32_t ref0 = r & 0xFF, ref1 = (r >> 8) & 0xFF, c0 = (r >> 16) & 7, c1 = (r >> 19) & 7, op = (r >> 22) & 3;
 	bool pass[256];
 	int n = 0;
@@ -2654,6 +2693,7 @@ struct TevCacheEntry {
 };
 static std::unordered_map<uint64_t, TevCacheEntry> s_tevCache;
 static const size_t kTevCacheMax = 1024;
+
 
 static uint64_t tevCacheKey(const bool pwhite[kMaxPairs], int nPairs, const PicaState& pre, bool debug,
                             PicaTex* const ptex[kMaxPairs]) {
@@ -2949,7 +2989,11 @@ static void drawTriangles() {
 	uint64_t perfTev0 = svcGetSystemTick();
 	TevSetup tev;
 	readTev(tev);
-	perfAdd(PERF_TEV, svcGetSystemTick() - perfTev0);
+	{
+		const uint64_t t = svcGetSystemTick() - perfTev0;
+		perfAdd(PERF_TEV, t);
+		s_tevPartTicks[0] += t;
+	}
 	PicaTex* ptex[kMaxPairs] = {};
 	const EfbCopy* pcopy[kMaxPairs] = {};
 	bool pwhite[kMaxPairs];
@@ -2978,14 +3022,30 @@ static void drawTriangles() {
 	bool translated = true;
 	unsigned dumpId = 0;
 	const uint64_t tevKey = tevCacheKey(pwhite, tev.nPairs, st, debug, ptex);
-	auto tevHit = s_tevCache.find(tevKey);
-	const bool cached = tevHit != s_tevCache.end();
-	if (cached) {
-		tev = tevHit->second.tev;
-		st = tevHit->second.st;
-		translated = tevHit->second.translated;
-		dumpId = tevHit->second.dumpId;
+	// The last batch's entry when the key repeats (the map's elements stay where they are until it
+	// is cleared), else a lookup.
+	static uint64_t s_lastTevKey;
+	static const TevCacheEntry* s_lastTevEntry;
+	const TevCacheEntry* hitEntry = nullptr;
+	if (s_lastTevEntry && tevKey == s_lastTevKey) {
+		hitEntry = s_lastTevEntry;
+	} else {
+		auto tevHit = s_tevCache.find(tevKey);
+		if (tevHit != s_tevCache.end()) hitEntry = &tevHit->second;
 	}
+	const bool cached = hitEntry != nullptr;
+	if (cached) {
+		tev = hitEntry->tev;
+		st = hitEntry->st;
+		translated = hitEntry->translated;
+		dumpId = hitEntry->dumpId;
+		s_lastTevKey = tevKey;
+		s_lastTevEntry = hitEntry;
+	}
+	uint64_t tevT1 = svcGetSystemTick();
+	s_tevPartTicks[1] += tevT1 - perfTev0;
+	if (cached) s_tevHits++;
+	else s_tevMisses++;
 	if (cached) {
 	} else if (debug) {
 		tev.nUnits = 0;
@@ -3012,8 +3072,17 @@ static void drawTriangles() {
 		}
 	}
 	if (!cached) {
-		if (s_tevCache.size() >= kTevCacheMax) s_tevCache.clear();
+		const uint64_t t2 = svcGetSystemTick();
+		s_tevPartTicks[2] += t2 - tevT1;
+		tevT1 = t2;
+		if (s_tevCache.size() >= kTevCacheMax) {
+			s_tevCache.clear();
+			s_tevClears++;
+		}
 		TevCacheEntry& e = s_tevCache[tevKey];
+		s_lastTevKey = tevKey;
+		s_lastTevEntry = &e;
+		s_tevEntries = uint32_t(s_tevCache.size());
 		e.tev = tev;
 		e.st = st;
 		e.translated = translated;
@@ -3063,7 +3132,11 @@ static void drawTriangles() {
 		st.alpha_func = 1;  // GPU_ALWAYS
 	}
 
-	perfAdd(PERF_TEV, svcGetSystemTick() - perfTev0);
+	{
+		const uint64_t t3 = svcGetSystemTick();
+		perfAdd(PERF_TEV, t3 - perfTev0);
+		s_tevPartTicks[3] += t3 - tevT1;
+	}
 	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
 	s_cpuBatches++;
 	if (r_spans) {
