@@ -2307,6 +2307,9 @@ int pica_selftest(void)
  * frame's GPU ms and ns per index; the setups differ from the first in one thing each. */
 enum { VB_GRID = 128, VB_VERTS = VB_GRID * VB_GRID, VB_IDX = (VB_GRID - 1) * (VB_GRID - 1) * 6 };
 enum { VB_UNIQUE_TRIS = 10922 };
+/* room for the S lines' strips: a strip each band row, two indices a quad column plus two to join */
+enum { VB_STRIP = 49152 };
+static GPU_Primitive_t s_vbPrim = GPU_TRIANGLES; /* the primitive vb_run draws */
 
 struct VbField { int reg, fmt, count, bytes; };
 static C3D_Tex s_vbTex[2];  /* setup G3's two textures */
@@ -2319,6 +2322,10 @@ static int vb_attribs(const struct VbField* f, int nf, u64* perm)
 	u64 p = 0;
 	int used = 0;
 	for (int i = 0; i < nf; i++) {
+		if (f[i].reg < 0) { /* padding: 4-16 bytes skipped */
+			p |= (u64)(0xB + f[i].bytes / 4) << (4 * i);
+			continue;
+		}
 		int a = AttrInfo_AddLoader(ai, f[i].reg, (GPU_FORMATS)f[i].fmt, f[i].count);
 		if (a < 0) return 0;
 		p |= (u64)a << (4 * i);
@@ -2427,7 +2434,7 @@ static void vb_run(const char* name, const void* verts, int stride, const struct
 				}
 			}
 			const int n = nidx - at < chunk ? nidx - at : chunk;
-			C3D_DrawElements(GPU_TRIANGLES, n, C3D_UNSIGNED_SHORT, idx + at);
+			C3D_DrawElements(s_vbPrim, n, C3D_UNSIGNED_SHORT, idx + at);
 			draws++;
 		}
 	selftest_end();
@@ -2527,7 +2534,11 @@ void pica_vertex_bench(void)
 	struct V16* lin16 = (struct V16*)linearAlloc(VB_VERTS * sizeof(struct V16));
 	uint16_t* idx = (uint16_t*)linearAlloc(VB_IDX * 2);
 	uint16_t* seq = (uint16_t*)linearAlloc(uniqueVerts * 2);
-	if (!lin56 || !lin24 || !vram56 || !vram24 || !uniq56 || !lin24m || !lin36 || !lin16 || !idx || !seq) {
+	uint16_t* idxw = (uint16_t*)linearAlloc(VB_IDX * 2);
+	uint16_t* strip = (uint16_t*)linearAlloc(VB_STRIP * 2);
+	uint8_t* linL = (uint8_t*)linearAlloc(VB_VERTS * 64);
+	if (!lin56 || !lin24 || !vram56 || !vram24 || !uniq56 || !lin24m || !lin36 || !lin16 || !idx || !seq || !idxw ||
+	    !strip || !linL) {
 		fprintf(stderr, "[vbench] not enough memory; skipped\n");
 		goto out;
 	}
@@ -2642,6 +2653,111 @@ void pica_vertex_bench(void)
 	       GPU_CULL_BACK_CCW);
 	vb_run("H' every triangle culled (front faces)", lin56, 56, f56, 7, idx, VB_IDX, R, 0, 0, 1.0f, 1, 1,
 	       GPU_CULL_FRONT_CCW);
+	/* W: D3's triangles in vertical bands of w quads, each band top to bottom: a vertex's second use
+	 * (by the next row of quads) comes 6w indices after its first, so the bands at which the cost
+	 * drops give the size of the GPU's post-transform vertex cache (rows the full width, as D3:
+	 * each vertex shaded about twice; narrow enough bands: about once). */
+	vb_run("D3 again (rows the full width)", lin36, 36, f36, 4, idx, VB_IDX, R, 0, 0, 1.0f, 1, 1, GPU_CULL_NONE);
+	{
+		static const int widths[] = {2, 3, 4, 6, 8, 12, 16, 32};
+		for (size_t k = 0; k < sizeof widths / sizeof widths[0]; k++) {
+			const int w = widths[k];
+			int n = 0;
+			for (int x0 = 0; x0 + 1 < VB_GRID; x0 += w)
+				for (int y = 0; y + 1 < VB_GRID; y++)
+					for (int x = x0; x < x0 + w && x + 1 < VB_GRID; x++) {
+						const uint16_t i0 = (uint16_t)(y * VB_GRID + x), i1 = i0 + 1, i2 = i0 + VB_GRID, i3 = i2 + 1;
+						idxw[n++] = i0, idxw[n++] = i2, idxw[n++] = i1;
+						idxw[n++] = i1, idxw[n++] = i2, idxw[n++] = i3;
+					}
+			GSPGPU_FlushDataCache(idxw, VB_IDX * 2);
+			char name[64];
+			snprintf(name, sizeof name, "W%-2d D3 in bands %d quads wide", w, w);
+			vb_run(name, lin36, 36, f36, 4, idxw, n, R, 0, 0, 1.0f, 1, 1, GPU_CULL_NONE);
+		}
+	}
+	/* S: D3's triangles as triangle strips (one index a triangle instead of three), compare the ms
+	 * with D3's: S1 one strip a row, all joined into one draw; S8/S16 strips across bands of 8 and
+	 * 16 quads (as W8/W16), joined the same way. */
+	{
+		static const int widths[] = {VB_GRID - 1, 8, 16};
+		for (size_t k = 0; k < sizeof widths / sizeof widths[0]; k++) {
+			const int w = widths[k];
+			int n = 0;
+			for (int x0 = 0; x0 + 1 < VB_GRID; x0 += w)
+				for (int y = 0; y + 1 < VB_GRID; y++) {
+					const int x1 = x0 + w < VB_GRID - 1 ? x0 + w : VB_GRID - 1;
+					if (n + 2 * (x1 - x0 + 1) + 2 > VB_STRIP) break;
+					if (n) { /* join: the last index again, then this strip's first */
+						strip[n] = strip[n - 1];
+						n++;
+						strip[n++] = (uint16_t)(y * VB_GRID + x0);
+					}
+					for (int x = x0; x <= x1; x++) {
+						strip[n++] = (uint16_t)(y * VB_GRID + x);
+						strip[n++] = (uint16_t)((y + 1) * VB_GRID + x);
+					}
+				}
+			GSPGPU_FlushDataCache(strip, (size_t)n * 2);
+			char name[64];
+			if (k == 0) snprintf(name, sizeof name, "S1 D3 as strips, one a row (one draw)");
+			else snprintf(name, sizeof name, "S%-2d D3 as strips across bands of %d", w, w);
+			s_vbPrim = GPU_TRIANGLE_STRIP;
+			vb_run(name, lin36, 36, f36, 4, strip, n, R, 0, 0, 1.0f, 1, 1, GPU_CULL_NONE);
+			s_vbPrim = GPU_TRIANGLES;
+		}
+	}
+	/* L: what each part of a layout costs, from D3's 36 bytes (f32 position and normal, u8 colour,
+	 * f32 coordinate) to A's 56 and the game's: the matrix-index block the game stores (12 bytes, 4
+	 * read and 8 skipped by a padding entry), more coordinates, and A padded to 64 bytes. */
+	{
+		enum { P_POS, P_NRM, P_CLR, P_T0, P_T1, P_T2, P_IDX, P_PAD4, P_PAD8 };
+		static const struct VbField part[] = {{REG_POS, GPU_FLOAT, 3, 12}, {REG_NRM, GPU_FLOAT, 3, 12},
+		                                      {REG_CLR, GPU_UNSIGNED_BYTE, 4, 4}, {REG_TA, GPU_FLOAT, 2, 8},
+		                                      {REG_TB, GPU_FLOAT, 2, 8}, {REG_TC, GPU_FLOAT, 2, 8},
+		                                      {REG_IDX, GPU_UNSIGNED_BYTE, 4, 4}, {-1, 0, 0, 4}, {-1, 0, 0, 8}};
+		static const struct { const char* name; int n, parts[9]; } lay[] = {
+		    {"L1 D3 + matrix index (40B)", 5, {P_POS, P_NRM, P_CLR, P_T0, P_IDX}},
+		    {"L2 D3 + the game's matrix block (48B, 8 skipped)", 6, {P_POS, P_NRM, P_CLR, P_T0, P_IDX, P_PAD8}},
+		    {"L3 D3 + 4 bytes skipped (40B)", 5, {P_POS, P_NRM, P_CLR, P_T0, P_PAD4}},
+		    {"L4 D3 + coordinate 1 (44B)", 5, {P_POS, P_NRM, P_CLR, P_T0, P_T1}},
+		    {"L5 D3 + coordinates 1, 2 (52B)", 6, {P_POS, P_NRM, P_CLR, P_T0, P_T1, P_T2}},
+		    {"L6 A (56B, as line A)", 7, {P_POS, P_NRM, P_CLR, P_T0, P_T1, P_T2, P_IDX}},
+		    {"L7 A + 8 bytes skipped (64B)", 8, {P_POS, P_NRM, P_CLR, P_T0, P_T1, P_T2, P_IDX, P_PAD8}},
+		    {"L8 position, colour, coordinate (24B, unlit)", 3, {P_POS, P_CLR, P_T0}},
+		    {"L9 position, normal (24B)", 2, {P_POS, P_NRM}},
+		};
+		for (size_t k = 0; k < sizeof lay / sizeof lay[0]; k++) {
+			struct VbField f[9];
+			int stride = 0;
+			for (int j = 0; j < lay[k].n; j++) {
+				f[j] = part[lay[k].parts[j]];
+				stride += f[j].bytes;
+			}
+			for (int v = 0; v < VB_VERTS; v++) {
+				const struct V56* a = &lin56[v];
+				uint8_t* o = linL + (size_t)v * stride;
+				for (int j = 0; j < lay[k].n; j++) {
+					const void* src = NULL;
+					switch (lay[k].parts[j]) {
+					case P_POS: src = a->pos; break;
+					case P_NRM: src = a->nrm; break;
+					case P_CLR: src = a->clr; break;
+					case P_T0: src = a->t0; break;
+					case P_T1: src = a->t1; break;
+					case P_T2: src = a->t2; break;
+					case P_IDX: src = a->mtx; break;
+					}
+					if (src) memcpy(o, src, (size_t)f[j].bytes);
+					else memset(o, 0, (size_t)f[j].bytes);
+					o += f[j].bytes;
+				}
+			}
+			GSPGPU_FlushDataCache(linL, (size_t)VB_VERTS * stride);
+			const int lit = lay[k].parts[1] == P_NRM;
+			vb_run(lay[k].name, linL, stride, f, lay[k].n, idx, VB_IDX, R, 0, 0, 1.0f, lit, lay[k].n > 2, GPU_CULL_NONE);
+		}
+	}
 	fprintf(stderr, "[vbench] done\n");
 out:
 	if (lin56) linearFree(lin56);
@@ -2654,6 +2770,9 @@ out:
 	if (lin16) linearFree(lin16);
 	if (idx) linearFree(idx);
 	if (seq) linearFree(seq);
+	if (idxw) linearFree(idxw);
+	if (strip) linearFree(strip);
+	if (linL) linearFree(linL);
 	/* the GPU state, buffer and uniforms here were the benchmark's own */
 	s_mode = MODE_NONE;
 	s_gxLayoutValid = 0;

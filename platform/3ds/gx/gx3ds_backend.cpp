@@ -46,6 +46,20 @@ static Stats s_frame;  // the frame in progress
 // as a draw record (render thread, below), which draws it from its own copy (r_verts, r_idx).
 static bool s_ready;
 static uint64_t s_arenaDrawVerts, s_arenaUploadBytes; // resident vertices drawn, stored (display-list arena)
+// Vertex reuse in the resident runs drawn (runReuse): what the GPU's post-transform vertex cache
+// could save with duplicate vertices merged. Indices, vertices stored, then the run stats.
+enum { RS_TRIS, RS_STRIP, RS_DISTINCT, RS_C8, RS_C16, RS_C32, RS_D8, RS_D16, RS_D32, RS_T16, RS_S16, kRunStat };
+static uint64_t s_reuse[2 + kRunStat], s_reuse0[2 + kRunStat];
+// Resident runs store each distinct vertex once (arenaUpload; GX3DS_SetMergeDuplicates), and those
+// drawn where order makes no difference have their triangles reordered for the GPU's vertex cache
+// (GX3DS_SetReorder). Reordered runs drawn, and those of them drawn where order matters, for [perf].
+static bool s_mergeDup = true, s_reorder = true;
+static uint64_t s_reordDraws, s_reordUnsafe;
+// Runs stored, by indices, by what decided their order (orderWhy): reordered, then kept for
+// blending or a logic op, no depth test, no depth update, a compare that does not order.
+static uint64_t s_reordWhy[5];
+// Vertices drawn per frame by vertex format (VtxFmtBits): which layouts the GPU fetches.
+static uint64_t s_fmtVerts[1u << 13], s_fmtVerts0[1u << 13];
 static uint64_t s_perfArenaDraw0, s_perfArenaUp0;
 // Vertices copied into batches instead: display-list runs not resident (appendDecoded) and decoded
 // draws (uncached lists, direct GXBegin/End); of the runs, those that found no room or were too
@@ -492,6 +506,71 @@ static void perfFrameEnd() {
 		sb0 = s_spanBatches;
 		sd0 = s_spansDrawn;
 		sc0 = s_spanCopies;
+		{
+			double r[2 + kRunStat];
+			for (int j = 0; j < 2 + kRunStat; j++) {
+				r[j] = double(s_reuse[j] - s_reuse0[j]) / frames;
+				s_reuse0[j] = s_reuse[j];
+			}
+			fprintf(stderr, "[perf]   vertex reuse in resident runs per frame: %.0f indices, %.0f triangles (%.0f%% continuing "
+			        "a strip), %.0f vertices stored%s, %.0f distinct | vertices shaded with a FIFO cache of 8/16/32: as "
+			        "recorded %.0f/%.0f/%.0f, duplicates merged %.0f/%.0f/%.0f, merged and reordered (cache 16) %.0f\n",
+			        r[0], r[2 + RS_TRIS], r[2 + RS_TRIS] > 0 ? 100.0 * r[2 + RS_STRIP] / r[2 + RS_TRIS] : 0.0, r[1],
+			        s_mergeDup ? " (duplicates merged)" : " (duplicates kept: circle pad right at launch)",
+			        r[2 + RS_DISTINCT], r[2 + RS_C8], r[2 + RS_C16], r[2 + RS_C32], r[2 + RS_D8], r[2 + RS_D16],
+			        r[2 + RS_D32], r[2 + RS_T16]);
+			const double why = double(s_reordWhy[0] + s_reordWhy[1] + s_reordWhy[2] + s_reordWhy[3] + s_reordWhy[4]);
+			fprintf(stderr, "[perf]   as stored (cache 16): %.0f vertices shaded per frame | runs stored so far, by indices: "
+			        "reordered %.0f%%, kept for blending/logic op %.0f%%, no depth test %.0f%%, no depth update %.0f%%, "
+			        "compare not ordering %.0f%%\n", r[2 + RS_S16], why > 0 ? 100.0 * s_reordWhy[0] / why : 0.0,
+			        why > 0 ? 100.0 * s_reordWhy[1] / why : 0.0, why > 0 ? 100.0 * s_reordWhy[2] / why : 0.0,
+			        why > 0 ? 100.0 * s_reordWhy[3] / why : 0.0, why > 0 ? 100.0 * s_reordWhy[4] / why : 0.0);
+			static uint64_t rd0, ru0;
+			fprintf(stderr, "[perf]   reordered runs drawn per frame: %.1f, %.1f of them where order matters (blending, no "
+			        "depth test or update, compare equal/always)%s\n", double(s_reordDraws - rd0) / frames,
+			        double(s_reordUnsafe - ru0) / frames,
+			        !s_mergeDup || !s_reorder ? " | reordering off (A or circle pad right held at launch)" : "");
+			rd0 = s_reordDraws;
+			ru0 = s_reordUnsafe;
+		}
+		{
+			// The vertex formats drawn, most vertices first.
+			uint32_t top[8];
+			double tv[8];
+			int nt = 0;
+			double all = 0;
+			for (uint32_t f = 0; f < (1u << 13); f++) {
+				const double v = double(s_fmtVerts[f] - s_fmtVerts0[f]) / frames;
+				s_fmtVerts0[f] = s_fmtVerts[f];
+				if (v <= 0) continue;
+				all += v;
+				int at;
+				if (nt < 8) at = nt++;
+				else if (v > tv[7]) at = 7;
+				else continue;
+				while (at > 0 && tv[at - 1] < v) {
+					top[at] = top[at - 1];
+					tv[at] = tv[at - 1];
+					at--;
+				}
+				top[at] = f;
+				tv[at] = v;
+			}
+			char line[640];
+			int o = 0;
+			for (int i = 0; i < nt; i++) {
+				const uint32_t f = top[i];
+				char d[64];
+				int k = snprintf(d, sizeof d, "%s%s%s", (f & VF_NRM) ? ((f & VF_NBT) ? "nbt " : "nrm ") : "",
+				                 (f & VF_CLR0) ? "c0 " : "", (f & (VF_CLR0 << 1)) ? "c1 " : "");
+				for (int t = 0; t < 8; t++)
+					if (f & (VF_TEX0 << t)) k += snprintf(d + k, sizeof d - k, "t%d ", t);
+				if (f & VF_MTX) k += snprintf(d + k, sizeof d - k, "mtx ");
+				o += snprintf(line + o, sizeof line - o, "%s pos %s(%uB) %.0f", i ? " |" : "", d,
+				              unsigned(vtxFmtLayout(f).stride), tv[i]);
+			}
+			fprintf(stderr, "[perf]   vertices drawn by format per frame (%.0f in all): %s\n", all, line);
+		}
 		{
 			const uint64_t c[4] = {s_copyRunVerts, s_copyDirectVerts, s_aNoRoomVerts, s_aTooBigVerts};
 			double d[4];
@@ -3502,9 +3581,11 @@ static void enqueueDraw() {
 		count = s_bmax;
 		verts = s_bArena;
 		s_arenaDrawVerts += s_bmax - s_bmin;
+		s_fmtVerts[s_bfmt & 0x1FFF] += s_bmax - s_bmin;
 	} else {
 		count = s_bcount;
 		verts = s_vdata.data();
+		s_fmtVerts[s_bfmt & 0x1FFF] += s_bcount;
 	}
 	const uint32_t nspans = s_bArena ? uint32_t(s_bSpans.size()) : 0;
 	const uint32_t nidx = s_bArena ? s_bSpanIdx : uint32_t(s_idx.size());
@@ -3827,7 +3908,171 @@ uint32_t arenaGeneration() { return s_agen; }
 // low byte the highest position matrix index; [1], [2]: each coordinate's texture matrix index,
 // 0xFF where it varies. The render side checks these instead of the page window's vertices.
 // [3]: where its 16-bit indices are stored (arenaIdxAlloc), [4]: how many (with padding).
-static const uint32_t kRunInfo = 5;
+// [5]: the vertices stored (fewer than the run's when duplicates were merged), [6]: bit 0 when its
+// triangles were reordered, [7...]: its vertex reuse (runReuse, kRunStat words).
+static const uint32_t kRunInfo = 7 + kRunStat;
+
+// Duplicate vertices (the same bytes) are stored once and their indices pointed at that one
+// (s_mergeDup; circle pad right at launch: off).
+extern "C" void GX3DS_SetMergeDuplicates(int on) { s_mergeDup = on != 0; }
+// Their triangles reordered for the vertex cache (tipsify, 16 entries: about a third fewer vertices
+// shaded in Delfino Plaza), when merged and the GX state draws them the same in any order
+// (s_reorder; A held at launch: off).
+extern "C" void GX3DS_SetReorder(int on) { s_reorder = on != 0; }
+// The current GX state draws a run's triangles the same in any order: depth test and update on with
+// an ordering compare (less or greater, with or without equal), and no blending, logic op or
+// subtraction. (Exactly equal depths still go to the later triangle: coplanar overlaps in one run.)
+static int orderWhy() {  // 0: free, else the first reason it is not (s_reordWhy)
+	const uint32_t z = g.bp[BP_ZMODE], c = g.bp[BP_CMODE0];
+	const uint32_t fn = (z >> 1) & 7;  // never, less, equal, lequal, greater, nequal, gequal, always
+	if ((c & 3) || (c & (1u << 11))) return 1;
+	if (!(z & 1)) return 2;
+	if (!(z & 0x10)) return 3;
+	if (!(fn == 1 || fn == 3 || fn == 4 || fn == 6)) return 4;
+	return 0;
+}
+static bool orderFree() { return orderWhy() == 0; }
+
+// Distinct vertices by content: canon[v] is the first vertex with v's bytes. Returns their count.
+static uint32_t distinctVertices(const uint8_t* verts, uint32_t n, uint32_t stride, std::vector<uint32_t>& canon) {
+	static std::vector<uint32_t> table;
+	canon.resize(n);
+	uint32_t size = 16;
+	while (size < n * 2) size <<= 1;
+	table.assign(size, ~0u);
+	uint32_t distinct = 0;
+	for (uint32_t v = 0; v < n; v++) {
+		const uint8_t* p = verts + size_t(v) * stride;
+		uint32_t h = 2166136261u;
+		for (uint32_t b = 0; b < stride; b++) h = (h ^ p[b]) * 16777619u;
+		for (uint32_t at = h & (size - 1);; at = (at + 1) & (size - 1)) {
+			if (table[at] == ~0u) {
+				table[at] = v;
+				canon[v] = v;
+				distinct++;
+				break;
+			}
+			if (memcmp(verts + size_t(table[at]) * stride, p, stride) == 0) {
+				canon[v] = table[at];
+				break;
+			}
+		}
+	}
+	return distinct;
+}
+
+// Tipsify (Sander, Nehab and Barczak 2007): the triangles reordered for a FIFO vertex cache of k
+// entries, each keeping its winding. For the [perf] estimate only (runReuse): reordering changes
+// the drawing order, which blended triangles show.
+static void tipsify(const uint32_t* idx, uint32_t nidx, uint32_t n, uint32_t k, std::vector<uint32_t>& out) {
+	static std::vector<uint32_t> start, adj, live, ctime, dead;
+	static std::vector<uint8_t> done;
+	const uint32_t nt = nidx / 3;
+	start.assign(n + 1, 0);
+	for (uint32_t i = 0; i < nt * 3; i++) start[idx[i] + 1]++;
+	for (uint32_t v = 0; v < n; v++) start[v + 1] += start[v];
+	live.assign(n, 0);
+	for (uint32_t v = 0; v < n; v++) live[v] = start[v + 1] - start[v];
+	adj.resize(nt * 3);
+	{
+		static std::vector<uint32_t> fill;
+		fill.assign(start.begin(), start.end() - 1);
+		for (uint32_t t = 0; t < nt; t++)
+			for (int j = 0; j < 3; j++) adj[fill[idx[t * 3 + j]]++] = t;
+	}
+	ctime.assign(n, 0);
+	done.assign(nt, 0);
+	dead.clear();
+	out.clear();
+	uint32_t s = k + 1, cursor = 0;
+	static std::vector<uint32_t> cand;
+	int64_t f = 0;
+	while (f >= 0 && live[uint32_t(f)] == 0) f = ++cursor < n ? int64_t(cursor) : -1;
+	while (f >= 0) {
+		cand.clear();
+		for (uint32_t a = start[uint32_t(f)]; a < start[uint32_t(f) + 1]; a++) {
+			const uint32_t t = adj[a];
+			if (done[t]) continue;
+			done[t] = 1;
+			for (int j = 0; j < 3; j++) {
+				const uint32_t v = idx[t * 3 + j];
+				out.push_back(v);
+				dead.push_back(v);
+				cand.push_back(v);
+				live[v]--;
+				if (s - ctime[v] > k) ctime[v] = s++;
+			}
+		}
+		int64_t best = -1, bp = -1;
+		for (uint32_t v : cand) {
+			if (!live[v]) continue;
+			int64_t pr = 0;
+			if (int64_t(s - ctime[v]) + 2 * int64_t(live[v]) <= int64_t(k)) pr = s - ctime[v];
+			if (pr > bp) bp = pr, best = v;
+		}
+		if (best < 0) {
+			while (!dead.empty() && best < 0) {
+				const uint32_t d = dead.back();
+				dead.pop_back();
+				if (live[d]) best = d;
+			}
+			while (best < 0 && cursor < n) {
+				if (live[cursor]) best = cursor;
+				else cursor++;
+			}
+		}
+		f = best;
+	}
+}
+
+// A run's vertex reuse, worked out when it is stored: its triangles, those that continue the one
+// before as a strip does (a native strip would draw them with one index each), its distinct
+// vertices (the same bytes: the same vertex), and the vertices a FIFO post-transform cache of 8,
+// 16 and 32 entries would shade, for the indices as stored and with duplicates merged (the GPU
+// shades a vertex again whenever its index has left the cache, and duplicates never hit it).
+static void runReuse(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32_t* idx, uint32_t nidx,
+                     uint32_t* st) {
+	static std::vector<uint32_t> canon, ins, merged, order;
+	const uint32_t distinct = distinctVertices(verts, n, stride, canon);
+	static const uint32_t kSizes[3] = {8, 16, 32};
+	ins.resize(n);
+	for (int merged = 0; merged < 2; merged++)
+		for (int k = 0; k < 3; k++) {
+			std::fill(ins.begin(), ins.end(), ~0u);
+			uint32_t shaded = 0;  // misses; ins[v]: the miss count when v went in
+			for (uint32_t i = 0; i < nidx; i++) {
+				const uint32_t v = merged ? canon[idx[i]] : idx[i];
+				if (ins[v] == ~0u || shaded - ins[v] >= kSizes[k]) ins[v] = shaded++;
+			}
+			st[RS_C8 + merged * 3 + k] = shaded;
+		}
+	uint32_t strip = 0;
+	for (uint32_t t = 3; t + 2 < nidx; t += 3) {
+		const uint32_t* a = idx + t - 3;
+		const uint32_t* b = idx + t;
+		uint32_t m1 = std::max(a[0], std::max(a[1], a[2]));
+		uint32_t m2 = a[0] + a[1] + a[2] - m1 - std::min(a[0], std::min(a[1], a[2]));
+		int has = 0;
+		uint32_t third = 0;
+		for (int j = 0; j < 3; j++) {
+			if (b[j] == m1 || b[j] == m2) has++;
+			else third = b[j];
+		}
+		if (has == 2 && third == m1 + 1) strip++;
+	}
+	st[RS_TRIS] = nidx / 3;
+	st[RS_STRIP] = strip;
+	st[RS_DISTINCT] = distinct;
+	// duplicates merged and the triangles reordered (tipsify), with the GPU's cache of about 16
+	merged.resize(nidx);
+	for (uint32_t i = 0; i < nidx; i++) merged[i] = canon[idx[i]];
+	tipsify(merged.data(), nidx, n, 16, order);
+	std::fill(ins.begin(), ins.end(), ~0u);
+	uint32_t shaded = 0;
+	for (uint32_t v : order)
+		if (ins[v] == ~0u || shaded - ins[v] >= 16) ins[v] = shaded++;
+	st[RS_T16] = order.size() == nidx - nidx % 3 ? shaded : 0;
+}
 
 // The runs' indices, 16-bit and relative to their page, in GPU-readable blocks: written once when
 // the run is stored, drawn from there (IdxSpan). Each page has blocks of its own, so the runs a
@@ -3913,6 +4158,7 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
 	}
 	ArenaPage& pg = s_apages[size_t(pi)];
 	const uint32_t nstore = (nidx & 1) ? nidx + 3 : nidx;
+	// (n and the page were chosen for the run's own vertex count: merging only stores fewer)
 	uint16_t* ix = arenaIdxAlloc(pg, nstore);
 	if (!ix) {
 		s_afull++;
@@ -3921,22 +4167,62 @@ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32
 		return false;
 	}
 	const uint32_t vb = pg.used;
-	for (uint32_t i = 0; i < nidx; i++) ix[i] = uint16_t(idx[i] + vb);
+	uint8_t* dst = pg.base + size_t(vb) * stride;
+	uint32_t nstored = n, flags = 0;
+	if (s_mergeDup) {
+		static std::vector<uint32_t> canon, slot, merged, order;
+		distinctVertices(verts, n, stride, canon);
+		slot.resize(n);
+		nstored = 0;
+		for (uint32_t v = 0; v < n; v++)
+			if (canon[v] == v) {
+				memcpy(dst + size_t(nstored) * stride, verts + size_t(v) * stride, stride);
+				slot[v] = nstored++;
+			}
+		merged.resize(nidx);
+		for (uint32_t i = 0; i < nidx; i++) merged[i] = slot[canon[idx[i]]];
+		const uint32_t ntri = nidx - nidx % 3;
+		const int why = orderWhy();
+		s_reordWhy[why] += nidx;
+		if (s_reorder && ntri >= 6 && why == 0) {
+			tipsify(merged.data(), ntri, nstored, 16, order);
+			if (order.size() == ntri) {
+				memcpy(merged.data(), order.data(), size_t(ntri) * 4);
+				flags |= 1;
+			}
+		}
+		for (uint32_t i = 0; i < nidx; i++) ix[i] = uint16_t(merged[i] + vb);
+	} else {
+		for (uint32_t i = 0; i < nidx; i++) ix[i] = uint16_t(idx[i] + vb);
+		memcpy(dst, verts, size_t(n) * stride);
+	}
 	for (uint32_t i = nidx; i < nstore; i++) ix[i] = ix[nidx - 1];
 	pica_flush(ix, nstore * 2);
-	uint8_t* dst = pg.base + size_t(vb) * stride;
-	memcpy(dst, verts, size_t(n) * stride);
-	pica_flush(dst, n * stride);
-	pg.used += n;
+	pica_flush(dst, nstored * stride);
+	pg.used += nstored;
 	const size_t io = s_aidx.size() + kRunInfo;
 	s_aidx.resize(io);
 	s_aidx[io - kRunInfo] = 0;  // its matrices: not worked out yet (arenaRunMtx)
-	s_aidx[io - 2] = uint32_t(uintptr_t(ix));
-	s_aidx[io - 1] = nstore;
+	s_aidx[io - kRunInfo + 3] = uint32_t(uintptr_t(ix));
+	s_aidx[io - kRunInfo + 4] = nstore;
+	s_aidx[io - kRunInfo + 5] = nstored;
+	s_aidx[io - kRunInfo + 6] = flags;
+	runReuse(verts, n, stride, idx, nidx, &s_aidx[io - kRunInfo + 7]);
+	{
+		// the vertices a 16-entry FIFO cache shades for the indices as stored (merged, reordered)
+		static std::vector<uint32_t> ins;
+		ins.assign(nstored, ~0u);
+		uint32_t shaded = 0;
+		for (uint32_t i = 0; i < nidx; i++) {
+			const uint32_t v = uint32_t(ix[i]) - vb;
+			if (ins[v] == ~0u || shaded - ins[v] >= 16) ins[v] = shaded++;
+		}
+		s_aidx[io - kRunInfo + 7 + RS_S16] = shaded;
+	}
 	out.gen = s_agen;
 	out.baseVertex = int32_t((uint32_t(pi) << 16) | vb);
 	out.iOff = io;
-	s_arenaUploadBytes += uint64_t(n) * stride;
+	s_arenaUploadBytes += uint64_t(nstored) * stride;
 	return true;
 }
 
@@ -3966,16 +4252,25 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& r
 				if (s_bTexMtx[c] != tex[c]) s_bTexMtx[c] = 0xFF;
 		}
 	}
+	const uint32_t* info = &s_aidx[ref.iOff - kRunInfo];
+	const uint32_t nstored = info[5];
 	if (!batchHasVertices()) {
 		s_bArena = pg.base;
 		s_bmin = vb;
-		s_bmax = vb + n;
+		s_bmax = vb + nstored;
 	} else {
 		s_bmin = std::min(s_bmin, vb);
-		s_bmax = std::max(s_bmax, vb + n);
+		s_bmax = std::max(s_bmax, vb + nstored);
 	}
-	const uint16_t* ix = reinterpret_cast<const uint16_t*>(uintptr_t(s_aidx[ref.iOff - 2]));
-	const uint32_t ns = s_aidx[ref.iOff - 1];
+	const uint16_t* ix = reinterpret_cast<const uint16_t*>(uintptr_t(info[3]));
+	const uint32_t ns = info[4];
+	s_reuse[0] += nidx;
+	s_reuse[1] += nstored;
+	for (int j = 0; j < kRunStat; j++) s_reuse[2 + j] += info[7 + j];
+	if (info[6] & 1) {
+		s_reordDraws++;
+		if (!orderFree()) s_reordUnsafe++;
+	}
 	if (!s_bSpans.empty() && s_bSpans.back().idx + s_bSpans.back().n == ix) s_bSpans.back().n += ns;
 	else s_bSpans.push_back(IdxSpan{ix, ns});
 	s_bSpanIdx += ns;

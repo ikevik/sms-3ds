@@ -48,6 +48,8 @@ void GX3DS_SetRenderThread(int on);
 void GX3DS_SetGxThread(int on);
 void GX3DS_SetListCopies(int on);
 void GX3DS_SetResidentIndicesInPlace(int on);
+void GX3DS_SetMergeDuplicates(int on);
+void GX3DS_SetReorder(int on);
 void GXPC_SetWriteFilter(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 // Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
@@ -539,6 +541,20 @@ int main()
 		GX3DS_SetResidentIndicesInPlace(0);
 		printf("Circle pad up: resident indices copied\n");
 		fprintf(stderr, "[3ds] circle pad up at launch: resident indices copied into the ring, rebased (not in place)\n");
+	}
+	// Circle pad right at launch: resident display-list runs keep their duplicate vertices (each
+	// stored as recorded), as before they were merged (to compare).
+	if (launchHeld & KEY_CPAD_RIGHT) {
+		GX3DS_SetMergeDuplicates(0);
+		printf("Circle pad right: duplicate vertices kept\n");
+		fprintf(stderr, "[3ds] circle pad right at launch: resident runs keep their duplicate vertices (not merged)\n");
+	}
+	// A held through launch: resident runs keep their triangles in the order recorded (merged runs
+	// are otherwise reordered for the vertex cache where order makes no difference).
+	if (launchHeld & KEY_A) {
+		GX3DS_SetReorder(0);
+		printf("A held: triangle order kept\n");
+		fprintf(stderr, "[3ds] A held at launch: resident runs keep their triangle order (not reordered)\n");
 	}
 	if (launchHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
