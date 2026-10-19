@@ -8,10 +8,14 @@
 // (pica_set_gpu_test), so the GPU still transforms and sets up every triangle but draws almost
 // no pixels. GPU time in part 1 less part 2 is the pixel work.
 // Part 3, GPU by object: the objects that sent vertices in part 1 (most vertices first, up to
-// kTargets) and the draws made outside any object, one at a time, have their pixels cut while
+// kTargets) and the draws made outside any object, one at a time, are left undrawn while
 // everything else draws normally (the GX backend batches them apart; SMS3DS_ProfCutNow). The
-// GPU time saved is roughly what that object's pixels cost. Normal GPU time is measured again
-// every kPerBase objects, so a drifting view skews only the objects near it.
+// GPU time saved is what that object costs the GPU in all: its vertices, triangles and pixels.
+// Normal GPU time is measured again every kPerBase objects, so a drifting view skews only the
+// objects near it.
+// Objects are told to the GX thread in the stream (kStreamOpProfObj, patch 0028): it runs behind
+// the game thread, so the object being performed now is not the one whose draws it is parsing.
+// Vertices are counted there (SMS3DS_ProfGxVerts) and part 3's cut decided there.
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
 #include <3ds.h>
 #include <stdio.h>
@@ -39,6 +43,9 @@ int SMS3DS_ProfState(void);
 volatile int SMS3DS_ProfCutActive;
 int SMS3DS_ProfCutNow(void);
 extern int GXPC_Detail;  // patch 0027: the GX thread's detailed counters, for the run
+extern uint32_t GXPC_ProfObj;  // patch 0028: the object of the draws the GX thread is parsing
+void GXPC_StreamOp(uint8_t op, const void* args, uint32_t n);
+void SMS3DS_ProfGxVerts(uint32_t n);
 // The GameCube's MTX/VEC routines and MSL's maths (patch 0024): calls per routine, and a run of
 // one routine on sample data.
 extern unsigned sms_mtx_calls[];
@@ -143,6 +150,13 @@ void resetCpu() {
 	s_calls = 0;
 	s_depth = 0;
 	for (int i = 0; i < s_nMath; i++) s_math0[i] = mathCalls(i);
+}
+
+// Tells the GX thread the object whose draws follow (kStreamOpProfObj, patch 0028).
+void markObj(const Entry* e) {
+	const uint32_t v = uint32_t(uintptr_t(e));
+	const uint8_t a[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+	GXPC_StreamOp(0xCB, a, 4);
 }
 
 // Writes 4096 NOPs (GX opcode 0x00) to the stream each way and times them. Called with the stream
@@ -374,13 +388,17 @@ void reportCut() {
 
 }  // namespace
 
-// Called by the GX backend before it adds vertices, while SMS3DS_ProfCutActive: non-zero when
-// the object being performed (the innermost open one) is part 3's current target.
+// Called by the GX backend (GX thread) before it adds vertices, while SMS3DS_ProfCutActive:
+// non-zero when the draws' object (the stream's last kStreamOpProfObj) is part 3's target.
 int SMS3DS_ProfCutNow(void) {
-	if (s_depth == 0) return s_cutOutside;
-	if (s_depth > int(sizeof s_stack / sizeof s_stack[0])) return 0;
-	const Entry* e = s_stack[s_depth - 1].e;
-	return s_cutEntry && e == s_cutEntry;
+	const Entry* cur = reinterpret_cast<const Entry*>(uintptr_t(GXPC_ProfObj));
+	return s_cutOutside ? cur == nullptr : (s_cutEntry && cur == s_cutEntry);
+}
+
+// GX thread: n vertices added to a batch, credited to the draws' object while profiling.
+void SMS3DS_ProfGxVerts(uint32_t n) {
+	if (!SMS3DS_ProfOn) return;
+	if (Entry* e = reinterpret_cast<Entry*>(uintptr_t(GXPC_ProfObj))) e->verts += n;
 }
 
 void SMS3DS_ProfRequest(void) {
@@ -418,6 +436,7 @@ void SMS3DS_ProfObjBegin(const void* vtable, const char* name) {
 	Entry* e = lookup(vtable, s_phase, name);
 	if (e && !e->name) e->name = name;
 	s_stack[s_depth++] = {e, now, 0, GX3DS_StreamWritten(), 0, GX3DS_GameVerts, 0, GXPC_StreamPuts, 0};
+	markObj(e);
 }
 
 void SMS3DS_ProfObjEnd(void) {
@@ -426,22 +445,20 @@ void SMS3DS_ProfObjEnd(void) {
 	if (--s_depth >= int(sizeof s_stack / sizeof s_stack[0])) return;
 	const Open& o = s_stack[s_depth];
 	const uint64_t dur = now - o.start;
-	const uint32_t verts = GX3DS_GameVerts - o.v0;
 	const uint64_t bytes = GX3DS_StreamWritten() - o.b0;
 	const uint32_t puts = GXPC_StreamPuts - o.p0;
 	if (o.e) {
 		o.e->ticks += dur > o.child ? dur - o.child : 0;
-		o.e->verts += verts > o.childVerts ? verts - o.childVerts : 0;
 		o.e->bytes += bytes > o.childBytes ? bytes - o.childBytes : 0;
 		o.e->puts += puts > o.childPuts ? puts - o.childPuts : 0;
 		o.e->calls++;
 	}
 	if (s_depth > 0) {
 		s_stack[s_depth - 1].child += dur;
-		s_stack[s_depth - 1].childVerts += verts;
 		s_stack[s_depth - 1].childBytes += bytes;
 		s_stack[s_depth - 1].childPuts += puts;
 	}
+	markObj(s_depth > 0 ? s_stack[s_depth - 1].e : nullptr);  // the draws that follow are the parent's
 }
 
 // Called by the game thread at the top of every frame (gameLoop), with no object perform open.
@@ -529,7 +546,7 @@ void SMS3DS_ProfFrame(void) {
 			// Part 3 needs the objects' open/close calls (the entries stay as part 1 left them).
 			pickTargets();
 			fprintf(stderr,
-			        "[prof] GPU by object: %d objects' pixels cut one at a time, each line printed as it is "
+			        "[prof] GPU by object: %d objects' draws left out one at a time (the GPU time each costs in all), each line printed as it is "
 			        "measured (keep standing still until \"done\")\n",
 			        s_nTargets);
 			s_depth = 0;

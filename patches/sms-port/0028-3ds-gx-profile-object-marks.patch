@@ -1,0 +1,39 @@
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -339,6 +339,8 @@
+     kStreamOpFilterCheck = 0xCA, // u8 kind (0 BP, 1 CP, 2 XF), u16 register (BP 0x100 + n: konst
+                                  // colour n), u8 count, the values: a write the filter would have
+                                  // left out, which follows (gx_api.cpp, write filter check mode)
++    kStreamOpProfObj = 0xCB,     // u32: the object the draws that follow belong to (profile runs,
++                                 // platform/3ds/prof_3ds.cpp; GXPC_ProfObj)
+ };
+ // (The BP registers hold 24 bits of a 32-byte-aligned offset from MEM1: images and copy
+ // destinations below MEM1, in the program image, do not survive them.)
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1151,6 +1151,7 @@
+     case kStreamOpTexImage: return 6;
+     case kStreamOpCopyDest: return 5;
+     case kStreamOpFilterCheck: return avail < 5 ? 5 : 5 + 4 * p[4];
++    case kStreamOpProfObj: return 5;
+     default: return 1;  // kStreamOpFlush, kStreamOpTexInval
+     }
+ }
+@@ -1178,6 +1179,9 @@
+ // have lost: each kind's checks and differences are counted, the first 300 differences logged.
+ extern "C" {
+ uint32_t GXPC_FltChecks[3], GXPC_FltWrong[3];
++// The profiled object the draws being parsed belong to (kStreamOpProfObj): the GX thread runs
++// behind the game thread, so the object the game is performing now is not the one to credit.
++uint32_t GXPC_ProfObj;
+ }
+ static void filterCheck(const uint8_t* p) {
+     static const char* const kKind[3] = {"BP", "CP", "XF"};
+@@ -1263,6 +1267,7 @@
+     }
+     case kStreamOpCopyDest: g.copyDest = reinterpret_cast<void*>(uintptr_t(be32(p + 1))); break;
+     case kStreamOpFilterCheck: filterCheck(p); break;
++    case kStreamOpProfObj: GXPC_ProfObj = be32(p + 1); break;
+     default: logmsg("unknown stream command 0x%02X", p[0]); break;
+     }
+ }

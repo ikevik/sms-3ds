@@ -203,6 +203,8 @@ uint32_t GX3DS_GameVerts;
 // SMS3DS_ProfCutNow names are drawn with their pixels cut, in batches of their own.
 extern "C" volatile int SMS3DS_ProfCutActive;
 extern "C" int SMS3DS_ProfCutNow(void);
+extern "C" void SMS3DS_ProfGxVerts(uint32_t n);  // profile runs: vertices credited to the draws' object
+extern "C" int SMS3DS_ProfOn;
 static uint8_t s_bcut;  // the open batch's vertices have their pixels cut
 // Running total of every phase, for the front half's display-list timers (patch 0007) to leave out.
 extern "C" uint64_t GX3DS_OursTicks;
@@ -3688,9 +3690,7 @@ static void renderDraw(const RecHdr* h) {
 	r_nspans = d->nspans;
 	r_bmin = d->bmin;
 	r_idx = d->nspans ? nullptr : reinterpret_cast<const uint16_t*>(data + vbytes);
-	if (d->cut) pica_set_draw_cut(1);
-	drawBatch();
-	if (d->cut) pica_set_draw_cut(0);
+	if (!d->cut) drawBatch();  // (part 3 of a profile run: the target object's draws left out)
 	free(d->ext);
 }
 
@@ -3842,6 +3842,7 @@ void primitiveEnd(uint8_t op, uint32_t n) {
 	uint32_t base = s_bcount;
 	s_bcount += n;
 	GX3DS_GameVerts += n;
+	if (SMS3DS_ProfOn) SMS3DS_ProfGxVerts(n);
 	s_copyDirectVerts += n;
 	s_vdata.resize(size_t(s_bcount) * s_bstride);
 	size_t at = s_idx.size();
@@ -3864,6 +3865,7 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 	uint32_t base = s_bcount;
 	s_bcount += n;
 	GX3DS_GameVerts += n;
+	if (SMS3DS_ProfOn) SMS3DS_ProfGxVerts(n);
 	s_copyRunVerts += n;
 	size_t at = s_idx.size();
 	s_idx.resize(at + nidx);
@@ -4230,6 +4232,7 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& r
                  const uint8_t* verts) {
 	PerfScopeExcl ps(PERF_APPEND);
 	GX3DS_GameVerts += n;
+	if (SMS3DS_ProfOn) SMS3DS_ProfGxVerts(n);
 	const ArenaPage& pg = s_apages[size_t(uint32_t(ref.baseVertex) >> 16)];
 	const uint32_t vb = uint32_t(ref.baseVertex) & 0xFFFF;
 	cutCheck();
