@@ -4573,8 +4573,9 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 			at += snprintf(line + at, sizeof line - at, "%s %s %.0f/%.1f ms", at ? " |" : "", kKind[k], all * perFrame,
 			               ms);
 		}
-		fprintf(stderr, "[perf]   GX thread by command (count/frame, ms/frame estimated from 1 in 16 timed; %.1f ms "
-		        "in all):%s\n", sum, line);
+		if (sum > 0)  // timed only in profile runs (GXPC_Detail, patch 0027)
+			fprintf(stderr, "[perf]   GX thread by command (count/frame, ms/frame estimated from 1 in 16 timed; %.1f "
+			        "ms in all):%s\n", sum, line);
 	}
 	{
 		// Register writes that changed nothing (patch 0022), and the registers most direct ones hit.
@@ -4609,16 +4610,21 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 			static uint32_t d0[3];
 			uint32_t d[3];
 			for (int t = 0; t < 3; t++) d[t] = GXPC_FilterDropped[t] - d0[t], d0[t] = GXPC_FilterDropped[t];
-			fprintf(stderr,
-			        "[perf]   the game thread's write filter left out BP %.0f, CP %.0f, XF words %.0f | of the rest, a filter "
-			        "could still drop: forgetting everything at each list call BP %.0f, CP %.0f, XF words %.0f | "
-			        "forgetting only what each list writes BP %.0f, CP %.0f, XF words %.0f\n",
-			        d[0] * perFrame, d[1] * perFrame, d[2] * perFrame, f[0][0] * perFrame, f[0][1] * perFrame,
-			        f[0][2] * perFrame, f[1][0] * perFrame, f[1][1] * perFrame, f[1][2] * perFrame);
+			if (all[0][0] + all[0][1] + all[0][2] == 0)  // the GX thread's counters run in profile runs only
+				fprintf(stderr, "[perf]   the game thread's write filter left out BP %.0f, CP %.0f, XF words %.0f\n",
+				        d[0] * perFrame, d[1] * perFrame, d[2] * perFrame);
+			else
+				fprintf(stderr,
+				        "[perf]   the game thread's write filter left out BP %.0f, CP %.0f, XF words %.0f | of the rest, a "
+				        "filter could still drop: forgetting everything at each list call BP %.0f, CP %.0f, XF words %.0f "
+				        "| forgetting only what each list writes BP %.0f, CP %.0f, XF words %.0f\n",
+				        d[0] * perFrame, d[1] * perFrame, d[2] * perFrame, f[0][0] * perFrame, f[0][1] * perFrame,
+				        f[0][2] * perFrame, f[1][0] * perFrame, f[1][1] * perFrame, f[1][2] * perFrame);
 		}
 		char bpTop[160], cpTop[120];
 		top(GXPC_BpSame, bp0, 8, bpTop, sizeof bpTop);
 		top(GXPC_CpSame, cp0, 6, cpTop, sizeof cpTop);
+		if (all[0][0] + all[0][1] + all[0][2] + all[1][0] + all[1][1] + all[1][2])
 		fprintf(stderr,
 		        "[perf]   writes that changed nothing, per frame: direct BP %.0f of %.0f, CP %.0f of %.0f, XF words %.0f "
 		        "of %.0f | in cached lists BP %.0f of %.0f, CP %.0f of %.0f, XF words %.0f of %.0f | direct BP by register"

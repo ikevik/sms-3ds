@@ -38,6 +38,7 @@ void SMS3DS_ProfRequest(void);
 int SMS3DS_ProfState(void);
 volatile int SMS3DS_ProfCutActive;
 int SMS3DS_ProfCutNow(void);
+extern int GXPC_Detail;  // patch 0027: the GX thread's detailed counters, for the run
 // The GameCube's MTX/VEC routines and MSL's maths (patch 0024): calls per routine, and a run of
 // one routine on sample data.
 extern unsigned sms_mtx_calls[];
@@ -453,6 +454,7 @@ void SMS3DS_ProfFrame(void) {
 		s_request = 0;
 		s_state = 2;
 		s_frame = 0;
+		GXPC_Detail = 1;  // the GX thread's per-write counters and command timing, for this run
 		fprintf(stderr,
 		        "[prof] profile run: %d frames timed, then %d each with pixels cut to 8x8, that and the picture shrunk 8x, "
 		        "positions collapsed and no draws, then objects' pixels cut one at a time (stand still)\n",
@@ -559,6 +561,7 @@ void SMS3DS_ProfFrame(void) {
 				SMS3DS_ProfOn = 0;
 				reportCut();
 				s_state = 0;
+				GXPC_Detail = 0;
 				return;
 			}
 			// After every kPerBase targets, normal drawing again.
