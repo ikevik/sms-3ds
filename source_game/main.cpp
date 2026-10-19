@@ -279,7 +279,17 @@ static const char kDefaultSettings[] =
     "\n"
     "# Delfino Plaza's Shine shadow: how many of its 5 shells to draw (0: all 5). Each costs\n"
     "# about 1 ms a frame; they only soften the shadow's edge over a pixel or two.\n"
-    "shine_shadow_shells = 1\n";
+    "shine_shadow_shells = 1\n"
+    "\n"
+    "# Small mipmapped textures drawn with their smaller levels, as the GameCube does (on), or\n"
+    "# at full size everywhere (off). On is faster and shimmers less in the distance.\n"
+    "mipmaps = on\n";
+
+// Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
+#ifndef SMS3DS_MIPS_DEFAULT
+#define SMS3DS_MIPS_DEFAULT 1
+#endif
+extern "C" void GX3DS_SetMips(int on);
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -381,6 +391,10 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "shine_shadow_shells", v, sizeof v)) SMS3DS_ShineShells = atoi(v);
 		fprintf(stderr, "[3ds] Delfino Plaza's Shine shadow: %d shell%s (shine_shadow_shells; 0: all 5)\n",
 		        SMS3DS_ShineShells, SMS3DS_ShineShells == 1 ? "" : "s");
+		int mips = SMS3DS_MIPS_DEFAULT;
+		if (setting_value(kSettingsPath, "mipmaps", v, sizeof v)) mips = strcmp(v, "off") != 0;
+		GX3DS_SetMips(mips);
+		fprintf(stderr, "[3ds] small mipmapped textures: %s (mipmaps)\n", mips ? "with their mip levels" : "level 0 only");
 	}
 	g_phase = 1;
 	port_init(2, argv);

@@ -45,6 +45,10 @@ static Stats s_frame;  // the frame in progress
 // The game thread (the GX front half) builds each batch here; flushBatch hands it to the renderer
 // as a draw record (render thread, below), which draws it from its own copy (r_verts, r_idx).
 static bool s_ready;
+// Small mipmapped textures uploaded with their mip levels (the texture cache; GX3DS_SetMips,
+// settings.txt mipmaps).
+static bool s_mipsOn = true;
+extern "C" void GX3DS_SetMips(int on) { s_mipsOn = on != 0; }
 static uint64_t s_arenaDrawVerts, s_arenaUploadBytes; // resident vertices drawn, stored (display-list arena)
 // Vertex reuse in the resident runs drawn (runReuse): what the GPU's post-transform vertex cache
 // could save with duplicate vertices merged. Indices, vertices stored, then the run stats.
@@ -921,9 +925,13 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		}
 	}
 	// Mip levels: a mipmapped texture (min filter with mipmaps, max LOD of 1 or more) up to the
-	// PICA's 8x8, the levels the GPU may pick. Only uploaded with them when level 0 is blank (the
-	// sea's distant waves in sea.bmd, seen only through the smaller levels): every level costs
-	// linear memory, which runs short in the bigger stages.
+	// PICA's 8x8, the levels the GPU may pick. Uploaded with them when level 0 is blank (the sea's
+	// distant waves in sea.bmd, seen only through the smaller levels), and (s_mipsOn) when it has 3
+	// levels or more and is at most 128x256: a tiled texture seen far off at level 0 thrashes the
+	// GPU's texture cache (Delfino Plaza's wave.bti, 128x256 I4 with 5 levels: ~11 ms of GPU a frame
+	// with the sea in view, drawn twice for its two alpha ranges) and shimmers. The bigger ones
+	// (map.bmd's 128x1024 with 2 levels) stay at one: mip textures are RGBA8, and linear memory runs
+	// short in the bigger stages (Delfino Plaza's 39 mipmapped textures would take 4.5 MB).
 	const uint32_t mode0 = rs.bp[bpTexReg(BP_TX_MODE0, map)], mode1 = rs.bp[bpTexReg(BP_TX_MODE1, map)];
 	int mipLevels = 1;
 	if (((mode0 >> 5) & 3) != 0 && fmt != 1 && fmt <= 6 && (w & (w - 1)) == 0 && (h & (h - 1)) == 0) {
@@ -974,7 +982,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	if (mipLevels > 1) {
 		bool blank = true;
 		for (uint32_t i = 0; i < bytes && blank; i++) blank = ptr[i] == 0;
-		if (blank) levels = mipLevels;
+		if (blank || (s_mipsOn && mipLevels >= 3 && w * h <= 128u * 256u)) levels = mipLevels;
 	}
 	// Single-level textures are decoded first, to pick the texel format from what they hold.
 	const uint8_t* src = nullptr;
