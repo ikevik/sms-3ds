@@ -1,0 +1,36 @@
+--- a/src/Player/ModelWaterManager.cpp
++++ b/src/Player/ModelWaterManager.cpp
+@@ -1811,6 +1811,10 @@
+ 	0x00, 0x00, 0x7F, 0xFF
+ };
+ 
++#if defined(__3DS__)
++extern "C" int SMS3DS_ShineShells;  // source_game/main.cpp (settings.txt shine_shadow_shells)
++#endif
++
+ static void* sphere_glist_p;
+ static void* sphere_pos_t;
+ 
+@@ -1860,6 +1864,22 @@
+ 		int r31 = unk5E44;
+ 		f32 f30 = (((unk5E0C + unk5E40) - unk5E0C) / f32(r31 - 1));
+ 		f32 f31 = unk5E0C;
++#if defined(__3DS__)
++		// 3DS: fewer shells (SMS3DS_ShineShells, settings.txt shine_shadow_shells; 0: all). The
++		// shells span unk5E40 (100 units) at a radius of about 6000, which only softens the
++		// volume's edge over a pixel or two, but each one is drawn twice and its back faces cover
++		// the whole screen from inside: about 1 ms of GPU a shell in Delfino Plaza. One shell sits
++		// in the middle of the band and carries all of their alpha (the loop below divides it).
++		if (SMS3DS_ShineShells > 0 && SMS3DS_ShineShells < r31) {
++			r31 = SMS3DS_ShineShells;
++			if (r31 == 1) {
++				f31 = unk5E0C + unk5E40 * 0.5f;
++				f30 = 0.0f;
++			} else {
++				f30 = unk5E40 / f32(r31 - 1);
++			}
++		}
++#endif
+ 
+ 		GXColor local_2C;
+ 		int r27 = unk5E45;

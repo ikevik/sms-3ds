@@ -275,7 +275,49 @@ static const char kDefaultSettings[] =
     "heat_haze = off\n"
     "\n"
     "# Skip the game's movies: on or off.\n"
-    "skip_movies = off\n";
+    "skip_movies = off\n"
+    "\n"
+    "# Delfino Plaza's Shine shadow: how many of its 5 shells to draw (0: all 5). Each costs\n"
+    "# about 1 ms a frame; they only soften the shadow's edge over a pixel or two.\n"
+    "shine_shadow_shells = 1\n";
+
+// Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
+#ifndef SMS3DS_SHINE_SHELLS_DEFAULT
+#define SMS3DS_SHINE_SHELLS_DEFAULT 1
+#endif
+extern "C" {
+int SMS3DS_ShineShells = SMS3DS_SHINE_SHELLS_DEFAULT;
+}
+
+// The value settings.txt gives `name` (a line "name = value"), into out; false when it gives none.
+static bool setting_value(const char* path, const char* name, char* out, size_t outSize)
+{
+	FILE* f = fopen(path, "r");
+	if (!f) return false;
+	char line[256];
+	const size_t n = strlen(name);
+	bool found = false;
+	while (!found && fgets(line, sizeof line, f)) {
+		const char* p = line;
+		while (*p == ' ' || *p == '\t') p++;
+		if (strncmp(p, name, n) != 0) continue;
+		p += n;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p++ != '=') continue;
+		while (*p == ' ' || *p == '\t') p++;
+		found = *p && *p != '\n' && *p != '\r' && *p != '#';
+		if (found) {
+			size_t k = 0;
+			while (p[k] && p[k] != '\n' && p[k] != '\r' && p[k] != ' ' && p[k] != '\t' && p[k] != '#' && k + 1 < outSize) {
+				out[k] = p[k];
+				k++;
+			}
+			out[k] = 0;
+		}
+	}
+	fclose(f);
+	return found;
+}
 
 // Whether settings.txt gives `name` a value (a line "name = value").
 static bool setting_given(const char* path, const char* name)
@@ -334,6 +376,12 @@ static void* game_thread(void*)
 	// No heat-wave shimmer unless settings.txt asks for it: a screen copy and a full-screen
 	// distortion pass every frame in the sunny stages (Delfino Airstrip and Plaza among them).
 	if (!setting_given(kSettingsPath, "heat_haze")) setenv("SMS_HEAT_HAZE", "0", 0);
+	{
+		char v[16];
+		if (setting_value(kSettingsPath, "shine_shadow_shells", v, sizeof v)) SMS3DS_ShineShells = atoi(v);
+		fprintf(stderr, "[3ds] Delfino Plaza's Shine shadow: %d shell%s (shine_shadow_shells; 0: all 5)\n",
+		        SMS3DS_ShineShells, SMS3DS_ShineShells == 1 ? "" : "s");
+	}
 	g_phase = 1;
 	port_init(2, argv);
 	g_phase = 2;
