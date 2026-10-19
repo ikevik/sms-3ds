@@ -100,12 +100,14 @@ uint32_t s_phaseEntries[PHASES];
 int s_phase;
 uint64_t s_calls;
 
-// state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 5 GPU
-// part (positions collapsed), 6 GPU part (no draws), 4 GPU by object
+// state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 7 GPU
+// part (pixels cut, the picture shrunk 8x: nothing clipped at the screen's sides), 5 GPU part
+// (positions collapsed), 6 GPU part (no draws), 4 GPU by object
 volatile int s_request;
 int s_state, s_frame;
 uint64_t s_winStart;
-double s_gpu0, s_cpuFrameMs, s_cpuGpuMs, s_gpuCutMs, s_gpuCollapsedMs, s_cutFrame, s_collapsedFrame;
+double s_gpu0, s_cpuFrameMs, s_cpuGpuMs, s_gpuCutMs, s_gpuCollapsedMs, s_cutFrame, s_collapsedFrame, s_gpuShrunkMs,
+    s_shrunkFrame;
 
 Entry* lookup(const void* vt, int phase, const char* name) {
 	// JDrama::TDrawBufObj (every "DrawBuf ..." object) draws a whole buffer of models: one entry
@@ -386,7 +388,7 @@ void SMS3DS_ProfRequest(void) {
 
 // 0 idle, 1 CPU part, 2 GPU part (for the status screen)
 int SMS3DS_ProfState(void) {
-	return s_state == 4 ? 3 : (s_state == 3 || s_state == 5 || s_state == 6) ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0;
+	return s_state == 4 ? 3 : (s_state == 3 || s_state == 5 || s_state == 6 || s_state == 7) ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0;
 }
 
 void SMS3DS_ProfPhase(int phase) {
@@ -452,8 +454,8 @@ void SMS3DS_ProfFrame(void) {
 		s_state = 2;
 		s_frame = 0;
 		fprintf(stderr,
-		        "[prof] profile run: %d frames timed, then %d each with pixels cut to 8x8, positions collapsed and no "
-		        "draws, then objects' pixels cut one at a time (stand still)\n",
+		        "[prof] profile run: %d frames timed, then %d each with pixels cut to 8x8, that and the picture shrunk 8x, "
+		        "positions collapsed and no draws, then objects' pixels cut one at a time (stand still)\n",
 		        kFrames, kFrames);
 		return;
 	case 2:  // CPU part
@@ -475,6 +477,7 @@ void SMS3DS_ProfFrame(void) {
 		}
 		return;
 	case 3:  // GPU part, pixels cut to 8x8
+	case 7:  // pixels cut, the picture shrunk 8x about the centre
 	case 5:  // positions collapsed
 	case 6:  // no draws
 		if (++s_frame == kSettle) {
@@ -486,6 +489,14 @@ void SMS3DS_ProfFrame(void) {
 			if (s_state == 3) {
 				s_gpuCutMs = gpuMs;
 				s_cutFrame = frameMs;
+				pica_set_gpu_test(4);
+				s_state = 7;
+				s_frame = 0;
+				return;
+			}
+			if (s_state == 7) {
+				s_gpuShrunkMs = gpuMs;
+				s_shrunkFrame = frameMs;
 				pica_set_gpu_test(2);
 				s_state = 5;
 				s_frame = 0;
@@ -503,12 +514,16 @@ void SMS3DS_ProfFrame(void) {
 			const double gpuCut = s_gpuCutMs;
 			fprintf(stderr,
 			        "[prof] GPU: %.1f ms/frame drawing normally (frame %.1f ms), %.1f with pixels cut to 8x8 (frame %.1f "
-			        "ms), %.1f with positions collapsed (frame %.1f), %.1f with no draws (frame %.1f)\n",
-			        s_cpuGpuMs, s_cpuFrameMs, gpuCut, s_cutFrame, s_gpuCollapsedMs, s_collapsedFrame, gpuMs, frameMs);
+			        "ms), %.1f with that and the picture shrunk 8x (frame %.1f), %.1f with positions collapsed (frame "
+			        "%.1f), %.1f with no draws (frame %.1f)\n",
+			        s_cpuGpuMs, s_cpuFrameMs, gpuCut, s_cutFrame, s_gpuShrunkMs, s_shrunkFrame, s_gpuCollapsedMs,
+			        s_collapsedFrame, gpuMs, frameMs);
 			fprintf(stderr,
-			        "[prof] GPU split: pixels %.1f ms | clipping, triangle setup, rasterising %.1f ms | vertex fetch and "
-			        "shading %.1f ms | the rest (state, commands, copies, the present) %.1f ms\n",
-			        s_cpuGpuMs - gpuCut, gpuCut - s_gpuCollapsedMs, s_gpuCollapsedMs - gpuMs, gpuMs);
+			        "[prof] GPU split: pixels %.1f ms | triangles running past the screen's sides (the rasteriser "
+			        "walks them; clipping is what limits it) %.1f ms | triangle setup and near-plane clipping %.1f ms | "
+			        "vertex fetch and shading %.1f ms | the rest (state, commands, copies, the present) %.1f ms\n",
+			        s_cpuGpuMs - gpuCut, gpuCut - s_gpuShrunkMs, s_gpuShrunkMs - s_gpuCollapsedMs,
+			        s_gpuCollapsedMs - gpuMs, gpuMs);
 			// Part 3 needs the objects' open/close calls (the entries stay as part 1 left them).
 			pickTargets();
 			fprintf(stderr,

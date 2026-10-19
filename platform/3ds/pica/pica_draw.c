@@ -1330,6 +1330,11 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 	if (u->LD[3] != 0.0f) gx_light_vectors(nrm_rows, u->LD);
 	if (s_gpuTest == 2)
 		for (int r = 0; r < 4; r++) vunif(s_uF + r, 0.0f, 0.0f, 0.0f, r == 3 ? 1.0f : 0.0f);
+	else if (s_gpuTest == 4) /* the picture shrunk 8x about the centre: nothing crosses the sides */
+		for (int r = 0; r < 4; r++) {
+			const float k = r < 2 ? 0.125f : 1.0f;
+			vunif(s_uF + r, k * u->F[r][0], k * u->F[r][1], k * u->F[r][2], k * u->F[r][3]);
+		}
 	else
 		for (int r = 0; r < 4; r++) vunif(s_uF + r, u->F[r][0], u->F[r][1], u->F[r][2], u->F[r][3]);
 	s_fIsCpu = 0;
@@ -1479,7 +1484,7 @@ static void apply_state(const PicaState* st)
 	}
 	if (!L || st->scissor != L->scissor || st->sc_x0 != L->sc_x0 || st->sc_y0 != L->sc_y0 || st->sc_x1 != L->sc_x1 ||
 	    st->sc_y1 != L->sc_y1) {
-		if (s_gpuTest == 1 || s_drawCut) {
+		if (s_gpuTest == 1 || s_gpuTest == 4 || s_drawCut) {
 			C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 8, 8);
 		} else if (st->scissor) {
 			/* The EFB texture holds the EFB with its bottom row first (pica_efb_uv); scissor
