@@ -526,6 +526,13 @@ int main()
 		printf("Circle pad left: GX write filter off\n");
 		fprintf(stderr, "[3ds] circle pad left at launch: GX write filter off (every register write sent)\n");
 	}
+	// Circle pad down at launch: the write filter's check mode (patch 0026): every write is sent, and
+	// each one the filter would have left out is checked against the GX thread's register.
+	if (launchHeld & KEY_CPAD_DOWN) {
+		GXPC_SetWriteFilter(2);
+		printf("Circle pad down: GX write filter check\n");
+		fprintf(stderr, "[3ds] circle pad down at launch: GX write filter check mode (nothing left out, each skip checked)\n");
+	}
 	// Circle pad up at launch: resident display-list runs' indices are copied into the GPU ring each
 	// frame, rebased to the batch (the render thread's copy, as before), not drawn where stored.
 	if (launchHeld & KEY_CPAD_UP) {

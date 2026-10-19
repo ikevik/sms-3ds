@@ -1,0 +1,161 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -108,9 +108,31 @@
+ static uint32_t s_genOfBP[kFltBP], s_genOfCP[kFltCP], s_genOfXF[kFltXF];  // generation they were sent in
+ static uint32_t s_genBP = 1, s_genCP = 1, s_genXF = 1;
+ static bool s_fltMaskNext, s_fltOn = true;
++// Check mode (GXPC_SetWriteFilter(2); circle pad down at launch): nothing is left out, and each
++// write the filter would have left out is preceded by a kStreamOpFilterCheck naming the register
++// and the value the filter takes it to hold, which the GX thread compares with the register.
++static bool s_fltCheck;
+ extern "C" {
+ uint32_t GXPC_FilterDropped[3];  // BP, CP, XF words not sent
+-void GXPC_SetWriteFilter(int on) { s_fltOn = on != 0; }
++void GXPC_SetWriteFilter(int on) {
++    s_fltOn = on != 0;
++    s_fltCheck = on == 2;
++}
++}
++static void fltCheckOp(uint8_t kind, uint32_t reg, const uint32_t* v, uint32_t n) {
++    uint8_t a[4 + 4 * 16];
++    if (n > 16) return;
++    a[0] = kind;
++    a[1] = uint8_t(reg >> 8);
++    a[2] = uint8_t(reg);
++    a[3] = uint8_t(n);
++    for (uint32_t i = 0; i < n; i++) {
++        a[4 + 4 * i] = uint8_t(v[i] >> 24);
++        a[5 + 4 * i] = uint8_t(v[i] >> 16);
++        a[6 + 4 * i] = uint8_t(v[i] >> 8);
++        a[7 + 4 * i] = uint8_t(v[i]);
++    }
++    GXPC_StreamOp(kStreamOpFilterCheck, a, 4 + 4 * n);
+ }
+ namespace gx {
+ void apiForget(int kinds) {
+@@ -145,6 +167,10 @@
+     default: break;
+     }
+     if (s_genOfBP[i] == s_genBP && s_fltBP[i] == data) {
++        if (s_fltCheck) {
++            fltCheckOp(0, i, &data, 1);
++            return false;
++        }
+         GXPC_FilterDropped[0]++;
+         return true;
+     }
+@@ -155,6 +181,10 @@
+ static bool fltCP(uint8_t reg, uint32_t v) {
+     if (!fltActive()) return false;
+     if (s_genOfCP[reg] == s_genCP && s_fltCP[reg] == v) {
++        if (s_fltCheck) {
++            fltCheckOp(1, reg, &v, 1);
++            return false;
++        }
+         GXPC_FilterDropped[1]++;
+         return true;
+     }
+@@ -168,6 +198,10 @@
+     bool same = true;
+     for (uint32_t i = 0; i < n && same; i++) same = s_genOfXF[addr + i] == s_genXF && s_fltXF[addr + i] == w[i];
+     if (same) {
++        if (s_fltCheck) {
++            fltCheckOp(2, addr, w, n);
++            return false;
++        }
+         GXPC_FilterDropped[2] += n;
+         return true;
+     }
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1142,6 +1142,7 @@
+     case kStreamOpDefaultBE: return 2;
+     case kStreamOpTexImage: return 6;
+     case kStreamOpCopyDest: return 5;
++    case kStreamOpFilterCheck: return avail < 5 ? 5 : 5 + 4 * p[4];
+     default: return 1;  // kStreamOpFlush, kStreamOpTexInval
+     }
+ }
+@@ -1164,6 +1165,62 @@
+     g_arrayGen++;
+ }
+ #if defined(__3DS__)
++// Write filter check mode (gx_api.cpp): the register a write the filter would have left out
++// names, against the value the filter takes it to hold. A difference is a write the filter would
++// have lost: each kind's checks and differences are counted, the first 300 differences logged.
++extern "C" {
++uint32_t GXPC_FltChecks[3], GXPC_FltWrong[3];
++}
++static void filterCheck(const uint8_t* p) {
++    static const char* const kKind[3] = {"BP", "CP", "XF"};
++    static uint32_t s_logged;
++    const int kind = p[1] < 3 ? p[1] : 0;
++    const uint32_t reg = uint32_t(p[2]) << 8 | p[3], n = p[4];
++    for (uint32_t k = 0; k < n; k++) {
++        const uint32_t v = be32(p + 5 + 4 * k);
++        uint32_t cur = v;
++        bool same = true;
++        if (kind == 0) {
++            cur = reg >= 0x100 ? g.kreg[reg & 7] : g.bp[reg & 0xFF];
++            same = (cur & 0xFFFFFF) == (v & 0xFFFFFF);
++        } else if (kind == 1) {
++            switch (reg & 0xF0) {
++            case CP_MATIDX_A: cur = g.cpMatA; break;
++            case CP_MATIDX_B: cur = g.cpMatB; break;
++            case CP_VCD_LO: cur = g.cpVcdLo; break;
++            case CP_VCD_HI: cur = g.cpVcdHi; break;
++            case CP_VAT_A: cur = g.cpVatA[reg & 7]; break;
++            case CP_VAT_B: cur = g.cpVatB[reg & 7]; break;
++            case CP_VAT_C: cur = g.cpVatC[reg & 7]; break;
++            case CP_ARRAY_BASE:
++                cur = uint32_t(uintptr_t(g.arrayBase[reg & 15]));
++                same = g.arrayBase[reg & 15] == physToPtr(v);
++                break;
++            case CP_ARRAY_STRIDE:
++                cur = g.arrayStride[reg & 15];
++                same = cur == (v & 0xFF);
++                break;
++            default: break;
++            }
++            if ((reg & 0xF0) != CP_ARRAY_BASE && (reg & 0xF0) != CP_ARRAY_STRIDE) same = cur == v;
++        } else {
++            const uint32_t a = reg + k;
++            if (a < XF_MEM_WORDS) cur = g.xfMem[a];
++            else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT) cur = g.xfReg[a - XF_REG_BASE];
++            same = cur == v;
++        }
++        GXPC_FltChecks[kind]++;
++        if (same) continue;
++        GXPC_FltWrong[kind]++;
++        if (s_logged < 300) {
++            s_logged++;
++            logmsg("write filter check: %s %s%03x would have been left out: the filter takes it to hold %08x, it "
++                   "holds %08x (%u of %u %s checks wrong so far)", kKind[kind], kind == 0 && reg >= 0x100 ? "konst " : "",
++                   unsigned(kind == 2 ? reg + k : reg & 0xFF), unsigned(v), unsigned(cur), unsigned(GXPC_FltWrong[kind]),
++                   unsigned(GXPC_FltChecks[kind]), kKind[kind]);
++        }
++    }
++}
+ static void callDisplayListAt(const void* key, const uint8_t* data, uint32_t size, bool copy);
+ static void streamOpRun(const uint8_t* p) {
+     switch (p[0]) {
+@@ -1197,6 +1254,7 @@
+         break;
+     }
+     case kStreamOpCopyDest: g.copyDest = reinterpret_cast<void*>(uintptr_t(be32(p + 1))); break;
++    case kStreamOpFilterCheck: filterCheck(p); break;
+     default: logmsg("unknown stream command 0x%02X", p[0]); break;
+     }
+ }
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -336,6 +336,9 @@
+     kStreamOpCopyDest = 0xC8,   // u32 host pointer: an EFB copy's destination (after its BP_COPY_DST)
+     kStreamOpCallDLCopy = 0xC9, // u32 list, u32 bytes, the bytes: callDisplayList on a copy (a list
+                                 // the game rewrites in place; cached under the list's address)
++    kStreamOpFilterCheck = 0xCA, // u8 kind (0 BP, 1 CP, 2 XF), u16 register (BP 0x100 + n: konst
++                                 // colour n), u8 count, the values: a write the filter would have
++                                 // left out, which follows (gx_api.cpp, write filter check mode)
+ };
+ // (The BP registers hold 24 bits of a 32-byte-aligned offset from MEM1: images and copy
+ // destinations below MEM1, in the program image, do not survive them.)

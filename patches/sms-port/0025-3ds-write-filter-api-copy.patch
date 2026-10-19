@@ -1,0 +1,72 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -193,7 +193,12 @@
+ 
+ static void apiBP(uint32_t reg, uint32_t data) {
+     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
+-    if (fltBP(reg, data & 0xFFFFFF)) return;
++    if (fltBP(reg, data & 0xFFFFFF)) {
++#if defined(__3DS__)
++        apiKeepBP(reg, data & 0xFFFFFF);  // left out, still what the API set (the SDK's copy always is)
++#endif
++        return;
++    }
+     if (s_recording || g_gxStream) {
+         GXPC_Put8(0x61);
+         GXPC_Put32(v);
+@@ -207,7 +212,12 @@
+ static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GA.bp[reg], size, shift, v)); }
+ 
+ static void apiCP(uint8_t reg, uint32_t v) {
+-    if (fltCP(reg, v)) return;
++    if (fltCP(reg, v)) {
++#if defined(__3DS__)
++        apiKeepCP(reg, v);  // (J3D's writes go around the API's copy: it can differ from what was sent)
++#endif
++        return;
++    }
+     if (s_recording || g_gxStream) {
+         GXPC_Put8(0x08);
+         GXPC_Put8(reg);
+@@ -221,7 +231,12 @@
+ }
+ 
+ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
+-    if (fltXF(addr, n, w)) return;
++    if (fltXF(addr, n, w)) {
++#if defined(__3DS__)
++        apiKeepXF(addr, n, w);
++#endif
++        return;
++    }
+     if (s_recording || g_gxStream) {
+         GXPC_Put8(0x10);
+         GXPC_Put32(((n - 1) << 16) | addr);
+@@ -546,8 +561,17 @@
+ }
+ #if defined(__3DS__)
+ // J3D's CP helpers (J3DLoadCPCmd, J3DLoadArrayBasePtr; decomp patch 3ds-0011) write through here
+-// rather than straight to the FIFO, so the write filter sees them.
+-extern "C" void GXPC_LoadCPReg(uint8_t reg, uint32_t v) { apiCP(reg, v); }
++// rather than straight to the FIFO, so the write filter sees them. As on the console, where they
++// write the FIFO directly, they leave the API's copy of the registers (GA) alone: GXSetVtxDesc and
++// GXSetVtxAttrFmt change fields of what the API itself last set, and with J3D's vertex formats in
++// that copy the game's own draws after a model took J3D's attributes too (their vertex data read
++// as commands, geometry drawn wrong: Delfino Plaza, from build 9b67851).
++extern "C" void GXPC_LoadCPReg(uint8_t reg, uint32_t v) {
++    if (fltCP(reg, v)) return;
++    GXPC_Put8(0x08);
++    GXPC_Put8(reg);
++    GXPC_Put32(v);
++}
+ #endif
+ void GXCallDisplayList(void* list, u32 nbytes) {
+     if (s_recording) {
+@@ -1001,6 +1025,7 @@
+     apiXF(uint16_t(0x600 + lightIndex(light) * 16), 16, w);
+ }
+ void GXLoadLightObjIndx(u32 idx, GXLightID light) {
++    apiForgetXF(0x600 + lightIndex(light) * 16, 16);
+     GXPC_Put8(0x38);
+     GXPC_Put16(uint16_t(idx));
+     GXPC_Put16(uint16_t((15u << 12) | (0x600 + lightIndex(light) * 16)));

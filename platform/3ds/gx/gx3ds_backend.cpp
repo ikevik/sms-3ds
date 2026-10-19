@@ -4026,7 +4026,7 @@ static std::atomic<uint32_t> s_sHead{0}, s_sTail{0};  // chunks handed over; don
 static std::atomic<uint32_t> s_sFramesDone{0};        // display copies the GX thread has run
 static uint32_t s_sFramesSent;                         // ... and the game thread has sent
 static bool s_gxWanted = true, s_streamOn;
-static std::atomic<uint64_t> s_sWait[4];  // game thread waiting: a free chunk, a frame ahead, a drain, a list rewrite
+static std::atomic<uint64_t> s_sWait[4];  // game thread waiting: a free chunk, the frame's end, a drain, a list rewrite
 static std::atomic<uint64_t> s_sBusy{0}, s_sIdle{0};  // GX thread: parsing, waiting for chunks
 enum { EV_GX = 2, EV_GAME = 3 };
 
@@ -4250,7 +4250,7 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 	const double perFrame = perMs * kTicksPerMs;  // 1 / frames
 	fprintf(stderr,
 	        "[perf]   GX thread (core 1): busy %.1f, idle %.1f ms/frame | game thread waited for it %.1f ms/frame "
-	        "(buffers full %.1f, a frame ahead %.1f, GXInit %.1f, rewriting a list it had yet to read %.1f, %u times) "
+	        "(buffers full %.1f, frame end %.1f, GXInit %.1f, rewriting a list it had yet to read %.1f, %u times) "
 	        "| %u chunks queued | lists sent as copies %.1f per frame, %.1f KB\n",
 	        double(busy - busy0) * perMs, double(idle - idle0) * perMs, double(gameWait) * perMs, double(w[0]) * perMs,
 	        double(w[1]) * perMs, double(w[2]) * perMs, double(w[3]) * perMs, unsigned(s_dlWaits - dlWaits0),
@@ -4555,12 +4555,17 @@ int GXPC_InitAuto(int) {
 	return 1;
 }
 
-// Streamed GX, game thread (gx_api.cpp): a display copy was sent; waits while the GX thread is
-// more than a frame behind.
+// Streamed GX, game thread (gx_api.cpp): a display copy was sent; waits until the GX thread has
+// finished the frame. The GX thread reads the game's memory as it parses (vertex arrays, matrices
+// for indexed loads, display lists), and the game refills some of it in place each frame (the
+// water's, for one), as the console allows: its CPU waits for the GPU at each frame's end. Letting
+// the game simulate the next frame while the GX thread was still a frame behind made those draws
+// read the next frame's data (flicker and ghost copies in Delfino Plaza, worse once the write
+// filter sped both threads up). It costs Delfino Plaza about 1 ms a frame.
 void GXPC_StreamFrameEnd(void) {
 	gx::GXPC_StreamFlush();
 	const uint32_t sent = ++gx::s_sFramesSent;
-	gx::streamWait(gx::s_sWait[1], [sent] { return sent - gx::s_sFramesDone.load(std::memory_order_acquire) <= 1; });
+	gx::streamWait(gx::s_sWait[1], [sent] { return int32_t(sent - gx::s_sFramesDone.load(std::memory_order_acquire)) <= 0; });
 }
 // ... a display list was called through the stream by address (GXCallDisplayList).
 void GXPC_StreamNoteDL(const void* list, uint32_t nbytes) { gx::streamNoteDL(list, nbytes); }
