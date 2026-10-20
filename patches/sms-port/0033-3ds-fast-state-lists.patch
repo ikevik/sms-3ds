@@ -1,0 +1,281 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1028,6 +1028,13 @@
+ extern "C" {
+ int GXPC_Detail;
+ }
++// The register-write study (the writes that changed nothing, what a filter could drop) only in
++// builds made with -DGXPC_WR_STUDY=1: it cost the GX thread a few ms a frame, which the profile
++// runs' timings then measured too.
++#ifndef GXPC_WR_STUDY
++#define GXPC_WR_STUDY 0
++#endif
++static inline bool wrStudy() { return GXPC_WR_STUDY && GXPC_Detail; }
+ #endif
+ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
+     uint32_t addr = v & 0xFFF, cnt = (v >> 12) + 1;
+@@ -1042,7 +1049,7 @@
+                          uint32_t(src[k * 4 + 3]) << 24);
+ #if defined(__3DS__)
+     // values from memory: a game-side filter cannot know them, wherever the load came from
+-    if (GXPC_Detail)
++    if (wrStudy())
+         for (uint32_t k = 0; k < cnt; k++) wrFromList(2, addr + k);
+ #endif
+     writeXF(uint16_t(addr), cnt, words);
+@@ -1123,7 +1130,8 @@
+ // 1 validate: compare the state the list was recorded with, 2 validate: write stamps, 3 validate:
+ // hash, 4 replay a state-only list, 5 replay a draw list: off-screen test, 6 replay a draw list:
+ // the appends (less the back end's own timed work). Counts: 0 state-only replays, 1 their
+-// commands, 2 draw-list replays, 3 their runs, 4 runs off-screen, 5 arrays compared, 6 hashes.
++// commands, 2 draw-list replays, 3 their runs, 4 runs off-screen, 5 arrays compared, 6 hashes,
++// 7 state-only replays as register words (FastOp).
+ extern "C" {
+ uint64_t GXPC_DlFineTicks[8];
+ uint32_t GXPC_DlFineCount[8];
+@@ -1413,7 +1421,7 @@
+             if (avail < len) break;
+             CMD_COUNT(5);
+ #if defined(__3DS__)
+-            if (GXPC_Detail) {
++            if (wrStudy()) {
+                 if (streamTop) wrCountCP(0, p[1], be32(p + 2));
+                 else wrFromList(1, p[1]);
+             }
+@@ -1432,7 +1440,7 @@
+                 uint32_t m = cnt - i > 64 ? 64 : cnt - i;
+                 for (uint32_t k = 0; k < m; k++) words[k] = be32(p + 5 + (i + k) * 4);
+ #if defined(__3DS__)
+-                if (GXPC_Detail) {
++                if (wrStudy()) {
+                     if (streamTop) wrCountXF(0, addr + i, words, m);
+                     else
+                         for (uint32_t k = 0; k < m; k++) wrFromList(2, addr + i + k);
+@@ -1465,7 +1473,7 @@
+             if (avail < len) break;
+             CMD_COUNT(4);
+ #if defined(__3DS__)
+-            if (GXPC_Detail) {
++            if (wrStudy()) {
+                 if (streamTop) wrCountBP(0, be32(p + 1));
+                 else wrFromList(0, p[1]);
+             }
+@@ -1577,6 +1585,17 @@
+     uint32_t v;    // CP/BP value; XF: first word in `words` (count in n); indexed load: its second half; call: size
+     uint32_t n;    // XF: words; call: the list's physical address
+ };
++#if defined(__3DS__)
++// 3DS port: a state-only list's writes again, as the register word each one sets and its value,
++// so one that would change nothing costs a load and a compare (on Delfino Plaza ~80% of the
++// writes replayed from cached lists, some 20,000 a frame). XF writes are split into words. A
++// command that is not a plain register write (BP registers with side effects, array bases,
++// indexed XF loads) points at nothing and names its op instead.
++struct FastOp {
++    uint32_t* reg;  // the word of g it writes; null: run ops[v]
++    uint32_t v;     // the value it writes there
++};
++#endif
+ struct DlArray {  // the part of an attribute array the list reads
+     const uint8_t* base;
+     uint32_t stride, lo, hi;  // bytes [lo, hi) from base
+@@ -1599,6 +1618,9 @@
+     std::vector<DlRun> runs;
+     std::vector<StateOp> ops;    // a state-only list's commands, decoded
+     std::vector<uint32_t> words; // their XF data
++#if defined(__3DS__)
++    std::vector<FastOp> fast;    // the same as register words, when every op could be put that way
++#endif
+     uint32_t misses = 0;  // consecutive calls that could not reuse it
+     uint32_t skip = 0;    // calls left to run without the cache
+     uint32_t checkedClock = 0, checkedFrame = 0;  // when its source bytes were last compared
+@@ -1896,43 +1918,134 @@
+     return true;
+ }
+ 
++static void dlReplayOp(const DlEntry& e, const StateOp& s) {
++    switch (s.type) {
++    case 0x08:
++#if defined(__3DS__)
++        if (wrStudy()) wrCountCP(1, s.reg, s.v);
++#endif
++        writeCP(s.reg, s.v);
++        break;
++    case 0x61:
++#if defined(__3DS__)
++        if (wrStudy()) wrCountBP(1, s.v);
++#endif
++        writeBP(s.v);
++        break;
++    case 0x10:
++#if defined(__3DS__)
++        if (wrStudy()) wrCountXF(1, s.a, &e.words[s.v], s.n);
++#endif
++        for (uint32_t i = 0; i < s.n;) {  // as parse: at most 64 words per writeXF
++            uint32_t m = s.n - i > 64 ? 64 : s.n - i;
++            writeXF(uint16_t(s.a + i), m, &e.words[s.v + i]);
++            i += m;
++        }
++        break;
++    case 0x40: {
++        const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(s.n));
++        if (s_dlDepth < 4 && dl && nestedListOk(dl, s.v)) {
++            s_dlDepth++;
++            runCommands(dl, s.v);
++            s_dlDepth--;
++        }
++        break;
++    }
++    default: loadIndexedXF(s.type, s.a, s.v); break;
++    }
++}
++
++#if defined(__3DS__)
++// Settings.txt gx_fast_state_lists (GXPC_SetFastStateLists): off replays every command as before.
++static bool s_fastStateLists = true;
++extern "C" void GXPC_SetFastStateLists(int on) { s_fastStateLists = on != 0; }
++
++// Puts a state-only list's ops as register words (e.fast), each write exactly what writeBP,
++// writeCP or writeXF would do with an unchanged value: nothing. Left empty for a list with a BP
++// mask (the write after it merges), a draw-sync token or EFB copy (they run game code or much of
++// the back end), or a call to another list.
++static void dlCompileFast(DlEntry& e) {
++    std::vector<FastOp> f;
++    for (size_t i = 0; i < e.ops.size(); i++) {
++        const StateOp& s = e.ops[i];
++        if (s.type == 0x61) {
++            const uint32_t reg = s.v >> 24, data = s.v & 0xFFFFFF;
++            if (reg == BP_MASK || reg == BP_PE_TOKEN_INT || reg == BP_COPY_EXEC) return;
++            if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) {
++                f.push_back({&g.kreg[reg & 7], data});
++                continue;
++            }
++            const bool texImage = (reg >= BP_TX_IMAGE3 && reg < BP_TX_IMAGE3 + 4) ||
++                                  (reg >= BP_TX_IMAGE3 + 0x20 && reg < BP_TX_IMAGE3 + 0x24);
++            if (reg != BP_PE_TOKEN && reg != BP_DRAWDONE && reg != BP_LOADTLUT1 && reg != BP_TEXINVALIDATE &&
++                reg != BP_COPY_DST && !texImage) {  // these always do something
++                f.push_back({&g.bp[reg], data});
++                continue;
++            }
++        } else if (s.type == 0x08) {
++            uint32_t* r = nullptr;
++            uint32_t v = s.v;
++            switch (s.reg & 0xF0) {  // as writeCP
++            case CP_MATIDX_A: r = &g.cpMatA; break;
++            case CP_MATIDX_B: r = &g.cpMatB; break;
++            case CP_VCD_LO: r = &g.cpVcdLo; break;
++            case CP_VCD_HI: r = &g.cpVcdHi; break;
++            case CP_VAT_A: r = &g.cpVatA[s.reg & 7]; break;
++            case CP_VAT_B: r = &g.cpVatB[s.reg & 7]; break;
++            case CP_VAT_C: r = &g.cpVatC[s.reg & 7]; break;
++            case CP_ARRAY_STRIDE:
++                r = &g.arrayStride[s.reg & 15];
++                v &= 0xFF;
++                break;
++            case CP_ARRAY_BASE: break;
++            default: continue;  // a register writeCP ignores
++            }
++            if (r) {
++                f.push_back({r, v});
++                continue;
++            }
++        } else if (s.type == 0x10) {
++            for (uint32_t k = 0; k < s.n; k++) {
++                const uint16_t a = uint16_t(s.a + k);
++                if (a < XF_MEM_WORDS) f.push_back({&g.xfMem[a], e.words[s.v + k]});
++                else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT)
++                    f.push_back({&g.xfReg[a - XF_REG_BASE], e.words[s.v + k]});
++            }
++            continue;
++        } else if (s.type == 0x40) {
++            return;
++        }
++        f.push_back({nullptr, uint32_t(i)});
++    }
++    e.fast.swap(f);
++}
++
++// A fast op's write when its register holds another value: as the command it came from.
++static void dlFastWrite(uint32_t* r, uint32_t v) {
++    const uintptr_t a = reinterpret_cast<uintptr_t>(r);
++    const auto at = [a](const uint32_t* base) { return uint32_t((a - reinterpret_cast<uintptr_t>(base)) / 4); };
++    if (at(g.bp) < 256) writeBP(at(g.bp) << 24 | v);
++    else if (at(g.kreg) < 8) writeBP((BP_TEV_REG + at(g.kreg)) << 24 | v);
++    else if (at(g.xfMem) < XF_MEM_WORDS) writeXF(uint16_t(at(g.xfMem)), 1, &v);
++    else if (at(g.xfReg) < XF_REG_COUNT) writeXF(uint16_t(XF_REG_BASE + at(g.xfReg)), 1, &v);
++    else if (at(g.arrayStride) < 16) writeCP(uint8_t(CP_ARRAY_STRIDE | at(g.arrayStride)), v);
++    else *r = v;  // vertex formats and matrix indices: writeCP only stores them
++}
++#endif
++
+ static void dlReplayState(const DlEntry& e) {
+-    for (const StateOp& s : e.ops) {
+-        switch (s.type) {
+-        case 0x08:
+-#if defined(__3DS__)
+-            if (GXPC_Detail) wrCountCP(1, s.reg, s.v);
+-#endif
+-            writeCP(s.reg, s.v);
+-            break;
+-        case 0x61:
+-#if defined(__3DS__)
+-            if (GXPC_Detail) wrCountBP(1, s.v);
+-#endif
+-            writeBP(s.v);
+-            break;
+-        case 0x10:
+-#if defined(__3DS__)
+-            if (GXPC_Detail) wrCountXF(1, s.a, &e.words[s.v], s.n);
+-#endif
+-            for (uint32_t i = 0; i < s.n;) {  // as parse: at most 64 words per writeXF
+-                uint32_t m = s.n - i > 64 ? 64 : s.n - i;
+-                writeXF(uint16_t(s.a + i), m, &e.words[s.v + i]);
+-                i += m;
+-            }
+-            break;
+-        case 0x40: {
+-            const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(s.n));
+-            if (s_dlDepth < 4 && dl && nestedListOk(dl, s.v)) {
+-                s_dlDepth++;
+-                runCommands(dl, s.v);
+-                s_dlDepth--;
+-            }
+-            break;
+-        }
+-        default: loadIndexedXF(s.type, s.a, s.v); break;
+-        }
+-    }
++#if defined(__3DS__)
++    // Not with a BP mask pending: the list's first BP write takes it.
++    if (!e.fast.empty() && s_fastStateLists && g.bpMask == 0xFFFFFF && !wrStudy()) {
++        for (const FastOp& f : e.fast) {
++            if (!f.reg) dlReplayOp(e, e.ops[f.v]);
++            else if (*f.reg != f.v) dlFastWrite(f.reg, f.v);
++        }
++        if (GXPC_Detail) GXPC_DlFineCount[7]++;
++        return;
++    }
++#endif
++    for (const StateOp& s : e.ops) dlReplayOp(e, s);
+ }
+ 
+ #if defined(__3DS__)
+@@ -2095,6 +2208,9 @@
+             return;
+         }
+         e.stateOnly = true;
++#if defined(__3DS__)
++        dlCompileFast(e);
++#endif
+         for (int i = 0; i < 16; i++) s_dlElem[i] = 0;  // arrays read by lists it called: not its own
+     }
+     e.hash = GXPC_HASH(data, size);
+@@ -2115,6 +2231,9 @@
+     for (DlRun& r : e.runs) dlRunBox(r);
+ #endif
+     e.bytes += e.ops.size() * sizeof(StateOp) + e.words.size() * 4;
++#if defined(__3DS__)
++    e.bytes += e.fast.size() * sizeof(FastOp);
++#endif
+     s_dlCacheBytes += e.bytes;
+     e.valid = true;
+ }

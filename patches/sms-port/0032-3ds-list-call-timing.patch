@@ -1,0 +1,142 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1101,11 +1101,15 @@
+ extern uint64_t GX3DS_OursTicks;
+ }
+ namespace {
++// 3DS port: only in profile runs (GXPC_Detail): its four clock reads a call cost the GX thread
++// about 1 ms a frame on Delfino Plaza (921 calls).
+ struct DlTimer {
+     int id;
++    bool on;
+     uint64_t t0, o0;
+-    explicit DlTimer(int i) : id(i), t0(svcGetSystemTick()), o0(GX3DS_OursTicks) {}
++    explicit DlTimer(int i) : id(i), on(GXPC_Detail != 0), t0(on ? svcGetSystemTick() : 0), o0(GX3DS_OursTicks) {}
+     void to(int i) {
++        if (!on) return;
+         const uint64_t now = svcGetSystemTick(), o = GX3DS_OursTicks;
+         GXPC_DlTicks[id] += (now - t0) - (o - o0);
+         id = i;
+@@ -1114,6 +1118,22 @@
+     }
+     ~DlTimer() { to(id); }
+ };
++}
++// 3DS port: display-list calls split finer, in profile runs (GXPC_Detail). Ticks: 0 lookup,
++// 1 validate: compare the state the list was recorded with, 2 validate: write stamps, 3 validate:
++// hash, 4 replay a state-only list, 5 replay a draw list: off-screen test, 6 replay a draw list:
++// the appends (less the back end's own timed work). Counts: 0 state-only replays, 1 their
++// commands, 2 draw-list replays, 3 their runs, 4 runs off-screen, 5 arrays compared, 6 hashes.
++extern "C" {
++uint64_t GXPC_DlFineTicks[8];
++uint32_t GXPC_DlFineCount[8];
++}
++static inline uint64_t dlFineNow() { return GXPC_Detail ? svcGetSystemTick() : 0; }
++static inline void dlFineAdd(int i, uint64_t& t) {
++    if (!t) return;
++    const uint64_t now = svcGetSystemTick();
++    GXPC_DlFineTicks[i] += now - t;
++    t = now;
+ }
+ #define GXPC_DL_TIMER(name, id) DlTimer name(id)
+ #define GXPC_DL_TO(name, id) name.to(id)
+@@ -1766,6 +1786,9 @@
+ // nothing about game memory now (the game may have rewritten the list since the copy was made):
+ // the entry's check time is left as it was, so a later call by address still hashes the list.
+ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size, bool copy = false) {
++#if defined(__3DS__)
++    uint64_t ft = dlFineNow();
++#endif
+     if (!e.valid) return DL_FAIL(0);
+     if (e.size != size) return DL_FAIL(1);
+     if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return DL_FAIL(2);
+@@ -1776,9 +1799,16 @@
+     for (const DlArray& a : e.arrays)
+         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
+             return DL_FAIL(5);
++#if defined(__3DS__)
++    if (ft) GXPC_DlFineCount[5] += uint32_t(e.arrays.size());
++    dlFineAdd(1, ft);
++#endif
+     bool unwritten = !copy && trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
+     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
+         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
++#if defined(__3DS__)
++    dlFineAdd(2, ft);
++#endif
+     if (unwritten && g_displayFrames - e.checkedFrame < kDlRecheckFrames) return true;
+     uint32_t clock = writeClock();
+ #if defined(__3DS__)
+@@ -1802,6 +1832,10 @@
+     bool same = GXPC_HASH(data, size) == e.hash;
+     for (size_t i = 0; same && i < e.arrays.size(); i++)
+         same = GXPC_HASH(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo) == e.arrays[i].hash;
++#if defined(__3DS__)
++    if (ft) GXPC_DlFineCount[6]++;
++    dlFineAdd(3, ft);
++#endif
+     if (!same) {
+         if (unwritten) e.hashAlways = true;  // changed behind the write stamps' back
+         return DL_FAIL(6);
+@@ -1925,7 +1959,13 @@
+         return;
+     }
+     GXPC_DL_TO(dlt, 0);
++#if defined(__3DS__)
++    uint64_t ft = dlFineNow();
++#endif
+     DlEntry& e = dlLookup(key);
++#if defined(__3DS__)
++    dlFineAdd(0, ft);
++#endif
+     if (e.skip) {
+         GXPC_DL_TO(dlt, 3);
+         GXPC_DL_COUNT(GXPC_DlUncached++);
+@@ -1940,14 +1980,36 @@
+         GXPC_DL_COUNT(GXPC_DlHits++);
+         GXPC_DL_COUNT(GXPC_DlVerts += e.verts);
+         if (e.stateOnly) {
++#if defined(__3DS__)
++            ft = dlFineNow();
++            const uint64_t fo = GX3DS_OursTicks;
++#endif
+             dlReplayState(e);
++#if defined(__3DS__)
++            if (ft) {
++                GXPC_DlFineTicks[4] += (svcGetSystemTick() - ft) - (GX3DS_OursTicks - fo);
++                GXPC_DlFineCount[0]++;
++                GXPC_DlFineCount[1] += uint32_t(e.ops.size());
++            }
++#endif
+             e.misses = 0;
+             return;
+         }
+         const bool arena = arenaEnabled() && !traceFile();  // traces list the batch's own vertices
++#if defined(__3DS__)
++        if (GXPC_Detail) GXPC_DlFineCount[2]++;
++#endif
+         for (DlRun& r : e.runs) {
+ #if defined(__3DS__)
+-            if (dlRunOffscreen(r)) continue;
++            ft = dlFineNow();
++            const bool off = dlRunOffscreen(r);
++            if (ft) {
++                GXPC_DlFineCount[3]++;
++                GXPC_DlFineCount[4] += off;
++            }
++            dlFineAdd(5, ft);
++            if (off) continue;
++            const uint64_t fo = GX3DS_OursTicks;
+ #endif
+             const uint32_t nidx = uint32_t(r.idx.size());
+ #if defined(__3DS__)
+@@ -1962,6 +2024,9 @@
+                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());
+             else
+                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
++#if defined(__3DS__)
++            if (ft) GXPC_DlFineTicks[6] += (svcGetSystemTick() - ft) - (GX3DS_OursTicks - fo);
++#endif
+         }
+         s_vertsLoaded += e.verts;
+         g_traceLastVat = e.lastVat;

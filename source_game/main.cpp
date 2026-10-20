@@ -298,7 +298,12 @@ static const char kDefaultSettings[] =
     "\n"
     "# The game's GX state resets written as precomputed blocks (on), with the same result as its\n"
     "# own calls (off), which cost several ms a frame. Off is for comparing the two.\n"
-    "gx_state_blocks = on\n";
+    "gx_state_blocks = on\n"
+    "\n"
+    "# The state-only display lists the GX thread has cached (materials, vertex formats) replayed as\n"
+    "# register words, skipping writes that change nothing (on), or command by command (off). The\n"
+    "# same result either way; off is for comparing the two.\n"
+    "gx_fast_state_lists = on\n";
 
 // Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
 #ifndef SMS3DS_MIPS_DEFAULT
@@ -310,6 +315,12 @@ extern "C" void GX3DS_SetMips(int on);
 #define SMS3DS_STATE_BLOCKS_DEFAULT 1
 #endif
 extern "C" void GXPC_SetStateBlocks(int on);
+// Cached state-only display lists replayed as register words (sms-pc-port patch 0033; settings.txt
+// gx_fast_state_lists).
+#ifndef SMS3DS_FAST_STATE_LISTS_DEFAULT
+#define SMS3DS_FAST_STATE_LISTS_DEFAULT 1
+#endif
+extern "C" void GXPC_SetFastStateLists(int on);
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -419,6 +430,11 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "gx_state_blocks", v, sizeof v)) blocks = strcmp(v, "off") != 0;
 		GXPC_SetStateBlocks(blocks);
 		fprintf(stderr, "[3ds] GX state resets: %s (gx_state_blocks)\n", blocks ? "as precomputed blocks" : "as the game's calls");
+		int fastLists = SMS3DS_FAST_STATE_LISTS_DEFAULT;
+		if (setting_value(kSettingsPath, "gx_fast_state_lists", v, sizeof v)) fastLists = strcmp(v, "off") != 0;
+		GXPC_SetFastStateLists(fastLists);
+		fprintf(stderr, "[3ds] cached state-only display lists: %s (gx_fast_state_lists)\n",
+		        fastLists ? "replayed as register words" : "replayed command by command");
 	}
 	g_phase = 1;
 	port_init(2, argv);

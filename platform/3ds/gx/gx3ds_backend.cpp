@@ -219,6 +219,8 @@ static uint8_t s_bcut;  // the open batch's vertices have their pixels cut
 extern "C" uint64_t GX3DS_OursTicks;
 uint64_t GX3DS_OursTicks;
 extern "C" uint64_t GXPC_DlTicks[4];
+extern "C" uint64_t GXPC_DlFineTicks[8];  // patch 0032: list calls split finer, in profile runs
+extern "C" uint32_t GXPC_DlFineCount[8];
 extern "C" uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
 extern "C" uint64_t GXPC_DlHashed;
 // Hashing by where the bytes are (patch 0021, and the texture cache below): outside the write stamps'
@@ -450,6 +452,26 @@ static void perfFrameEnd() {
 		        (GXPC_DlNew - s_perfDlNew0) / frames, (GXPC_DlUncached - s_perfDlUncached0) / frames,
 		        double(GXPC_DlHashed - s_perfDlHashed0) / frames / 1024.0, unsigned(GXPC_DlEntryCount()),
 		        unsigned(GXPC_DlCacheBytes() >> 10));
+		{
+			static uint64_t ft0[8];
+			static uint32_t fc0[8];
+			double ft[8], fc[8], any = 0;
+			for (int i = 0; i < 8; i++) {
+				ft[i] = double(GXPC_DlFineTicks[i] - ft0[i]) * perMs;
+				fc[i] = double(GXPC_DlFineCount[i] - fc0[i]) / frames;
+				ft0[i] = GXPC_DlFineTicks[i];
+				fc0[i] = GXPC_DlFineCount[i];
+				any += ft[i];
+			}
+			if (any > 0)
+				fprintf(stderr,
+				        "[perf]   display-list calls, finer (ms/frame): lookup %.2f | validate: compare %.2f (%.1f arrays a call), "
+				        "write stamps %.2f, hash %.2f (%.1f hashed) | replay: state-only %.2f (%.0f lists, %.0f commands; %.0f lists "
+				        "as register words), draw lists: off-screen test %.2f (%.0f lists, %.0f runs, %.0f off-screen), appends "
+				        "%.2f\n",
+				        ft[0], ft[1], fc[2] + fc[0] > 0 ? fc[5] / (fc[2] + fc[0]) : 0.0, ft[2], ft[3], fc[6], ft[4], fc[0], fc[1],
+				        fc[7], ft[5], fc[2], fc[3], fc[4], ft[6]);
+		}
 		{
 			static uint64_t do0, th0, to0, tl0;
 			const uintptr_t base = uintptr_t(physToPtr(32)) - 32;
