@@ -7,6 +7,7 @@
 #   ARCHFLAGS        default: -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations
 #   LIMIT=N          compile only the first N units (quick test)
 #   OPT=-O2          optimization level
+#   SAMPLE=1         instrument every function for profile runs' sampler (platform/3ds/prof_3ds.cpp)
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECOMP="${DECOMP:-$ROOT/build/decomp-patched}"
@@ -58,7 +59,10 @@ for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
 # files (e.g. GXVtxAttrFmtList in J3D models) and char comparisons. Units that talk to
 # libctru keep the toolchain defaults (see build_platform_lib.sh).
 GC_ABI="-fno-short-enums -fsigned-char"
-COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT/src/port_compat.h"
+# SAMPLE=1: each function's entry and exit call prof_3ds.cpp's hooks (inline ones from headers
+# are left out), for the profile run's sampler. A measurement build: the hooks cost time.
+INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h"
+COMMON="$ARCHFLAGS $OPT $INSTR -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT/src/port_compat.h"
 CXXF="$COMMON -std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics"
 CF="$COMMON -std=gnu99 -fcommon"
 CP932=""

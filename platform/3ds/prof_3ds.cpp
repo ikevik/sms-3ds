@@ -17,6 +17,12 @@
 // the game thread, so the object being performed now is not the one whose draws it is parsing.
 // Vertices are counted there (SMS3DS_ProfGxVerts) and part 3's cut decided there.
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
+// Sampling, in builds made with SAMPLE=1 (scripts/build_game_lib.sh, build_platform_lib.sh,
+// build_gx_lib.sh): the game's, the platform layer's and the GX API's functions are compiled with
+// -finstrument-functions, and every call on the game thread pushes the function on a shadow stack
+// (__cyg_profile_func_enter/exit below). Through part 1 a thread on core 2 reads its top every
+// kSampleNs: the function the game thread is in, by phase, without timing each call. Other builds
+// never call the hooks and leave it out.
 #include <3ds.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +62,13 @@ extern unsigned sms_msl_calls[];
 extern const char* const sms_msl_names[];
 extern const int sms_msl_n;
 void sms_msl_bench(int k, int n);
+// The game thread waiting for the GX thread (1 + which wait), set by the GX backend.
+extern volatile int SMS3DS_SampWaiting;
+void SMS3DS_SampReport(const char* why);
+int SMS3DS_ZoneBegin(int zone);  // decomp patch 3ds-0016: timers around a few drawing routines
+void SMS3DS_ZoneEnd(int zone, int token);
+__attribute__((no_instrument_function)) void __cyg_profile_func_enter(void* fn, void* site);
+__attribute__((no_instrument_function)) void __cyg_profile_func_exit(void* fn, void* site);
 }
 
 namespace {
@@ -108,6 +121,38 @@ uint32_t s_phaseEntries[PHASES];
 int s_phase;
 uint64_t s_calls;
 
+// Drawing routines timed in part 1 (decomp patch 3ds-0016), nested ones included: calls, ticks,
+// GX stream bytes. The open ones are a stack (they nest, on the game thread).
+enum { kZones = 8 };
+const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
+                                       "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
+                                       "TMapObjWave::draw"};
+uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
+uint32_t s_zoneCalls[kZones];
+struct ZoneOpen {
+	uint64_t t0, b0;
+};
+ZoneOpen s_zoneStack[32];
+int s_zoneDepth;
+
+// Sampling (see the top). The shadow stack is the game thread's alone: the hooks compare the
+// calling thread's TLS pointer with the game thread's, taken at its first frame (gameLoop, which
+// is never on the stack itself; what it was called from is left off too).
+// Each group on its own cache lines: every thread's hooks read the first, the game thread's write
+// the second.
+const uint32_t kShadow = 256;
+struct alignas(32) {
+	void* volatile tls;
+	volatile bool hooked;  // a hook ran: a SAMPLE=1 build
+} s_game;
+struct alignas(32) {
+	volatile uint32_t depth;
+	uint32_t calls;     // hook pairs on the game thread
+	uint32_t deepest;   // the most entries it has held
+	void* volatile fn[kShadow];  // a ring: entry d at fn[d % kShadow], so the innermost are kept
+} s_shadow;
+double s_hookUs;          // what a pair costs (calibrate)
+
 // state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 7 GPU
 // part (pixels cut, the picture shrunk 8x: nothing clipped at the screen's sides), 5 GPU part
 // (positions collapsed), 6 GPU part (no draws), 4 GPU by object
@@ -149,6 +194,10 @@ void resetCpu() {
 	s_phaseP0 = GXPC_StreamPuts;
 	s_calls = 0;
 	s_depth = 0;
+	memset(s_zoneTicks, 0, sizeof s_zoneTicks);
+	memset(s_zoneBytes, 0, sizeof s_zoneBytes);
+	memset(s_zoneCalls, 0, sizeof s_zoneCalls);
+	s_zoneDepth = 0;
 	for (int i = 0; i < s_nMath; i++) s_math0[i] = mathCalls(i);
 }
 
@@ -182,6 +231,15 @@ void calibrate() {
 		if (i < sms_mtx_n) sms_mtx_bench(i, 1000);
 		else sms_msl_bench(i - sms_mtx_n, 1000);
 		s_mathUs[i] = double(svcGetSystemTick() - a) / 1000.0 / kTicksPerMs * 1000.0;
+	}
+	// A pair of the sampling hooks on the game thread (SAMPLE=1 builds).
+	if (s_game.hooked) {
+		const uint64_t a = svcGetSystemTick();
+		for (int i = 0; i < 1000; i++) {
+			__cyg_profile_func_enter((void*)&calibrate, nullptr);
+			__cyg_profile_func_exit((void*)&calibrate, nullptr);
+		}
+		s_hookUs = double(svcGetSystemTick() - a) / 1000.0 / kTicksPerMs * 1000.0;
 	}
 }
 
@@ -314,6 +372,23 @@ void reportCpu(double frames, double frameMs) {
 		fprintf(stderr, "[prof]   %7.0fv %6.2f ms %-15s vt %08lx \"%s\"\n", e->verts / frames, e->ticks * per,
 		        kPhaseName[e->phase], (unsigned long)uintptr_t(e->vt), name);
 	}
+	// The timed drawing routines (each figure includes the routines it calls, timed or not).
+	{
+		const double tick = tickCostMs();
+		int at = 0;
+		for (int z = 0; z < kZones; z++) {
+			if (!s_zoneCalls[z]) continue;
+			const double calls = s_zoneCalls[z] / frames;
+			const double ms = s_zoneTicks[z] * per - calls * tick;  // less one tick read a call
+			at += snprintf(line + at, sizeof line - at, "%s %s %.1f x %.3f = %.2f ms, %.1f KB", at ? " |" : "", kZoneName[z],
+			               calls, calls > 0 ? ms / calls : 0.0, ms, s_zoneBytes[z] / frames / 1024.0);
+			if (at > 380) {
+				fprintf(stderr, "[prof]   drawing routines (calls/frame x ms each = ms/frame, GX stream KB/frame):%s\n", line);
+				at = 0;
+			}
+		}
+		if (at) fprintf(stderr, "[prof]   drawing routines (calls/frame x ms each = ms/frame, GX stream KB/frame):%s\n", line);
+	}
 	reportMath(frames);
 }
 
@@ -386,7 +461,225 @@ void reportCut() {
 	for (int i = 0; i < s_nTargets; i++) printTarget(" ", order[i]);
 }
 
+
+const uint64_t kSampleNs = 100000;
+struct Samp {
+	const void* fn;      // the innermost instrumented function; in s_pairTab, with the one that called it
+	const void* caller;
+	uint32_t self, incl;  // samples with it innermost, and with it anywhere on the stack
+	int phase;
+};
+const int kSampTab = 4096;  // power of two
+Samp s_fnTab[kSampTab], s_pairTab[kSampTab];
+uint32_t s_sampN, s_sampLost, s_sampPhase[PHASES], s_sampOut[PHASES], s_sampWait[PHASES][4], s_hookCalls0;
+uint32_t s_topDepthMin, s_topDepthMax;  // the shadow stack's depth at the frame's top: 0 when balanced
+uint64_t s_sampT0, s_sampT1;
+volatile bool s_sampling;
+Thread s_sampThread;
+
+Samp* sampFind(Samp* t, const void* fn, const void* caller, int phase) {
+	const uint32_t h = (uint32_t(uintptr_t(fn)) >> 2) * 2654435761u ^ (uint32_t(uintptr_t(caller)) >> 2) * 40503u ^
+	                   uint32_t(phase) * 0x9E3779B1u;
+	for (int n = 0; n < 64; n++) {
+		Samp* e = &t[(h + n) & (kSampTab - 1)];
+		if (!e->fn) {
+			e->fn = fn;
+			e->caller = caller;
+			e->phase = phase;
+			return e;
+		}
+		if (e->fn == fn && e->caller == caller && e->phase == phase) return e;
+	}
+	s_sampLost++;
+	return nullptr;
+}
+
+// Sampler thread: one look at the game thread.
+void sampleOnce() {
+	const int ph = s_phase;
+	if (ph < 0 || ph >= PHASES) return;
+	s_sampN++;
+	s_sampPhase[ph]++;
+	const int w = SMS3DS_SampWaiting;
+	if (w > 0 && w <= 4) {
+		s_sampWait[ph][w - 1]++;
+		return;
+	}
+	const uint32_t depth = s_shadow.depth;
+	const uint32_t d = depth > kShadow ? kShadow : depth;
+	if (!d) {
+		s_sampOut[ph]++;
+		return;
+	}
+	const void* st[kShadow];  // outermost first
+	for (uint32_t i = 0; i < d; i++) st[i] = s_shadow.fn[(depth - d + i) % kShadow];
+	if (Samp* e = sampFind(s_fnTab, st[d - 1], nullptr, ph)) e->self++;
+	if (ph == 10 || ph == 12)
+		if (Samp* e = sampFind(s_pairTab, st[d - 1], d > 1 ? st[d - 2] : nullptr, ph)) e->self++;
+	for (uint32_t i = 0; i < d; i++) {
+		bool seen = false;
+		for (uint32_t j = 0; j < i && !seen; j++) seen = st[j] == st[i];
+		if (!seen)
+			if (Samp* e = sampFind(s_fnTab, st[i], nullptr, ph)) e->incl++;
+	}
+}
+
+void samplerMain(void*) {
+	while (s_sampling) {
+		svcSleepThread(kSampleNs);
+		if (s_sampling) sampleOnce();
+	}
+}
+
+// Game thread, at the measuring window's start and end.
+void sampStart() {
+	if (!s_game.hooked) return;
+	memset(s_fnTab, 0, sizeof s_fnTab);
+	memset(s_pairTab, 0, sizeof s_pairTab);
+	memset(s_sampPhase, 0, sizeof s_sampPhase);
+	memset(s_sampOut, 0, sizeof s_sampOut);
+	memset(s_sampWait, 0, sizeof s_sampWait);
+	s_sampN = s_sampLost = 0;
+	s_topDepthMin = ~0u;
+	s_topDepthMax = 0;
+	s_hookCalls0 = s_shadow.calls;
+	s_sampT0 = svcGetSystemTick();
+	s_sampling = true;
+	// Above the render thread on core 2 (the New 3DS's), else on core 1 above the GX thread.
+	s_sampThread = threadCreate(samplerMain, nullptr, 16u << 10, 0x18, 2, false);
+	if (!s_sampThread) s_sampThread = threadCreate(samplerMain, nullptr, 16u << 10, 0x18, 1, false);
+	if (!s_sampThread) s_sampling = false;
+}
+void sampStop() {
+	if (!s_sampThread) return;
+	s_sampling = false;
+	threadJoin(s_sampThread, U64_MAX);
+	threadFree(s_sampThread);
+	s_sampThread = nullptr;
+	s_sampT1 = svcGetSystemTick();
+}
+
+struct Agg {
+	const void* fn;
+	const void* caller;
+	double ms;
+};
+Agg s_agg[kSampTab];
+// Sums s_agg's entries of the same function (and caller), largest first; returns the count.
+int aggMerge(int n) {
+	qsort(s_agg, n, sizeof s_agg[0], [](const void* a, const void* b) {
+		const Agg *x = (const Agg*)a, *y = (const Agg*)b;
+		if (x->fn != y->fn) return x->fn < y->fn ? -1 : 1;
+		return x->caller < y->caller ? -1 : x->caller > y->caller ? 1 : 0;
+	});
+	int m = 0;
+	for (int i = 0; i < n; i++) {
+		if (m && s_agg[m - 1].fn == s_agg[i].fn && s_agg[m - 1].caller == s_agg[i].caller) s_agg[m - 1].ms += s_agg[i].ms;
+		else s_agg[m++] = s_agg[i];
+	}
+	qsort(s_agg, m, sizeof s_agg[0], [](const void* a, const void* b) {
+		const double x = ((const Agg*)a)->ms, y = ((const Agg*)b)->ms;
+		return x < y ? 1 : x > y ? -1 : 0;
+	});
+	return m;
+}
+// Fills s_agg from a table: phases in mask, self or inclusive samples, in ms/frame.
+int aggFrom(const Samp* t, uint32_t mask, bool incl, const double* msPer) {
+	int n = 0;
+	for (int i = 0; i < kSampTab; i++) {
+		const Samp& e = t[i];
+		if (!e.fn || !(mask & (1u << e.phase))) continue;
+		const uint32_t c = incl ? e.incl : e.self;
+		if (c) s_agg[n++] = {e.fn, e.caller, c * msPer[e.phase]};
+	}
+	return aggMerge(n);
+}
+void printAgg(int n, int max, double total) {
+	for (int i = 0; i < n && i < max; i++) {
+		if (s_agg[i].ms < 0.03) break;
+		if (s_agg[i].caller)
+			fprintf(stderr, "[prof]   %6.2f ms %4.1f%% fn %08lx <- fn %08lx\n", s_agg[i].ms, 100.0 * s_agg[i].ms / total,
+			        (unsigned long)uintptr_t(s_agg[i].fn), (unsigned long)uintptr_t(s_agg[i].caller));
+		else
+			fprintf(stderr, "[prof]   %6.2f ms %4.1f%% fn %08lx\n", s_agg[i].ms, 100.0 * s_agg[i].ms / total,
+			        (unsigned long)uintptr_t(s_agg[i].fn));
+	}
+}
+
+void reportSamples(double frames) {
+	if (!s_game.hooked) return;
+	if (!s_sampN) {
+		fprintf(stderr, "[prof] sampling: no samples (the sampler thread did not start)\n");
+		return;
+	}
+	const double secs = double(s_sampT1 - s_sampT0) / SYSCLOCK_ARM11;
+	const double hooks = double(s_shadow.calls - s_hookCalls0) / frames;
+	fprintf(stderr,
+	        "[prof] game thread sampled %u times (%.1f a ms; a sample is the innermost instrumented function, "
+	        "maths routines included; %u lost to a full table); the hooks: %.0f calls/frame costing about %.1f "
+	        "ms/frame, spread over the functions below; shadow stack at the frame's top %u..%u (0 when balanced)\n",
+	        s_sampN, s_sampN / (secs * 1000.0), s_sampLost, hooks, hooks * s_hookUs / 1000.0, s_topDepthMin,
+	        s_topDepthMax);
+	double msPer[PHASES], all = 0;
+	for (int p = 0; p < PHASES; p++) {
+		const double ms = s_phaseTicks[p] / frames / kTicksPerMs;
+		msPer[p] = s_sampPhase[p] ? ms / s_sampPhase[p] : 0;
+		all += ms;
+	}
+	const int kDraw[2] = {10, 12};
+	for (int k = 0; k < 2; k++) {
+		const int p = kDraw[k];
+		const double ms = s_sampPhase[p] * msPer[p];
+		const uint32_t* w = s_sampWait[p];
+		fprintf(stderr,
+		        "[prof]   %s, %.1f ms/frame (%u samples): waiting on the GX thread %.2f ms (a free chunk %.2f, a list "
+		        "rewrite %.2f, other %.2f), outside any instrumented function %.2f ms; by function:\n",
+		        kPhaseName[p], ms, s_sampPhase[p], (w[0] + w[1] + w[2] + w[3]) * msPer[p], w[0] * msPer[p],
+		        w[3] * msPer[p], (w[1] + w[2]) * msPer[p], s_sampOut[p] * msPer[p]);
+		printAgg(aggFrom(s_fnTab, 1u << p, false, msPer), 30, ms);
+	}
+	const uint32_t draw = (1u << 10) | (1u << 12);
+	const double drawMs = (s_sampPhase[10] * msPer[10] + s_sampPhase[12] * msPer[12]);
+	fprintf(stderr, "[prof]   GX list and GX post together, %.1f ms/frame, by function and all it calls:\n", drawMs);
+	printAgg(aggFrom(s_fnTab, draw, true, msPer), 40, drawMs);
+	fprintf(stderr, "[prof]   GX list and GX post together, by function and its caller:\n");
+	printAgg(aggFrom(s_pairTab, draw, false, msPer), 40, drawMs);
+	fprintf(stderr, "[prof]   all phases, %.1f ms/frame, by function:\n", all);
+	printAgg(aggFrom(s_fnTab, 0xFFFFu, false, msPer), 50, all);
+}
+
 }  // namespace
+
+// The -finstrument-functions hooks (SAMPLE=1 builds): every instrumented function's entry and
+// exit, on every thread.
+void __cyg_profile_func_enter(void* fn, void*) {
+	if (getThreadLocalStorage() != s_game.tls) {
+		if (!s_game.hooked) s_game.hooked = true;
+		return;
+	}
+	const uint32_t d = s_shadow.depth;
+	s_shadow.fn[d % kShadow] = fn;
+	s_shadow.depth = d + 1;
+	s_shadow.calls++;
+	if (d >= s_shadow.deepest) s_shadow.deepest = d + 1;
+}
+void __cyg_profile_func_exit(void*, void*) {
+	if (getThreadLocalStorage() != s_game.tls) return;
+	const uint32_t d = s_shadow.depth;
+	if (d) s_shadow.depth = d - 1;  // (a function entered before the game thread was known)
+}
+volatile int SMS3DS_SampWaiting;
+
+// SAMPLE=1 builds: where the game thread is, from the shadow stack (for a stall report, from
+// another thread: the entries can change as they are read).
+void SMS3DS_SampReport(const char* why) {
+	if (!s_game.hooked) return;
+	const uint32_t depth = s_shadow.depth, n = depth < 32 ? depth : 32;
+	fprintf(stderr, "[sample] %s: the game thread's call stack is %lu deep (at most %lu so far), innermost first:\n", why,
+	        (unsigned long)depth, (unsigned long)s_shadow.deepest);
+	for (uint32_t i = 0; i < n; i++)
+		fprintf(stderr, "[sample]   fn %08lx\n", (unsigned long)uintptr_t(s_shadow.fn[(depth - 1 - i) % kShadow]));
+}
 
 // Called by the GX backend (GX thread) before it adds vertices, while SMS3DS_ProfCutActive:
 // non-zero when the draws' object (the stream's last kStreamOpProfObj) is part 3's target.
@@ -399,6 +692,23 @@ int SMS3DS_ProfCutNow(void) {
 void SMS3DS_ProfGxVerts(uint32_t n) {
 	if (!SMS3DS_ProfOn) return;
 	if (Entry* e = reinterpret_cast<Entry*>(uintptr_t(GXPC_ProfObj))) e->verts += n;
+}
+
+int SMS3DS_ZoneBegin(int zone) {
+	if (zone < 0 || zone >= kZones || s_zoneDepth >= int(sizeof s_zoneStack / sizeof s_zoneStack[0])) return -1;
+	s_zoneStack[s_zoneDepth] = {svcGetSystemTick(), GX3DS_StreamWritten()};
+	return s_zoneDepth++;
+}
+void SMS3DS_ZoneEnd(int zone, int token) {
+	const uint64_t now = svcGetSystemTick();
+	if (token != s_zoneDepth - 1) {  // unbalanced (a run started inside one): drop the stack
+		s_zoneDepth = 0;
+		return;
+	}
+	s_zoneDepth--;
+	s_zoneTicks[zone] += now - s_zoneStack[token].t0;
+	s_zoneBytes[zone] += GX3DS_StreamWritten() - s_zoneStack[token].b0;
+	s_zoneCalls[zone]++;
 }
 
 void SMS3DS_ProfRequest(void) {
@@ -464,7 +774,13 @@ void SMS3DS_ProfObjEnd(void) {
 // Called by the game thread at the top of every frame (gameLoop), with no object perform open.
 void SMS3DS_ProfFrame(void) {
 	const uint64_t now = svcGetSystemTick();
+	if (!s_game.tls) s_game.tls = getThreadLocalStorage();  // the sampling hooks record this thread
 	if (SMS3DS_ProfOn) SMS3DS_ProfPhase(-1);
+	if (s_sampling) {
+		const uint32_t d = s_shadow.depth;
+		if (d < s_topDepthMin) s_topDepthMin = d;
+		if (d > s_topDepthMax) s_topDepthMax = d;
+	}
 	switch (s_state) {
 	case 0:
 		if (!s_request) return;
@@ -485,11 +801,14 @@ void SMS3DS_ProfFrame(void) {
 			s_phase = 0;
 			s_gpu0 = pica_gpu_ms_sum();
 			SMS3DS_ProfOn = 1;
+			sampStart();
 		} else if (s_frame == kSettle + kFrames) {
 			SMS3DS_ProfOn = 0;
+			sampStop();
 			s_cpuFrameMs = double(now - s_winStart) / kFrames / kTicksPerMs;
 			s_cpuGpuMs = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
 			reportCpu(kFrames, s_cpuFrameMs);
+			reportSamples(kFrames);
 			pica_set_gpu_test(1);
 			s_state = 3;
 			s_frame = 0;

@@ -1,0 +1,148 @@
+--- /dev/null
++++ b/include/sms3ds_zone.h
+@@ -0,0 +1,23 @@
++// 3DS port (decomp patch 3ds-0016): profile-run timers around a few drawing routines, reported by
++// platform/3ds/prof_3ds.cpp (calls, time and GX stream bytes per frame, nested ones included).
++// Outside a profile run each costs one branch.
++#ifndef SMS3DS_ZONE_H
++#define SMS3DS_ZONE_H
++#if defined(__3DS__)
++extern "C" int SMS3DS_ProfOn;
++extern "C" int SMS3DS_ZoneBegin(int zone);
++extern "C" void SMS3DS_ZoneEnd(int zone, int token);
++struct SMS3DSZone {
++	int zone, token;
++	explicit SMS3DSZone(int z) : zone(z), token(SMS3DS_ProfOn ? SMS3DS_ZoneBegin(z) : -1) {}
++	~SMS3DSZone()
++	{
++		if (token >= 0)
++			SMS3DS_ZoneEnd(zone, token);
++	}
++};
++#define SMS3DS_ZONE(n) SMS3DSZone sms3ds_zone_(n)
++#else
++#define SMS3DS_ZONE(n)
++#endif
++#endif
+--- a/src/MarioUtil/gd-reinit-gx.cpp
++++ b/src/MarioUtil/gd-reinit-gx.cpp
+@@ -1,4 +1,5 @@
+ #include <dolphin/gx.h>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ #include <dolphin/mtx.h>
+ #include <dolphin/types.h>
+ 
+@@ -30,6 +31,7 @@
+ 
+ extern "C" void ReInitializeGX()
+ {
++	SMS3DS_ZONE(0);
+ 	ReInitGenMode();
+ 	ReInitGeometry();
+ 	ReInitLighting();
+--- a/src/MarioUtil/DrawUtil.cpp
++++ b/src/MarioUtil/DrawUtil.cpp
+@@ -1,4 +1,5 @@
+ #include "MarioUtil/RandomUtil.hpp"
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ #include <MarioUtil/DrawUtil.hpp>
+ #include <MarioUtil/MathUtil.hpp>
+ #include <Player/MarioAccess.hpp>
+@@ -866,6 +867,7 @@
+ 
+ void SMS_DrawInit()
+ {
++	SMS3DS_ZONE(1);
+ 	j3dSys.drawInit();
+ 	SMS_ResetTexCacheRegion();
+ }
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DSys.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DSys.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ #include <JSystem/J3D/J3DGraphBase/J3DTevs.hpp>
+ #include <JSystem/JRenderer.hpp>
+ #include <dolphin/os.h>
+@@ -114,6 +115,7 @@
+ 
+ void J3DSys::drawInit()
+ {
++	SMS3DS_ZONE(2);
+ 	GXSetMisc(GX_MT_DL_SAVE_CONTEXT, 0);
+ 	GXInvalidateVtxCache();
+ 	GXSetCurrentMtx(GX_PNMTX0);
+--- a/src/MarioUtil/LightUtil.cpp
++++ b/src/MarioUtil/LightUtil.cpp
+@@ -2,6 +2,7 @@
+ // dummyMactorStringValue1's string; LightUtil is one of the three TUs that
+ // carry it without SMS_NO_MEMORY_MESSAGE.
+ #include <System/DummyMactorString.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ 
+ #include <MarioUtil/LightUtil.hpp>
+ #include <MarioUtil/DrawUtil.hpp>
+@@ -104,6 +105,7 @@
+ 
+ void TLightCommon::setLight(const JDrama::TGraphics* gfx, int index)
+ {
++	SMS3DS_ZONE(3);
+ 	ReInitializeGX();
+ 	SMS_DrawInit();
+ 	int lightIndex = index * 2;
+@@ -168,6 +170,7 @@
+ 
+ void TLightMario::setLight(const JDrama::TGraphics* gfx, int index)
+ {
++	SMS3DS_ZONE(4);
+ 	ReInitializeGX();
+ 	SMS_DrawInit();
+ 	int lightIndex = index * 2;
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DDrawBuffer.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DDrawBuffer.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/J3D/J3DGraphBase/J3DDrawBuffer.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DTexture.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DMaterial.hpp>
+@@ -199,6 +200,7 @@
+ 
+ void J3DDrawBuffer::draw() const
+ {
++	SMS3DS_ZONE(5);
+ 	drawFunc func = drawFuncTable[mDrawType];
+ 	(this->*func)();
+ }
+--- a/libs/JSystem/src/JParticle/JPAEmitterManager.cpp
++++ b/libs/JSystem/src/JParticle/JPAEmitterManager.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/JParticle/JPAEmitterManager.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ #include <JSystem/JParticle/JPAParticle.hpp>
+ #include <JSystem/JParticle/JPAEmitter.hpp>
+ #include <JSystem/JParticle/JPAField.hpp>
+@@ -184,6 +185,7 @@
+ 
+ void JPAEmitterManager::draw(JPADrawInfo* info, u8 group_id)
+ {
++	SMS3DS_ZONE(6);
+ 	if (group_id >= 8)
+ 		return;
+ 
+--- a/src/MoveBG/MapObjWave.cpp
++++ b/src/MoveBG/MapObjWave.cpp
+@@ -1,4 +1,5 @@
+ #include <MoveBG/MapObjWave.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
+ #include <Camera/CubeManagerBase.hpp>
+ #include <Map/Map.hpp>
+ #include <Map/MapData.hpp>
+@@ -155,6 +156,7 @@
+ 
+ void TMapObjWave::draw()
+ {
++	SMS3DS_ZONE(7);
+ 	for (f32 z = -mHalfSize; z <= mHalfSize - mGridSize; z += mGridSize) {
+ 		f32 z0 = z + SMS_GetMarioZ();
+ 		f32 z1 = z0 + mGridSize;

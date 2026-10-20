@@ -1,0 +1,75 @@
+--- a/platform/port_runtime.cpp
++++ b/platform/port_runtime.cpp
+@@ -502,6 +502,53 @@
+ }
+ #endif
+ 
++#if defined(__3DS__)
++// 3DS port: MEM1 is a heap block, and the heap's next block starts where it ends. A write past
++// MEM1's end reaches no memory on the GameCube, but here it would land in whatever the heap holds
++// next, far from the code that did it (19 Oct: J3DTevBlock4::load, miscompiled in the sampling
++// builds, wrote a display list on through MEM1 and into the heap). So MEM1 is followed by a page of
++// a pattern, made read-only: a write past the end faults at the writer. Where Horizon refuses,
++// port_mem1_guard_check says whether the page changed.
++const u32 kMem1Guard = 4096;
++const u32 kMem1GuardWord = 0xA5A5A5A5u;
++static u32* g_mem1_guard;
++static bool g_mem1_guard_ro;
++extern "C" int svcControlMemory(u32* addr_out, u32 addr0, u32 addr1, u32 size, int op, int perm);
++static void mem1_guard_init(u8* at)
++{
++	g_mem1_guard = (u32*)at;
++	for (u32 i = 0; i < kMem1Guard / 4; i++)
++		g_mem1_guard[i] = kMem1GuardWord;
++	u32 out = 0;
++	const int r = svcControlMemory(&out, (u32)(uintptr_t)at, 0, kMem1Guard, 6 /* MEMOP_PROT */, 1 /* MEMPERM_READ */);
++	g_mem1_guard_ro = r >= 0;
++	port_log("[port] MEM1 guard: %u bytes after it at %p, %s (result %08x)\n", (unsigned)kMem1Guard, (void*)at,
++	         g_mem1_guard_ro ? "read-only: a write past MEM1's end faults" : "writable: checked for changes", (unsigned)r);
++}
++// The guard's changed words: the first and last offset past MEM1's end, how many, and the words at
++// the first. 0 when it is untouched.
++extern "C" int port_mem1_guard_check(u32* first, u32* last, u32* count, u32 words[8])
++{
++	if (!g_mem1_guard)
++		return 0;
++	u32 n = 0, lo = 0, hi = 0;
++	for (u32 i = 0; i < kMem1Guard / 4; i++)
++		if (g_mem1_guard[i] != kMem1GuardWord) {
++			if (!n++)
++				lo = i;
++			hi = i;
++		}
++	if (!n)
++		return 0;
++	*first = lo * 4;
++	*last = hi * 4;
++	*count = n;
++	for (u32 k = 0; k < 8; k++)
++		words[k] = lo + k < kMem1Guard / 4 ? g_mem1_guard[lo + k] : 0;
++	return 1;
++}
++#endif
++
+ static void map_mem1()
+ {
+ 	// 64-bit hosts: objects holding pointers are larger, and the fixed-size
+@@ -523,11 +570,18 @@
+ 	void* p = map_exact(want, port_mem1_size);
+ 	if (p != want) {
+ 		port_log("[port] cannot map MEM1 at 0x80000000; falling back to a heap block\n");
++#if defined(__3DS__)
++		p = mmap(NULL, port_mem1_size + kMem1Guard, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++#else
+ 		p = mmap(NULL, port_mem1_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++#endif
+ 		if (p == MAP_FAILED) {
+ 			port_log("[port] out of memory for MEM1\n");
+ 			exit(1);
+ 		}
++#if defined(__3DS__)
++		mem1_guard_init((u8*)p + port_mem1_size);
++#endif
+ 	}
+ #endif
+ 	port_mem1_base = (u8*)p;

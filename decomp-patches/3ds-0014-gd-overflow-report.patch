@@ -1,0 +1,20 @@
+--- a/libs/dolphin/src/gd/GDBase.c
++++ b/libs/dolphin/src/gd/GDBase.c
+@@ -29,8 +29,17 @@
+ 	}
+ }
+ 
++#if defined(__3DS__)
++/* 3DS port: GD writes on past a display list's end (the check only calls the callback), so an
++ * overflow overwrites what follows the list. Logged with the list and the writer (the function
++ * whose inline GD write found the list full; platform/3ds/game_new_3ds.cpp). */
++void SMS3DS_GDOverflow(const GDLObj* dl, const void* caller);
++#endif
+ void GDOverflowed(void)
+ {
++#if defined(__3DS__)
++	SMS3DS_GDOverflow(__GDCurrentDL, __builtin_return_address(0));
++#endif
+ 	if (overflowcb != NULL) {
+ 		(*overflowcb)();
+ 	}

@@ -1,0 +1,342 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <math.h>
+ #include <string.h>
++#include <stddef.h>
+ 
+ #include "port_fpu.h"  // port_cvt_fp2unsigned: MWCC's __cvt_fp2unsigned, as the SDK converts
+ #include "gx_sdk_math.h"  // the SDK's float arithmetic, as the DOL computes it
+@@ -225,7 +226,19 @@
+ static inline void apiForgetXF(uint32_t, uint32_t) {}
+ #endif
+ 
++#if defined(__3DS__)
++static void sbTouch(int kind, uint32_t key, uint32_t reg);  // state blocks (below): a write while one is worked out
++static bool s_sbVirtual;
++#endif
+ static void apiBP(uint32_t reg, uint32_t data) {
++#if defined(__3DS__)
++    if (s_sbVirtual) {
++        const bool konst = reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000);
++        sbTouch(0, konst ? 256 + (reg & 7) : reg, reg);
++        apiKeepBP(reg, data & 0xFFFFFF);
++        return;
++    }
++#endif
+     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
+     if (fltBP(reg, data & 0xFFFFFF)) {
+ #if defined(__3DS__)
+@@ -246,6 +259,13 @@
+ static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GA.bp[reg], size, shift, v)); }
+ 
+ static void apiCP(uint8_t reg, uint32_t v) {
++#if defined(__3DS__)
++    if (s_sbVirtual) {
++        sbTouch(1, reg, reg);
++        apiKeepCP(reg, v);
++        return;
++    }
++#endif
+     if (fltCP(reg, v)) {
+ #if defined(__3DS__)
+         apiKeepCP(reg, v);  // (J3D's writes go around the API's copy: it can differ from what was sent)
+@@ -265,6 +285,13 @@
+ }
+ 
+ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
++#if defined(__3DS__)
++    if (s_sbVirtual) {
++        for (uint32_t i = 0; i < n; i++) sbTouch(2, uint32_t(addr + i), uint32_t(addr + i));
++        apiKeepXF(addr, n, w);
++        return;
++    }
++#endif
+     if (fltXF(addr, n, w)) {
+ #if defined(__3DS__)
+         apiKeepXF(addr, n, w);
+@@ -294,6 +321,283 @@
+     return u;
+ }
+ static uint32_t xfReg(int r) { return GA.xfReg[r]; }
++
++#if defined(__3DS__)
++// ------------------------------------------------------------------ state blocks (3DS port)
++// The game resets GX state with long runs of setters with fixed arguments (ReInitializeGX and
++// J3DSys::drawInit: some 250 calls each, 63 times a frame on Delfino Plaza, 7 ms of the game
++// thread). Each call costs its own logic plus a filtered register write, while the result is
++// always the same function of the state before it: some bits of some registers set to constants,
++// the rest kept. GXPC_StateBlock(slot, fn, name) gives fn's result that way. The first time, fn
++// runs "virtually" (the API's copy of the state changes, nothing is sent) from made-up states:
++// all zeros and all ones show, for every register and other API field it changes, which bits it
++// sets and to what; three runs from random states check that, and find the registers that take
++// another's value (the CP matrix indices, written with the XF ones). For its first kSbVerify calls
++// fn then runs for real and the API's state after it is compared with the prediction. After that a
++// call writes each register fn wrote once, with its final value, through the write filter as fn's
++// own writes went: the GX thread's registers, the filter and the API's copy end as fn left them.
++// fn must only set state: a texture load (its region callback has a cursor), a draw, a display-list
++// call or a command of the stream's own is caught (the pipe is redirected meanwhile) and the block
++// is left to run fn every time. Circle pad up at launch: off (GXPC_SetStateBlocks).
++namespace {
++struct SbEntry {
++    uint8_t kind;    // 0 BP, 1 CP, 2 XF, 3 another API field (not sent)
++    uint16_t reg;    // BP/CP register, XF address
++    int16_t link;    // >= 0: takes that entry's final value
++    uint32_t word;   // its word in State
++    uint32_t mask, value;  // final = (prior & ~mask) | value
++};
++struct SbBlock {
++    const char* name;
++    int state;       // 1 checking against fn, 2 fast, -1 fn always
++    uint32_t checks, n;
++    SbEntry* e;
++};
++const uint32_t kSbVerify = 256;
++const uint32_t kSbMaxTouch = 1024;
++bool s_sbOn = true, s_sbImpure;
++uint32_t s_sbTouched[kSbMaxTouch][3];  // kind, word, reg: the registers fn wrote, first write first
++uint32_t s_sbNTouched;
++uint8_t s_sbScratch[16384];  // the pipe while fn runs virtually: anything written there is a command
++// State as words, less the TLUT memory (no setter of a block reads or writes it).
++const uint32_t kSbTlutLo = uint32_t(offsetof(State, tlutMem)) / 4, kSbTlutHi = kSbTlutLo + TMEM_TLUT_SIZE / 4;
++const uint32_t kSbWords = uint32_t(sizeof(State) / 4) - (kSbTlutHi - kSbTlutLo);
++inline uint32_t* sbWordPtr(uint32_t i) {
++    uint32_t* w = reinterpret_cast<uint32_t*>(&GA);
++    return w + (i < kSbTlutLo ? i : i + (kSbTlutHi - kSbTlutLo));
++}
++void sbSave(uint32_t* out) { for (uint32_t i = 0; i < kSbWords; i++) out[i] = *sbWordPtr(i); }
++void sbLoad(const uint32_t* in) { for (uint32_t i = 0; i < kSbWords; i++) *sbWordPtr(i) = in[i]; }
++uint32_t sbWordIndex(uint32_t byteOff) {
++    const uint32_t w = byteOff / 4;
++    return w < kSbTlutLo ? w : w - (kSbTlutHi - kSbTlutLo);
++}
++uint32_t sbRegWord(int kind, uint32_t key) {
++    if (kind == 0) return key < 256 ? sbWordIndex(uint32_t(offsetof(State, bp)) + 4 * key)
++                                    : sbWordIndex(uint32_t(offsetof(State, kreg)) + 4 * (key - 256));
++    if (kind == 1) {
++        switch (key & 0xF0) {
++        case CP_MATIDX_A: return sbWordIndex(uint32_t(offsetof(State, cpMatA)));
++        case CP_MATIDX_B: return sbWordIndex(uint32_t(offsetof(State, cpMatB)));
++        case CP_VCD_LO: return sbWordIndex(uint32_t(offsetof(State, cpVcdLo)));
++        case CP_VCD_HI: return sbWordIndex(uint32_t(offsetof(State, cpVcdHi)));
++        case CP_VAT_A: return sbWordIndex(uint32_t(offsetof(State, cpVatA)) + 4 * (key & 7));
++        case CP_VAT_B: return sbWordIndex(uint32_t(offsetof(State, cpVatB)) + 4 * (key & 7));
++        case CP_VAT_C: return sbWordIndex(uint32_t(offsetof(State, cpVatC)) + 4 * (key & 7));
++        default: return ~0u;  // not kept in State: not supported
++        }
++    }
++    if (key < XF_MEM_WORDS) return sbWordIndex(uint32_t(offsetof(State, xfMem)) + 4 * key);
++    if (key >= XF_REG_BASE && key < XF_REG_BASE + XF_REG_COUNT)
++        return sbWordIndex(uint32_t(offsetof(State, xfReg)) + 4 * (key - XF_REG_BASE));
++    return ~0u;
++}
++// One virtual run of fn from the state in `in`: the state after it in `out`, the touched list in
++// s_sbTouched. False if fn did something a block cannot stand for.
++bool sbRun(void (*fn)(void), const uint32_t* in, uint32_t* out) {
++    sbLoad(in);
++    s_sbNTouched = 0;
++    s_sbImpure = false;
++    setPipeRedirect(s_sbScratch);  // (no redirect is open: GXPC_StateBlock checks)
++    s_sbVirtual = true;
++    fn();
++    s_sbVirtual = false;
++    const bool wrote = getPipeRedirect() != s_sbScratch;
++    setPipeRedirect(nullptr);
++    sbSave(out);
++    return !s_sbImpure && !wrote;
++}
++uint32_t s_sbRng = 0x9E3779B9u;
++uint32_t sbRand() {
++    s_sbRng ^= s_sbRng << 13;
++    s_sbRng ^= s_sbRng >> 17;
++    s_sbRng ^= s_sbRng << 5;
++    return s_sbRng;
++}
++}  // namespace
++
++static void sbTouch(int kind, uint32_t key, uint32_t reg) {
++    if (kind == 0) {
++        switch (reg) {  // registers with effects beyond their value
++        case BP_MASK: case BP_COPY_EXEC: case BP_PE_TOKEN: case BP_PE_TOKEN_INT: case BP_DRAWDONE:
++        case BP_LOADTLUT0: case BP_LOADTLUT1: case BP_TEXINVALIDATE:
++            s_sbImpure = true;
++            return;
++        default: break;
++        }
++    }
++    const uint32_t word = sbRegWord(kind, key);
++    if (word == ~0u) {
++        s_sbImpure = true;
++        return;
++    }
++    for (uint32_t i = 0; i < s_sbNTouched; i++)
++        if (s_sbTouched[i][1] == word) return;
++    if (s_sbNTouched >= kSbMaxTouch) {
++        s_sbImpure = true;
++        return;
++    }
++    s_sbTouched[s_sbNTouched][0] = uint32_t(kind);
++    s_sbTouched[s_sbNTouched][1] = word;
++    s_sbTouched[s_sbNTouched][2] = reg;
++    s_sbNTouched++;
++}
++
++// Works out fn's block (see above). The API's state is as it was after, whatever the outcome.
++static bool sbDerive(SbBlock* b, void (*fn)(void)) {
++    const uint32_t W = kSbWords;
++    uint32_t* buf = static_cast<uint32_t*>(malloc(sizeof(uint32_t) * W * 10));
++    if (!buf) return false;
++    uint32_t *saved = buf, *in = buf + W, *zo = buf + 2 * W, *oo = buf + 3 * W, *rin[3], *rout[3];
++    for (int k = 0; k < 3; k++) {
++        rin[k] = buf + (4 + k) * W;
++        rout[k] = buf + (7 + k) * W;
++    }
++    sbSave(saved);
++    bool ok = true;
++    const char* why = "";
++    static uint32_t touched[kSbMaxTouch][3];
++    uint32_t nt = 0;
++    // From all zeros, then all ones: the touched list must be the same.
++    for (uint32_t i = 0; i < W; i++) in[i] = 0;
++    ok = sbRun(fn, in, zo);
++    if (!ok) why = "it does more than set state";
++    nt = s_sbNTouched;
++    memcpy(touched, s_sbTouched, sizeof(uint32_t) * 3 * nt);
++    if (ok) {
++        for (uint32_t i = 0; i < W; i++) in[i] = ~0u;
++        ok = sbRun(fn, in, oo) && s_sbNTouched == nt && !memcmp(touched, s_sbTouched, sizeof(uint32_t) * 3 * nt);
++        if (!ok) why = "what it writes depends on the state before it";
++    }
++    for (int k = 0; ok && k < 3; k++) {
++        for (uint32_t i = 0; i < W; i++) rin[k][i] = sbRand();
++        ok = sbRun(fn, rin[k], rout[k]) && s_sbNTouched == nt && !memcmp(touched, s_sbTouched, sizeof(uint32_t) * 3 * nt);
++        if (!ok) why = "what it writes depends on the state before it";
++    }
++    // The entries: every touched register, and every other field a run changed.
++    SbEntry* e = ok ? static_cast<SbEntry*>(malloc(sizeof(SbEntry) * (nt + 64))) : nullptr;
++    uint32_t n = 0;
++    if (ok && !e) { ok = false; why = "no memory"; }
++    for (uint32_t t = 0; ok && t < nt; t++)
++        e[n++] = {uint8_t(touched[t][0]), uint16_t(touched[t][2]), -1, touched[t][1], 0, 0};
++    for (uint32_t i = 0; ok && i < W; i++) {
++        bool reg = false;
++        for (uint32_t t = 0; t < nt && !reg; t++) reg = touched[t][1] == i;
++        if (reg) continue;
++        bool changed = zo[i] != 0 || oo[i] != ~0u;
++        for (int k = 0; k < 3; k++) changed |= rout[k][i] != rin[k][i];
++        if (!changed) continue;
++        if (n >= nt + 64) { ok = false; why = "it changes too many other fields"; break; }
++        e[n++] = {3, 0, -1, i, 0, 0};
++    }
++    // Each entry's bits: set by fn (the same whatever came before) or kept; checked on the
++    // random runs, where a register that fails may take another's value instead.
++    for (uint32_t j = 0; ok && j < n; j++) {
++        const uint32_t i = e[j].word, m = ~(zo[i] ^ oo[i]);
++        if ((zo[i] & ~m) || (~oo[i] & ~m)) { ok = false; why = "a bit is inverted from the state before it"; break; }
++        e[j].mask = m;
++        e[j].value = zo[i] & m;
++        bool fits = true;
++        for (int k = 0; k < 3; k++) fits &= rout[k][i] == ((rin[k][i] & ~m) | e[j].value);
++        if (fits) continue;
++        for (uint32_t s2 = 0; s2 < n && e[j].link < 0; s2++) {
++            if (s2 == j || e[s2].kind == 3) continue;
++            const uint32_t i2 = e[s2].word;
++            bool same = zo[i2] == zo[i] && oo[i2] == oo[i];
++            for (int k = 0; k < 3; k++) same &= rout[k][i2] == rout[k][i];
++            if (same) e[j].link = int16_t(s2);
++        }
++        if (e[j].link < 0) { ok = false; why = "a register depends on another in a way it cannot follow"; }
++    }
++    // A link must point at an entry that is not itself linked.
++    for (uint32_t j = 0; ok && j < n; j++)
++        if (e[j].link >= 0 && e[e[j].link].link >= 0) { ok = false; why = "a register depends on another in a way it cannot follow"; }
++    sbLoad(saved);
++    free(buf);
++    if (!ok) {
++        free(e);
++        logmsg("state block %s: fn runs every time (%s)", b->name, why);
++        return false;
++    }
++    b->e = e;
++    b->n = n;
++    uint32_t regs = 0;
++    for (uint32_t j = 0; j < n; j++) regs += e[j].kind != 3;
++    logmsg("state block %s: %u registers and %u other fields, checked against the real calls for the first %u",
++           b->name, regs, n - regs, kSbVerify);
++    return true;
++}
++
++static void sbFinals(const SbBlock* b, uint32_t* fin) {
++    for (uint32_t j = 0; j < b->n; j++) fin[j] = (*sbWordPtr(b->e[j].word) & ~b->e[j].mask) | b->e[j].value;
++    for (uint32_t j = 0; j < b->n; j++)
++        if (b->e[j].link >= 0) fin[j] = fin[b->e[j].link];
++}
++static void sbApply(const SbBlock* b) {
++    uint32_t fin[kSbMaxTouch + 64];
++    sbFinals(b, fin);
++    for (uint32_t j = 0; j < b->n;) {
++        const SbEntry& x = b->e[j];
++        if (x.kind == 0) apiBP(x.reg, fin[j]);
++        else if (x.kind == 1) apiCP(uint8_t(x.reg), fin[j]);
++        else if (x.kind == 3) *sbWordPtr(x.word) = fin[j];
++        else {  // XF: a run of consecutive addresses goes as one write, as fn's loads did
++            uint32_t k = 1;
++            while (j + k < b->n && b->e[j + k].kind == 2 && b->e[j + k].reg == x.reg + k && k < 16) k++;
++            apiXF(x.reg, k, fin + j);
++            j += k;
++            continue;
++        }
++        j++;
++    }
++}
++
++extern "C" {
++uint32_t GXPC_StateBlockCalls[3];  // fast, checked against fn, fn only
++void GXPC_SetStateBlocks(int on) { s_sbOn = on != 0; }
++void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name) {
++    SbBlock* b = static_cast<SbBlock*>(*slot);
++    const bool usable = s_sbOn && g_gxStream && !s_recording && !getPipeRedirect();
++    if (!b && usable) {
++        b = static_cast<SbBlock*>(calloc(1, sizeof(SbBlock)));
++        if (b) {
++            b->name = name;
++            b->state = sbDerive(b, fn) ? 1 : -1;
++            *slot = b;
++        }
++    }
++    if (!b || b->state < 0 || !usable) {
++        GXPC_StateBlockCalls[2]++;
++        fn();
++        return;
++    }
++    if (b->state == 2) {
++        GXPC_StateBlockCalls[0]++;
++        sbApply(b);
++        return;
++    }
++    // Checking: fn runs as before; the state it leaves must be the prediction, and nothing else changed.
++    GXPC_StateBlockCalls[1]++;
++    static uint32_t before[kSbWords];
++    uint32_t fin[kSbMaxTouch + 64];
++    sbFinals(b, fin);
++    sbSave(before);
++    fn();
++    for (uint32_t j = 0; j < b->n; j++) before[b->e[j].word] = fin[j];
++    for (uint32_t i = 0; i < kSbWords; i++) {
++        if (*sbWordPtr(i) == before[i]) continue;
++        logmsg("state block %s: state word %u is %08x after the real calls, not %08x as worked out: fn runs every time",
++               b->name, i, *sbWordPtr(i), before[i]);
++        b->state = -1;
++        return;
++    }
++    if (++b->checks >= kSbVerify) {
++        b->state = 2;
++        logmsg("state block %s: matched the real calls %u times; written as a block from now on", b->name, b->checks);
++    }
++}
++}
++#endif
+ 
+ // ------------------------------------------------------------------ internal object layouts
+ namespace {

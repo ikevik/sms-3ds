@@ -50,6 +50,11 @@ CFLAGS   += $(INCLUDE) -D__3DS__ -DSMS_PLATFORM_3DS=1
 ifneq ($(strip $(DEMO_STAGE)),)
 CFLAGS   += -DSMS_DEMO_STAGE=$(DEMO_STAGE)
 endif
+# HEAPCHECK=1: freed blocks are poisoned and held back, and writes into them after the free are
+# logged (source_game/heapcheck_3ds.cpp). A debugging build: it costs memory and time.
+ifeq ($(HEAPCHECK),1)
+CFLAGS   += -DSMS3DS_HEAPCHECK=1
+endif
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
@@ -65,6 +70,9 @@ SMSLIBS  += -Wl,--wrap=GDInitGDLObj
 # The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
 # and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
 SMSLIBS  += -Wl,--no-enum-size-warning
+ifeq ($(HEAPCHECK),1)
+SMSLIBS  += -Wl,--wrap=free -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvj -Wl,--wrap=_ZdaPvj
+endif
 SMSLIBS  += -Wl,--whole-archive $(TOPDIR)/build/libsms_game.a $(TOPDIR)/build/libsms_platform.a $(TOPDIR)/build/libsms_gx.a -Wl,--no-whole-archive $(TOPDIR)/build/linktest/gx_stubs.o
 endif
 LIBS     := $(SMSLIBS) -lcitro3d -lctru -lm

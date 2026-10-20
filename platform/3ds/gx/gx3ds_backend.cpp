@@ -213,6 +213,7 @@ extern "C" volatile int SMS3DS_ProfCutActive;
 extern "C" int SMS3DS_ProfCutNow(void);
 extern "C" void SMS3DS_ProfGxVerts(uint32_t n);  // profile runs: vertices credited to the draws' object
 extern "C" int SMS3DS_ProfOn;
+extern "C" volatile int SMS3DS_SampWaiting;  // profile runs' sampler: the game thread waiting here
 static uint8_t s_bcut;  // the open batch's vertices have their pixels cut
 // Running total of every phase, for the front half's display-list timers (patch 0007) to leave out.
 extern "C" uint64_t GX3DS_OursTicks;
@@ -251,6 +252,8 @@ static uint64_t s_perfDsTicks0;
 static unsigned long long s_perfSwitches0;
 static uint64_t s_perfWait0;
 extern "C" int port_os_live_hosts(void);  // patch 0012
+extern "C" int port_os_stack_report(char* out, int n);  // patch 0029
+extern "C" uint32_t GXPC_StateBlockCalls[3];  // patch 0031: written as blocks, checked against the calls, calls
 extern "C" unsigned long __ctru_heap_size; // libctru: the process heap's size
 static uint64_t s_perfDl0[4], s_perfDlHashed0;
 static uint32_t s_perfDlCalls0, s_perfDlHits0, s_perfDlVerts0, s_perfDlRecords0, s_perfDlNew0, s_perfDlUncached0;
@@ -492,6 +495,12 @@ static void perfFrameEnd() {
 		s_perfDsCalls0 = GXPC_DrawSyncCalls;
 		s_perfDsTicks0 = GXPC_DrawSyncTicks;
 		s_perfSwitches0 = port_os_switches();
+		{
+			char st[1024];
+			if (port_os_stack_report(st, sizeof st))
+				fprintf(stderr, "[perf]   emulated threads' stacks, most used of the host stack in KB (!: into its last "
+				        "2 KB, or past it):%s\n", st);
+		}
 		uint32_t ringPeak = pica_ring_peak();
 		uint32_t dropRing, dropCmd;
 		pica_drop_reasons(&dropRing, &dropCmd);
@@ -4414,7 +4423,9 @@ template <class F>
 static void streamWait(std::atomic<uint64_t>& acc, F ready) {
 	if (ready()) return;
 	const uint64_t t0 = svcGetSystemTick();
+	SMS3DS_SampWaiting = int(&acc - s_sWait) + 1;
 	while (!ready()) pica_event_wait(EV_GAME);
+	SMS3DS_SampWaiting = 0;
 	acc += svcGetSystemTick() - t0;
 }
 
@@ -4704,6 +4715,12 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 				        "| forgetting only what each list writes BP %.0f, CP %.0f, XF words %.0f\n",
 				        d[0] * perFrame, d[1] * perFrame, d[2] * perFrame, f[0][0] * perFrame, f[0][1] * perFrame,
 				        f[0][2] * perFrame, f[1][0] * perFrame, f[1][1] * perFrame, f[1][2] * perFrame);
+			static uint32_t sb0[3];
+			uint32_t sb[3];
+			for (int t = 0; t < 3; t++) sb[t] = GXPC_StateBlockCalls[t] - sb0[t], sb0[t] = GXPC_StateBlockCalls[t];
+			if (sb[0] + sb[1] + sb[2])
+				fprintf(stderr, "[perf]   GX state resets per frame: %.1f written as blocks, %.1f checked against the game's calls, %.1f as the calls\n",
+				        sb[0] * perFrame, sb[1] * perFrame, sb[2] * perFrame);
 		}
 		char bpTop[160], cpTop[120];
 		top(GXPC_BpSame, bp0, 8, bpTop, sizeof bpTop);

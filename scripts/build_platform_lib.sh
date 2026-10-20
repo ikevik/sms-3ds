@@ -6,7 +6,7 @@
 #
 # Output: build/libsms_platform.a, build/platform_failures.txt
 # Usage: scripts/build_platform_lib.sh [-j N]
-#   CXX/CC/AR/SIZE/ARCHFLAGS/OPT as in build_game_lib.sh
+#   CXX/CC/AR/SIZE/ARCHFLAGS/OPT/SAMPLE as in build_game_lib.sh
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECOMP="${DECOMP:-$ROOT/build/decomp-patched}"
@@ -44,7 +44,11 @@ COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-a
 # toolchain's variable-size enums, so they keep the defaults; they share no enum-typed
 # structs with the game (PADStatus is all integer fields).
 GC_ABI="-fno-short-enums -fsigned-char"
-export CXX CC INCS OBJ PCPORT P3DS GC_ABI
+# SAMPLE=1: see build_game_lib.sh; sms-pc-port's units only (the @3ds ones hold the hooks), less
+# the audio, which runs on its own thread. SMS3DS_SAMPLE doubles the host threads' stacks
+# (os_thread.cpp, patch 0029): every instrumented frame is bigger.
+INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h -DSMS3DS_SAMPLE=1"
+export CXX CC INCS OBJ PCPORT P3DS GC_ABI INSTR
 export CXXF="$COMMON -std=gnu++11"
 export CF="$COMMON -std=gnu99 -fcommon"
 
@@ -55,13 +59,14 @@ export CTRU
 
 compile_one() {
   rel="$1"; out="$OBJ/$(echo "$rel" | tr '/' '_').o"
+  case "$rel" in platform/audio/*) INSTR="" ;; esac
   case "$rel" in
     @3ds/*) f="${rel#@3ds/}"; out="$OBJ/3ds_$f.o"
             case "$f" in *.cpp) CMP="$CXX $CXXF" ;; *) CMP="$CC $CF" ;; esac
             $CMP $INCS $CTRU -c "$P3DS/$f" -o "$out" 2>"$out.err" || { echo "FAIL $rel: $(grep -m1 'error' "$out.err" | cut -c1-140)"; return 1; }
             rm -f "$out.err"; return 0 ;;
-    *.cpp) $CXX $CXXF $GC_ABI $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
-    *)     $CC  $CF   $GC_ABI $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
+    *.cpp) $CXX $CXXF $GC_ABI $INSTR $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
+    *)     $CC  $CF   $GC_ABI $INSTR $INCS -c "$PCPORT/$rel" -o "$out" 2>"$out.err" ;;
   esac || { echo "FAIL $rel: $(grep -m1 'error' "$out.err" | cut -c1-140)"; return 1; }
   rm -f "$out.err"
 }

@@ -6,6 +6,7 @@
 #     gx_texture/gx_platform, which are OpenGL + SDL)
 # Needs scripts/prepare_pcport.sh and scripts/apply_patches.sh first.
 # Usage: scripts/build_gx_lib.sh
+#   SAMPLE=1: instrument the game thread's side (gx_api, gx_vert, GD) for profile runs' sampler
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECOMP="${DECOMP:-$ROOT/build/decomp-patched}"
@@ -30,16 +31,20 @@ for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
 # libctru keep the toolchain defaults (see build_platform_lib.sh).
 GC_ABI="-fno-short-enums -fsigned-char"
 COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -ffp-contract=off -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI"
+# SAMPLE=1: see build_game_lib.sh. Only the units the game thread runs: the GX and render
+# threads' code stays as it is.
+INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h"
 fail=0
-cxx() { # src out
-  $CXX $COMMON -std=gnu++17 -fpermissive -include "$PCPORT/src/port_compat.h" -include "$P3DS/sms_compat_3ds.h" $INCS -c "$1" -o "$2" 2>"$2.err" \
+cxx() { # src out [flags]
+  $CXX $COMMON ${3:-} -std=gnu++17 -fpermissive -include "$PCPORT/src/port_compat.h" -include "$P3DS/sms_compat_3ds.h" $INCS -c "$1" -o "$2" 2>"$2.err" \
     && rm -f "$2.err" || { echo "FAIL $(basename "$1"): $(grep -m1 error "$2.err" | cut -c1-160)"; fail=$((fail+1)); }
 }
-for f in gx_api gx_fifo gx_vert gx_trace; do cxx "$GX/src/$f.cpp" "$OBJ/$f.o"; done
+for f in gx_api gx_vert; do cxx "$GX/src/$f.cpp" "$OBJ/$f.o" "$INSTR"; done
+for f in gx_fifo gx_trace; do cxx "$GX/src/$f.cpp" "$OBJ/$f.o"; done
 cxx "$P3DS/gx/gx3ds_backend.cpp" "$OBJ/gx3ds_backend.o"
 cxx "$P3DS/gx/gx3ds_texdecode.cpp" "$OBJ/gx3ds_texdecode.o"
 for f in GDBase GDGeometry GDLight GDPixel GDTev GDTransform; do
-  $CC $COMMON -std=gnu99 -fcommon -include "$GX/src/gd_host_prefix.h" $INCS -c "$DECOMP/libs/dolphin/src/gd/$f.c" -o "$OBJ/$f.o" 2>"$OBJ/$f.o.err" \
+  $CC $COMMON $INSTR -std=gnu99 -fcommon -include "$GX/src/gd_host_prefix.h" $INCS -c "$DECOMP/libs/dolphin/src/gd/$f.c" -o "$OBJ/$f.o" 2>"$OBJ/$f.o.err" \
     && rm -f "$OBJ/$f.o.err" || { echo "FAIL $f.c: $(grep -m1 error "$OBJ/$f.o.err" | cut -c1-160)"; fail=$((fail+1)); }
 done
 n=$(ls "$OBJ"/*.o 2>/dev/null | wc -l | tr -d ' ')

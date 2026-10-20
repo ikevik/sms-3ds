@@ -43,6 +43,8 @@ void pica_set_overlap(int on);
 void pica_set_big_ring(int on);
 extern "C" void SMS3DS_ProfRequest(void);
 extern "C" int SMS3DS_ProfState(void);
+extern "C" void SMS3DS_SampReport(const char* why);  // prof_3ds.cpp, SAMPLE=1 builds
+extern "C" int port_os_stack_report(char* out, int n);  // patch 0029
 void GX3DS_SetArena(int on);
 void GX3DS_SetRenderThread(int on);
 void GX3DS_SetGxThread(int on);
@@ -198,8 +200,11 @@ static void log_scene(uint32_t frames, uint32_t batches)
 	static int state0_secs;
 	if (s.mar_state == 0) {
 		state0_secs++;
-		if (state0_secs == 8 || (state0_secs > 8 && state0_secs % 30 == 8))
+		if (state0_secs == 8 || (state0_secs > 8 && state0_secs % 30 == 8)) {
+			SMS3DS_SampReport("stage setup not finished after 8 s");
+			flush_log();
 			dump_os_threads("stage setup not finished after 8 s");
+		}
 	} else {
 		state0_secs = 0;
 	}
@@ -246,6 +251,12 @@ static void check_stall(uint32_t frames, uint32_t batches)
 	        (unsigned long)secs, (unsigned long)frames, pica_where(), (unsigned long)pica_frame_draws(),
 	        (unsigned long)batches, GX3DS_GetGpuTransform() ? "GPU" : "CPU");
 	fprintf(stderr, "[stall]   %s\n", pica_queue_state());
+	SMS3DS_SampReport("no frame for 5 s");  // sampling builds: the game thread's calls
+	{
+		char st[1024];
+		if (port_os_stack_report(st, sizeof st)) fprintf(stderr, "[stall]   emulated threads' stacks (KB):%s\n", st);
+	}
+	flush_log();
 	dump_os_threads("no frame for 5 s");
 	flush_log();
 	printf("\x1b[29;0Hstalled: %.30s", pica_where());
@@ -283,13 +294,22 @@ static const char kDefaultSettings[] =
     "\n"
     "# Small mipmapped textures drawn with their smaller levels, as the GameCube does (on), or\n"
     "# at full size everywhere (off). On is faster and shimmers less in the distance.\n"
-    "mipmaps = on\n";
+    "mipmaps = on\n"
+    "\n"
+    "# The game's GX state resets written as precomputed blocks (on), with the same result as its\n"
+    "# own calls (off), which cost several ms a frame. Off is for comparing the two.\n"
+    "gx_state_blocks = on\n";
 
 // Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
 #ifndef SMS3DS_MIPS_DEFAULT
 #define SMS3DS_MIPS_DEFAULT 1
 #endif
 extern "C" void GX3DS_SetMips(int on);
+// The game's GX state resets as precomputed blocks (sms-pc-port patch 0031; settings.txt gx_state_blocks).
+#ifndef SMS3DS_STATE_BLOCKS_DEFAULT
+#define SMS3DS_STATE_BLOCKS_DEFAULT 1
+#endif
+extern "C" void GXPC_SetStateBlocks(int on);
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -395,6 +415,10 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "mipmaps", v, sizeof v)) mips = strcmp(v, "off") != 0;
 		GX3DS_SetMips(mips);
 		fprintf(stderr, "[3ds] small mipmapped textures: %s (mipmaps)\n", mips ? "with their mip levels" : "level 0 only");
+		int blocks = SMS3DS_STATE_BLOCKS_DEFAULT;
+		if (setting_value(kSettingsPath, "gx_state_blocks", v, sizeof v)) blocks = strcmp(v, "off") != 0;
+		GXPC_SetStateBlocks(blocks);
+		fprintf(stderr, "[3ds] GX state resets: %s (gx_state_blocks)\n", blocks ? "as precomputed blocks" : "as the game's calls");
 	}
 	g_phase = 1;
 	port_init(2, argv);
@@ -409,7 +433,28 @@ static void* game_thread(void*)
 // The bottom screen's status text. Drawing it takes tens of milliseconds (the console draws
 // every glyph with the CPU): on the game's core, at the main thread's priority, each redraw held
 // the game thread that long, twice a second. It runs on core 1 (status_thread) when it can.
+// The guard after MEM1 (patch 0030): logged when its changed words change.
+extern "C" int port_mem1_guard_check(u32* first, u32* last, u32* count, u32 words[8]);
+static void check_mem1_guard(uint32_t frame)
+{
+	static u32 lastCount;
+	u32 first, last, count, w[8];
+	if (!port_mem1_guard_check(&first, &last, &count, w) || count == lastCount)
+		return;
+	lastCount = count;
+	fprintf(stderr, "[heap] written past MEM1's end (frame %lu): %lu words changed, from byte %lu to byte %lu past the end; at the first: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n",
+	        (unsigned long)frame, (unsigned long)count, (unsigned long)first, (unsigned long)last, (unsigned long)w[0], (unsigned long)w[1],
+	        (unsigned long)w[2], (unsigned long)w[3], (unsigned long)w[4], (unsigned long)w[5], (unsigned long)w[6], (unsigned long)w[7]);
+	flush_log();
+}
+#if defined(SMS3DS_HEAPCHECK)
+extern "C" void SMS3DS_HeapCheckPoll(uint32_t frame);  // heapcheck_3ds.cpp, HEAPCHECK=1 builds
+#endif
 static void draw_status(const uint32_t* s) {
+	check_mem1_guard(s[0]);
+#if defined(SMS3DS_HEAPCHECK)
+	SMS3DS_HeapCheckPoll(s[0]);
+#endif
 	static const char* const phase[] = {"waiting", "port_init", "SMS_main (running)", "SMS_main returned"};
 	printf("\x1b[8;0Hphase: %-22s\nframes %6lu  batches %7lu\nverts %8lu  tris %8lu\n", phase[g_phase],
 	       (unsigned long)s[0], (unsigned long)s[1], (unsigned long)s[2], (unsigned long)s[3]);

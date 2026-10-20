@@ -1,0 +1,45 @@
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DMaterial.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DMaterial.cpp
+@@ -436,6 +436,34 @@
+ 		mTevStage[i].load(i);
+ 		mIndTevStage[i].load(i);
+ 	}
++#if defined(__3DS__)
++	// 3DS port: retail reads mTevKColorSel[i..i+3] and mTevKAlphaSel[i..i+3] for i up to 12, past
++	// these 4-entry arrays into the members after them: the konst selections of stages this block
++	// does not have (it is the swap tables these registers also hold that count). To GCC those
++	// reads are undefined ("iteration 1 invokes undefined behavior"); the normal build happens to
++	// compile the loop as written, but with the sampling builds' instrumentation GCC dropped the
++	// loop's exit, and the display list was written on through the rest of MEM1 (19 Oct). The same
++	// bytes are read as the object's own representation, which is defined.
++	const u8* const self = reinterpret_cast<const u8*>(this);
++	const u32 kc = u32(reinterpret_cast<const u8*>(mTevKColorSel) - self);
++	const u32 ka = u32(reinterpret_cast<const u8*>(mTevKAlphaSel) - self);
++	for (u32 i = 0; i < 16; i += 4) {
++		J3DGDSetTevKonstantSel_SwapModeTable(
++		    (GXTevStageID)i, (GXTevKColorSel)self[kc + i],
++		    (GXTevKAlphaSel)self[ka + i],
++		    (GXTevKColorSel)self[kc + i + 1],
++		    (GXTevKAlphaSel)self[ka + i + 1],
++		    (GXTevColorChan)mTevSwapModeTable[i / 4].getR(),
++		    (GXTevColorChan)mTevSwapModeTable[i / 4].getG());
++		J3DGDSetTevKonstantSel_SwapModeTable(
++		    (GXTevStageID)(i + 2), (GXTevKColorSel)self[kc + i + 2],
++		    (GXTevKAlphaSel)self[ka + i + 2],
++		    (GXTevKColorSel)self[kc + i + 3],
++		    (GXTevKAlphaSel)self[ka + i + 3],
++		    (GXTevColorChan)mTevSwapModeTable[i / 4].getB(),
++		    (GXTevColorChan)mTevSwapModeTable[i / 4].getA());
++	}
++#else
+ 	for (u32 i = 0; i < 16; i += 4) {
+ 		J3DGDSetTevKonstantSel_SwapModeTable(
+ 		    (GXTevStageID)i, (GXTevKColorSel)mTevKColorSel[i],
+@@ -452,6 +480,7 @@
+ 		    (GXTevColorChan)mTevSwapModeTable[i / 4].getB(),
+ 		    (GXTevColorChan)mTevSwapModeTable[i / 4].getA());
+ 	}
++#endif
+ }
+ 
+ void J3DTevBlock16::load()

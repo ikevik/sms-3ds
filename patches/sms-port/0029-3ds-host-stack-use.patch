@@ -1,0 +1,120 @@
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -56,13 +56,59 @@
+ 	unsigned spin_skips;  // switches that did not spin since the last that did
+ #if defined(__3DS__)
+ 	u32 gc_stack; // the stack size the game gave OSCreateThread (3DS: sizes the host stack)
++	u32 host_stack; // ... and the host stack it got
+ #endif
+ };
+ 
+ #if defined(__3DS__)
+ // Host threads running (3DS: for the pthread_create failure report and [perf]).
+ int g_live_hosts;
+-#define LIVE_HOST_END() __atomic_sub_fetch(&g_live_hosts, 1, __ATOMIC_RELAXED)
++// 3DS port: each host thread paints its stack as it starts, and port_os_stack_report (the
++// renderer's [perf] lines) says how much of it each has used since. An overflow writes over
++// whatever the heap holds below the stack, far from the thread that caused it. Kept in a
++// fixed table, not the scheduler's map: the report runs on a renderer thread.
++struct StackRec {
++	u32* lo; // the painted words, lo up to the top less 512 bytes
++	u32* top;
++	u32 size, gc;
++	void* func;
++	int live; // 0 free, 1 in use, 2 being filled
++};
++const int kStackRecs   = 48;
++const u32 kStackPaint  = 0x57AC57ACu;
++StackRec g_stacks[kStackRecs];
++__thread int t_stack_slot = -1;
++// On the new host thread, first thing: the stack runs from about here down host_stack bytes;
++// the lowest 2 KiB are left unpainted (libctru's start code is above this frame, not below).
++void stack_paint(Host* h)
++{
++	volatile u32 here = 0;
++	u32* top = (u32*)((uintptr_t)&here & ~(uintptr_t)3);
++	u32* lo  = top - h->host_stack / 4 + 2048 / 4;
++	u32* hi  = top - 512 / 4;
++	for (volatile u32* p = lo; p < hi; p++)
++		*p = kStackPaint;
++	for (int i = 0; i < kStackRecs; i++) {
++		int expect = 0;
++		if (!__atomic_compare_exchange_n(&g_stacks[i].live, &expect, 2, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
++			continue;
++		g_stacks[i].lo   = lo;
++		g_stacks[i].top  = top;
++		g_stacks[i].size = h->host_stack;
++		g_stacks[i].gc   = h->gc_stack;
++		g_stacks[i].func = (void*)h->func;
++		__atomic_store_n(&g_stacks[i].live, 1, __ATOMIC_RELEASE);
++		t_stack_slot = i;
++		return;
++	}
++}
++void stack_end()
++{
++	if (t_stack_slot >= 0)
++		__atomic_store_n(&g_stacks[t_stack_slot].live, 0, __ATOMIC_RELEASE);
++	t_stack_slot = -1;
++}
++#define LIVE_HOST_END() (stack_end(), __atomic_sub_fetch(&g_live_hosts, 1, __ATOMIC_RELAXED))
+ #else
+ #define LIVE_HOST_END() ((void)0)
+ #endif
+@@ -296,9 +342,18 @@
+ 		// are created again for each movie, and with a level loaded the 1 MiB stacks ran the
+ 		// heap out at a cutscene (pthread_create failed).
+ 		{
++#if defined(SMS3DS_SAMPLE)
++			// Sampling builds (-finstrument-functions, platform/3ds/prof_3ds.cpp): every
++			// function's frame grows, so twice that.
++			size_t st = size_t(hn->gc_stack) * 8;
++			if (st < (256u << 10)) st = 256u << 10;
++			if (st > (2u << 20)) st = 2u << 20;
++#else
+ 			size_t st = size_t(hn->gc_stack) * 4;
+ 			if (st < (128u << 10)) st = 128u << 10;
+ 			if (st > (1u << 20)) st = 1u << 20;
++#endif
++			hn->host_stack = (u32)st;
+ 			pthread_attr_setstacksize(&a, st);
+ 		}
+ #else
+@@ -474,6 +529,10 @@
+ 	OSThread* self = (OSThread*)p;
+ 	pthread_mutex_lock(&g_cpu);
+ 	Host* h = host_of(self);
++#if defined(__3DS__)
++	if (h->host_stack)
++		stack_paint(h);
++#endif
+ 	while (g_cur != self || host_of(self) != h) {
+ 		pthread_cond_wait(&h->cv, &g_cpu);
+ 		if (h->cancelled) { // cancelled before it ever ran
+@@ -951,6 +1010,26 @@
+ extern "C" double port_idle_seconds(void) { return g_idle_seconds; }
+ #if defined(__3DS__)
+ extern "C" int port_os_live_hosts(void) { return g_live_hosts; }
++// Each live host thread's function, and the most of its stack it has used: what is no longer
++// the paint, from the bottom up. "!" marks one whose painted bottom was overwritten (2 KiB
++// from the end, or past it). Returns the length written.
++extern "C" int port_os_stack_report(char* out, int n)
++{
++	int at = 0;
++	out[0] = 0;
++	for (int i = 0; i < kStackRecs && at < n - 48; i++) {
++		if (__atomic_load_n(&g_stacks[i].live, __ATOMIC_ACQUIRE) != 1)
++			continue;
++		const StackRec r = g_stacks[i];
++		const u32* p     = r.lo;
++		while (p < r.top - 512 / 4 && *p == kStackPaint)
++			p++;
++		const unsigned used = (unsigned)((r.top - p) * 4) >> 10;
++		at += snprintf(out + at, n - at, "%s fn %08lx %u/%u%s", at ? " |" : "", (unsigned long)(uintptr_t)r.func,
++		               used, (unsigned)(r.size >> 10), p == r.lo ? "!" : "");
++	}
++	return at;
++}
+ #endif
+ #if defined(__3DS__)
+ // 3DS port: emulated thread switches so far, for the renderer's [perf] lines.
