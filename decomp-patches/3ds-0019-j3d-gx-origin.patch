@@ -1,0 +1,102 @@
+--- a/include/sms3ds_zone.h
++++ b/include/sms3ds_zone.h
+@@ -20,4 +20,39 @@
+ #else
+ #define SMS3DS_ZONE(n)
+ #endif
++
++// 3DS port (decomp patch 3ds-0019, native J3D stage 0, docs/native-j3d.md): in profile runs the J3D
++// draw code tells the GX thread which of its parts the GX commands that follow come from, and
++// puts the one before back as it returns (SMS3DS_GxOrigin, platform/3ds/prof_3ds.cpp: the GX
++// thread's time by object and origin). Outside a profile run each costs one branch.
++enum {
++	SMS3DS_GX_OTHER,
++	SMS3DS_GX_J3D_MATERIAL,      // the material's display list
++	SMS3DS_GX_J3D_SHAPE_PACKET,  // a shape packet's callbacks and setup
++	SMS3DS_GX_J3D_VTX_FORMAT,    // the shape's vertex-format list
++	SMS3DS_GX_J3D_MATRICES,      // vertex and matrix arrays, matrix indices, matrix loads
++	SMS3DS_GX_J3D_DRAW,          // the shape's draw lists
++};
++#if defined(__3DS__)
++extern "C" int SMS3DS_GxOrigin(int origin);
++struct SMS3DSGxOrigin {
++	int prev;
++	explicit SMS3DSGxOrigin(int origin) : prev(SMS3DS_ProfOn ? SMS3DS_GxOrigin(origin) : -1) {}
++	void set(int origin)
++	{
++		if (prev >= 0)
++			SMS3DS_GxOrigin(origin);
++	}
++	~SMS3DSGxOrigin()
++	{
++		if (prev >= 0)
++			SMS3DS_GxOrigin(prev);
++	}
++};
++#define SMS3DS_GX_ORIGIN(o) SMS3DSGxOrigin sms3ds_gx_origin_(o)
++#define SMS3DS_GX_ORIGIN_SET(o) sms3ds_gx_origin_.set(o)
++#else
++#define SMS3DS_GX_ORIGIN(o)
++#define SMS3DS_GX_ORIGIN_SET(o)
+ #endif
++#endif
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DMaterial.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DMaterial.cpp
+@@ -1,4 +1,5 @@
+ #include <string.h>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0019
+ #include <JSystem/J3D/J3DGraphBase/J3DMaterial.hpp>
+ 
+ #include <JSystem/J3D/J3DGraphBase/Blocks/J3DTevBlocks.hpp>
+@@ -859,6 +860,7 @@
+ {
+ 	j3dSys.unk50 = mMaterialMode;
+ 	if (!j3dSys.checkFlag2()) {
++		SMS3DS_GX_ORIGIN(SMS3DS_GX_J3D_MATERIAL);
+ 		j3dSys.getMatPacket()->getDisplayListObj()->callDL();
+ 		loadNBTScale(*mTexGenBlock->getNBTScale());
+ 	}
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DPacket.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DPacket.cpp
+@@ -1,3 +1,4 @@
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0019
+ #include <JSystem/J3D/J3DGraphBase/J3DPacket.hpp>
+ #include <JSystem/JKernel/JKRHeap.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+@@ -171,6 +172,7 @@
+ void J3DShapePacket::draw()
+ {
+ 	if (mpShape != nullptr && mVisible) {
++		SMS3DS_GX_ORIGIN(SMS3DS_GX_J3D_SHAPE_PACKET);
+ 		if (mpCallBack != nullptr)
+ 			mpCallBack(this, 0);
+ 
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DShape.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DShape.cpp
+@@ -1,3 +1,4 @@
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0019
+ #include <JSystem/J3D/J3DGraphBase/J3DShape.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DTevs.hpp>
+@@ -226,8 +227,10 @@
+ 
+ void J3DShape::draw() const
+ {
++	SMS3DS_GX_ORIGIN(SMS3DS_GX_J3D_VTX_FORMAT);
+ 	GXCallDisplayList(mVcdVatCmd, J3DShape::kVcdVatDLSize);
+ 
++	SMS3DS_GX_ORIGIN_SET(SMS3DS_GX_J3D_MATRICES);
+ 	J3DShapeMtx::currentPipeline = mFlags >> 2 & 3;
+ 	loadVtxArray();
+ 
+@@ -239,8 +242,10 @@
+ 	                  mCurrentTexMtx[5], mCurrentTexMtx[6], mCurrentTexMtx[7]);
+ 
+ 	for (u16 i = 0; i < mMtxGroupNum; ++i) {
++		SMS3DS_GX_ORIGIN_SET(SMS3DS_GX_J3D_MATRICES);
+ 		if (mMatrices[i])
+ 			mMatrices[i]->load();
++		SMS3DS_GX_ORIGIN_SET(SMS3DS_GX_J3D_DRAW);
+ 		if (mDraws[i])
+ 			mDraws[i]->draw();
+ 	}

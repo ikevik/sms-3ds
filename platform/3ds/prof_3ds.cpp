@@ -16,6 +16,9 @@
 // Objects are told to the GX thread in the stream (kStreamOpProfObj, patch 0028): it runs behind
 // the game thread, so the object being performed now is not the one whose draws it is parsing.
 // Vertices are counted there (SMS3DS_ProfGxVerts) and part 3's cut decided there.
+// The GX thread's own time is credited there too (SMS3DS_ProfGxTicks), by object and by where the
+// commands came from: the J3D draw code says which of its parts is sending (decomp patch 3ds-0019,
+// SMS3DS_GxOrigin, kStreamOpOrigin: native J3D stage 0, docs/native-j3d.md).
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
 // Sampling, in builds made with SAMPLE=1 (scripts/build_game_lib.sh, build_platform_lib.sh,
 // build_gx_lib.sh): the game's, the platform layer's and the GX API's functions are compiled with
@@ -52,6 +55,10 @@ extern int GXPC_Detail;  // patch 0027: the GX thread's detailed counters, for t
 extern uint32_t GXPC_ProfObj;  // patch 0028: the object of the draws the GX thread is parsing
 void GXPC_StreamOp(uint8_t op, const void* args, uint32_t n);
 void SMS3DS_ProfGxVerts(uint32_t n);
+void SMS3DS_ProfGxTicks(uint32_t obj, int origin, uint32_t ticks);
+int SMS3DS_GxOrigin(int origin);
+void GXPC_StreamOrigin(uint8_t origin);
+extern uint32_t GXPC_J3DExits;
 // The GameCube's MTX/VEC routines and MSL's maths (patch 0024): calls per routine, and a run of
 // one routine on sample data.
 extern unsigned sms_mtx_calls[];
@@ -84,12 +91,17 @@ const char* const kPhaseName[PHASES] = {
     "end rendering",
 };
 
+// Where the GX thread's commands came from (kStreamOpOrigin): 0 other, then J3D's parts.
+enum { kOrigins = 6 };
+const char* const kOriginName[kOrigins] = {"other", "J3D material lists", "J3D shape packets", "J3D vertex formats",
+                                           "J3D arrays and matrices", "J3D draw lists"};
 struct Entry {
 	const void* vt;
 	const char* name;  // draw buffers (one class, many jobs) are told apart by name
 	uint64_t ticks, bytes;
 	uint32_t calls, verts, puts;
 	int phase;
+	uint32_t gx[kOrigins];  // the GX thread's time on its draws, by origin (ticks)
 };
 const int kTable = 2048;  // power of two
 Entry s_table[kTable];
@@ -134,6 +146,12 @@ struct ZoneOpen {
 };
 ZoneOpen s_zoneStack[32];
 int s_zoneDepth;
+
+// The GX thread's time credited outside any object, and in all, by origin (ticks); the origin the
+// game thread last told it, and the GX thread's J3D exits at the start of the window.
+uint64_t s_gxOutside[kOrigins], s_gxAll[kOrigins];
+int s_gxOrigin;
+uint32_t s_j3dExits0;
 
 // Sampling (see the top). The shadow stack is the game thread's alone: the hooks compare the
 // calling thread's TLS pointer with the game thread's, taken at its first frame (gameLoop, which
@@ -198,6 +216,11 @@ void resetCpu() {
 	memset(s_zoneBytes, 0, sizeof s_zoneBytes);
 	memset(s_zoneCalls, 0, sizeof s_zoneCalls);
 	s_zoneDepth = 0;
+	memset(s_gxOutside, 0, sizeof s_gxOutside);
+	memset(s_gxAll, 0, sizeof s_gxAll);
+	s_gxOrigin = 0;
+	GXPC_StreamOrigin(0);
+	s_j3dExits0 = GXPC_J3DExits;
 	for (int i = 0; i < s_nMath; i++) s_math0[i] = mathCalls(i);
 }
 
@@ -371,6 +394,51 @@ void reportCpu(double frames, double frameMs) {
 			if ((unsigned char)*c < 0x20 || (unsigned char)*c >= 0x7f) *c = '?';
 		fprintf(stderr, "[prof]   %7.0fv %6.2f ms %-15s vt %08lx \"%s\"\n", e->verts / frames, e->ticks * per,
 		        kPhaseName[e->phase], (unsigned long)uintptr_t(e->vt), name);
+	}
+	// The GX thread's time by origin, and the objects that cost it most (native J3D stage 0).
+	{
+		double all = 0, j3d = 0;
+		int at = 0;
+		for (int o = 0; o < kOrigins; o++) {
+			const double ms = s_gxAll[o] * per;
+			all += ms;
+			if (o) j3d += ms;
+			at += snprintf(line + at, sizeof line - at, "%s %s %.2f", at ? " |" : "", kOriginName[o], ms);
+		}
+		fprintf(stderr,
+		        "[prof]   GX thread by where its commands came from (ms/frame, its waits left out):%s | J3D %.2f of "
+		        "%.2f | J3D followed by a command from elsewhere %.1f times/frame\n",
+		        line, j3d, all, (GXPC_J3DExits - s_j3dExits0) / frames);
+		const auto gxSum = [](const Entry* e) {
+			uint64_t t = 0;
+			for (int o = 0; o < kOrigins; o++) t += e->gx[o];
+			return t;
+		};
+		qsort(order, n, sizeof order[0], [](const void* a, const void* b) {
+			uint64_t x = 0, y = 0;
+			for (int o = 0; o < kOrigins; o++) x += (*(Entry* const*)a)->gx[o], y += (*(Entry* const*)b)->gx[o];
+			return x < y ? 1 : x > y ? -1 : 0;
+		});
+		fprintf(stderr,
+		        "[prof]   by GX-thread time (ms/frame: in all = J3D material lists + shape packets + vertex formats + "
+		        "arrays and matrices + draw lists + other; phase, vtable, a name):\n");
+		double outside = 0;
+		for (int o = 0; o < kOrigins; o++) outside += s_gxOutside[o] * per;
+		fprintf(stderr, "[prof]   %6.2f = %5.2f + %5.2f + %5.2f + %5.2f + %5.2f + %5.2f  (outside any object)\n", outside,
+		        s_gxOutside[1] * per, s_gxOutside[2] * per, s_gxOutside[3] * per, s_gxOutside[4] * per,
+		        s_gxOutside[5] * per, s_gxOutside[0] * per);
+		for (int i = 0; i < n && i < 30; i++) {
+			const Entry* e = order[i];
+			const double ms = gxSum(e) * per;
+			if (ms < 0.05) break;
+			char name[40];
+			snprintf(name, sizeof name, "%s", e->name ? e->name : "");
+			for (char* c = name; *c; c++)
+				if ((unsigned char)*c < 0x20 || (unsigned char)*c >= 0x7f) *c = '?';
+			fprintf(stderr, "[prof]   %6.2f = %5.2f + %5.2f + %5.2f + %5.2f + %5.2f + %5.2f  %-15s vt %08lx \"%s\"\n", ms,
+			        e->gx[1] * per, e->gx[2] * per, e->gx[3] * per, e->gx[4] * per, e->gx[5] * per, e->gx[0] * per,
+			        kPhaseName[e->phase], (unsigned long)uintptr_t(e->vt), name);
+		}
 	}
 	// The timed drawing routines (each figure includes the routines it calls, timed or not).
 	{
@@ -692,6 +760,26 @@ int SMS3DS_ProfCutNow(void) {
 void SMS3DS_ProfGxVerts(uint32_t n) {
 	if (!SMS3DS_ProfOn) return;
 	if (Entry* e = reinterpret_cast<Entry*>(uintptr_t(GXPC_ProfObj))) e->verts += n;
+}
+
+// GX thread: its time since the last credit, on commands of object obj (an Entry, or none) from
+// origin.
+void SMS3DS_ProfGxTicks(uint32_t obj, int origin, uint32_t ticks) {
+	if (!SMS3DS_ProfOn || origin < 0 || origin >= kOrigins) return;
+	if (Entry* e = reinterpret_cast<Entry*>(uintptr_t(obj))) e->gx[origin] += ticks;
+	else s_gxOutside[origin] += ticks;
+	s_gxAll[origin] += ticks;
+}
+
+// Game thread (decomp patch 3ds-0019, SMS3DSGxOrigin): the GX commands that follow come from
+// origin. Returns the one before, for the caller to put back.
+int SMS3DS_GxOrigin(int origin) {
+	const int prev = s_gxOrigin;
+	if (origin != prev) {
+		s_gxOrigin = origin;
+		GXPC_StreamOrigin(uint8_t(origin));
+	}
+	return prev;
 }
 
 int SMS3DS_ZoneBegin(int zone) {

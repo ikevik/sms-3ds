@@ -218,6 +218,10 @@ static uint8_t s_bcut;  // the open batch's vertices have their pixels cut
 // Running total of every phase, for the front half's display-list timers (patch 0007) to leave out.
 extern "C" uint64_t GX3DS_OursTicks;
 uint64_t GX3DS_OursTicks;
+// The GX thread's waits, for the stream's next chunk and for the render thread: what the profile
+// runs' GX-time credit leaves out (sms-pc-port patch 0034, native J3D stage 0).
+extern "C" uint64_t GX3DS_GxWaitTicks;
+uint64_t GX3DS_GxWaitTicks;
 extern "C" uint64_t GXPC_DlTicks[4];
 extern "C" uint64_t GXPC_DlFineTicks[8];  // patch 0032: list calls split finer, in profile runs
 extern "C" uint32_t GXPC_DlFineCount[8];
@@ -3520,6 +3524,7 @@ static void gameWaitFor(uint64_t& acc, F ready) {
 	const uint64_t dt = svcGetSystemTick() - t0;
 	acc += dt;
 	GX3DS_OursTicks += dt;  // not the front half's own time
+	GX3DS_GxWaitTicks += dt;
 }
 
 static void renderDrain();
@@ -4585,6 +4590,7 @@ static void gxMain(void*) {
 		while (s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire)) pica_event_wait(EV_GX);
 		const uint64_t t1 = svcGetSystemTick();
 		s_sIdle += t1 - t0;
+		GX3DS_GxWaitTicks += t1 - t0;
 		const uint32_t t = s_sTail.load(std::memory_order_relaxed);
 		const uint8_t* p = s_sChunk[t % kStreamChunks];
 		uint32_t n = s_sLen[t % kStreamChunks];
