@@ -1,0 +1,986 @@
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -13,6 +13,9 @@
+ #include <string>
+ #include <stddef.h>
+ #include <vector>
++#if defined(__3DS__)
++#include "sms3ds_j3d.h"  // native J3D's op (decomp patch 3ds-0020)
++#endif
+ 
+ namespace gx {
+ 
+@@ -343,10 +346,43 @@
+                                  // platform/3ds/prof_3ds.cpp; GXPC_ProfObj)
+     kStreamOpOrigin = 0xCC,      // u8: where the commands that follow come from (profile runs:
+                                  // 0 other, 1-5 J3D's parts; GXPC_StreamOrigin)
+-};
++    kStreamOpJ3DMat = 0xCD,      // u32 list, u32 bytes, u8 check: a J3D material's list (native J3D)
++    kStreamOpJ3DShape = 0xCE,    // u8 check, u8 groups, u8 0, then the SMS3DSJ3DShapeOp's fields up
++                                 // to its groups, then the groups: a J3D shape's draw (native J3D)
++    kStreamOpJ3DEnd = 0xCF,      // check mode: the calls of the last J3D op end here
++};
++// The bytes of a kStreamOpJ3DShape before its groups, its op byte included (sms3ds_j3d.h).
++enum { kJ3DShapeHead = 4 + offsetof(SMS3DSJ3DShapeOp, group) };
+ // (The BP registers hold 24 bits of a 32-byte-aligned offset from MEM1: images and copy
+ // destinations below MEM1, in the program image, do not survive them.)
+ void apiStreamStart();  // gx_api.cpp: the API's copy of the registers, from g
++
++// Native J3D (docs/native-j3d.md stage 1; gx_fifo.cpp draws J3D's ops, the back end below): what
++// a J3D material's list leaves in the registers, made once on the GX thread and never changed
++// after (the render thread reads it from the records that name it). BP entries set the bits of
++// mask (reg 256 + i: konst colour i); XF entries are XF memory or register words.
++struct J3DImage {
++    struct Bp {
++        uint16_t reg;
++        uint32_t v, mask;
++    };
++    struct Xf {
++        uint16_t addr;
++        uint32_t v;
++    };
++    std::vector<Bp> bp;
++    std::vector<Xf> xf;
++    const uint8_t* texImage[8] = {};
++    uint8_t texMask = 0;  // the maps whose image it sets
++};
++void j3dEmitMaterial(const J3DImage* img);         // the render thread applies it to its registers
++void j3dEmitXF(const uint32_t* pairs, uint32_t n);  // (XF address, word) pairs for it to apply
++void j3dBatchNative(bool native);  // the batch's draws are native ones: drawn with the render side's
++                                   // registers as the native records left them (else g's kreg,
++                                   // texture images, copy destination, as every batch)
++void j3dStateOut();                // the registers written since the last state record, sent now
++void j3dEmitSig(const uint32_t* w, uint32_t n);  // verify mode: the registers the render side should hold
++void j3dEffKregTex(uint32_t* kreg, const uint8_t** tex);  // gx_fifo.cpp: konst colours, texture images now
+ #endif
+ 
+ // ---------------------------------------------------------------- util
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -910,6 +910,84 @@
+     GXPC_Put8(reg);
+     GXPC_Put32(v);
+ }
++
++// Native J3D (decomp patch 3ds-0020, sms3ds_j3d.h; docs/native-j3d.md stage 1): J3D's material and
++// shape draws in the draw buffers settings.txt names go to the GX thread as one op each
++// (gx_fifo.cpp), with the values the calls would have sent. What the calls do to the API's own
++// state is done here: the lists they call forget the write filter's knowledge (apiForget(7), as
++// each GXCallDisplayList does: a shape's calls end with one), and the lists are noted as read
++// later, so a write to one waits for the GX thread (none of these lists is rewritten in place).
++// Not while a list is recorded or the pipe is redirected, nor for a list rewritten lately (its
++// call carries a copy): the calls are made then.
++static int s_j3dMode;  // GXPC_SetNativeJ3D: 0 off, 1 on, 2 check
++static char s_j3dBuf[16][40];
++static int s_j3dBufs;
++extern "C" {
++int SMS3DS_J3DNative;
++// mode 0 off, 1 on, 2 check, 3 verify (on, the render side's registers checked); buffers: the draw buffers' names less "DrawBuf ", comma-separated,
++// '_' for a space (settings.txt values end at a space): "MapOpa,StaticMapObj_SunOpa".
++extern int GXPC_J3DVerify;  // gx_fifo.cpp
++void GXPC_SetNativeJ3D(int mode, const char* buffers) {
++    GXPC_J3DVerify = mode == 3;
++    s_j3dMode = mode == 3 ? 1 : mode;
++    s_j3dBufs = 0;
++    for (const char* b = buffers; b && *b && s_j3dBufs < 16;) {
++        while (*b == ' ' || *b == ',') b++;
++        const char* e = b;
++        while (*e && *e != ',') e++;
++        const char* t = e;
++        while (t > b && t[-1] == ' ') t--;
++        if (t > b) {
++            char* name = s_j3dBuf[s_j3dBufs++];
++            snprintf(name, sizeof s_j3dBuf[0], "DrawBuf %.*s", int(t - b), b);
++            for (char* c = name; *c; c++)
++                if (*c == '_') *c = ' ';
++        }
++        b = e;
++    }
++}
++int SMS3DS_J3DBufferMode(const char* name) {
++    if (!s_j3dMode || !name) return 0;
++    for (int i = 0; i < s_j3dBufs; i++)
++        if (strcmp(name, s_j3dBuf[i]) == 0) return s_j3dMode;
++    return 0;
++}
++static bool j3dCanSend() { return g_gxStream && !s_recording && !getPipeRedirect(); }
++int SMS3DS_J3DMat(const void* list, uint32_t size) {
++    if (!SMS3DS_J3DNative || !j3dCanSend() || !list || !size || GXPC_StreamCopyDL(list, size)) return 0;
++    apiForget(7);
++    uint8_t a[9];
++    streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(list)));
++    streamU32(a + 4, size);
++    a[8] = SMS3DS_J3DNative == 2;
++    GXPC_StreamOp(kStreamOpJ3DMat, a, 9);
++    GXPC_StreamNoteDL(list, size);
++    return SMS3DS_J3DNative == 2 ? 2 : 1;
++}
++int SMS3DS_J3DShape(const SMS3DSJ3DShapeOp* op) {
++    if (!SMS3DS_J3DNative || !j3dCanSend() || op->ngroups > 8) return 0;
++    const void* vcd = reinterpret_cast<const void*>(uintptr_t(op->vcdvat));
++    if (GXPC_StreamCopyDL(vcd, 0xC0)) return 0;
++    for (uint32_t i = 0; i < op->ngroups; i++)
++        if (op->group[i].list && GXPC_StreamCopyDL(reinterpret_cast<const void*>(uintptr_t(op->group[i].list)), op->group[i].size))
++            return 0;
++    apiForget(7);
++    // the op byte, then (kJ3DShapeHead counts it) the check flag, the groups, a 0, the fields
++    uint8_t a[kJ3DShapeHead - 1 + sizeof(op->group)];
++    a[0] = SMS3DS_J3DNative == 2;
++    a[1] = uint8_t(op->ngroups);
++    a[2] = 0;
++    memcpy(a + 3, op, kJ3DShapeHead - 4);
++    memcpy(a + kJ3DShapeHead - 1, op->group, op->ngroups * sizeof(op->group[0]));
++    GXPC_StreamOp(kStreamOpJ3DShape, a, kJ3DShapeHead - 1 + op->ngroups * uint32_t(sizeof(op->group[0])));
++    GXPC_StreamNoteDL(vcd, 0xC0);
++    for (uint32_t i = 0; i < op->ngroups; i++)
++        if (op->group[i].list)
++            GXPC_StreamNoteDL(reinterpret_cast<const void*>(uintptr_t(op->group[i].list)), op->group[i].size);
++    return SMS3DS_J3DNative == 2 ? 2 : 1;
++}
++void SMS3DS_J3DEnd(void) { GXPC_StreamOp(kStreamOpJ3DEnd, nullptr, 0); }
++}
+ #endif
+ void GXCallDisplayList(void* list, u32 nbytes) {
+     if (s_recording) {
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1181,7 +1181,9 @@
+     case kStreamOpFilterCheck: return avail < 5 ? 5 : 5 + 4 * p[4];
+     case kStreamOpProfObj: return 5;
+     case kStreamOpOrigin: return 2;
+-    default: return 1;  // kStreamOpFlush, kStreamOpTexInval
++    case kStreamOpJ3DMat: return 10;
++    case kStreamOpJ3DShape: return avail < 4 ? 4 : kJ3DShapeHead + uint32_t(p[2] <= 8 ? p[2] : 8) * sizeof(SMS3DSJ3DShapeOp::Group);
++    default: return 1;  // kStreamOpFlush, kStreamOpTexInval, kStreamOpJ3DEnd
+     }
+ }
+ #endif
+@@ -1295,6 +1297,75 @@
+     }
+ }
+ static void callDisplayListAt(const void* key, const uint8_t* data, uint32_t size, bool copy);
++// Native J3D (below, after the display-list cache): the registers its ops have left, not yet in g.
++namespace {
++struct NatPending {
++    uint32_t bpVal[264], bpKnown[264], bpDirty[9];  // BP registers, then konst colours (256 + i)
++    uint32_t xfMem[XF_MEM_WORDS], xfMemDirty[(XF_MEM_WORDS + 31) / 32];
++    uint32_t xfReg[XF_REG_COUNT], xfRegDirty[(XF_REG_COUNT + 31) / 32];
++    uint32_t cp[256], cpDirty[8];
++    const uint8_t* tex[8];
++    uint8_t texDirty;
++    bool any;
++};
++NatPending s_np;
++bool s_npCheck;  // s_np holds a check op's expectation (kStreamOpJ3DEnd compares it)
++uint8_t s_npCheckKind;
++inline bool bit(const uint32_t* m, uint32_t i) { return (m[i >> 5] >> (i & 31)) & 1; }
++inline void setBit(uint32_t* m, uint32_t i) { m[i >> 5] |= 1u << (i & 31); }
++void npBP(uint32_t i, uint32_t v, uint32_t mask) {
++    if (!bit(s_np.bpDirty, i)) {
++        setBit(s_np.bpDirty, i);
++        s_np.bpVal[i] = s_np.bpKnown[i] = 0;
++    }
++    s_np.bpVal[i] = (s_np.bpVal[i] & ~mask) | (v & mask);
++    s_np.bpKnown[i] |= mask;
++    s_np.any = true;
++}
++void npXF(uint32_t addr, uint32_t v) {
++    if (addr < XF_MEM_WORDS) {
++        s_np.xfMem[addr] = v;
++        setBit(s_np.xfMemDirty, addr);
++    } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
++        s_np.xfReg[addr - XF_REG_BASE] = v;
++        setBit(s_np.xfRegDirty, addr - XF_REG_BASE);
++    } else {
++        return;
++    }
++    s_np.any = true;
++}
++void npCP(uint8_t reg, uint32_t v) {
++    s_np.cp[reg] = v;
++    setBit(s_np.cpDirty, reg);
++    s_np.any = true;
++}
++// The XF word as the native ops have left it (theirs, else g's).
++inline uint32_t effXF(uint32_t addr) {
++    if (addr < XF_MEM_WORDS) return bit(s_np.xfMemDirty, addr) ? s_np.xfMem[addr] : g.xfMem[addr];
++    const uint32_t r = addr - XF_REG_BASE;
++    return bit(s_np.xfRegDirty, r) ? s_np.xfReg[r] : g.xfReg[r];
++}
++void npApply(const J3DImage& img) {
++    for (const J3DImage::Bp& b : img.bp) npBP(b.reg, b.v, b.mask);
++    for (const J3DImage::Xf& x : img.xf) npXF(x.addr, x.v);
++    for (int m = 0; m < 8; m++)
++        if ((img.texMask >> m) & 1) {
++            s_np.tex[m] = img.texImage[m];
++            s_np.texDirty |= uint8_t(1u << m);
++            s_np.any = true;
++        }
++}
++void npClear() {
++    memset(s_np.bpDirty, 0, sizeof s_np.bpDirty);
++    memset(s_np.xfMemDirty, 0, sizeof s_np.xfMemDirty);
++    memset(s_np.xfRegDirty, 0, sizeof s_np.xfRegDirty);
++    memset(s_np.cpDirty, 0, sizeof s_np.cpDirty);
++    s_np.texDirty = 0;
++    s_np.any = false;
++}
++}  // namespace
++static void natOp(const uint8_t* p);
++static void natHandOver();
+ static void streamOpRun(const uint8_t* p) {
+     switch (p[0]) {
+     case kStreamOpCallDL:
+@@ -1333,6 +1404,9 @@
+         GXPC_ProfObj = be32(p + 1);
+         break;
+     case kStreamOpOrigin: setOrigin(p[1] & 7); break;
++    case kStreamOpJ3DMat:
++    case kStreamOpJ3DShape:
++    case kStreamOpJ3DEnd: natOp(p); break;
+     default: logmsg("unknown stream command 0x%02X", p[0]); break;
+     }
+ }
+@@ -1450,6 +1524,9 @@
+         }
+         if (s_dlRec && !(op >= 0x80 && op < 0xC0)) s_dlRecFail = true;
+ #if defined(__3DS__)
++        // native J3D: its registers into g before any command but its own ops
++        if (s_np.any && streamTop && (op < kStreamOpOrigin || op > kStreamOpJ3DEnd) && op != kStreamOpProfObj)
++            natHandOver();
+         if (s_j3dExit && streamTop && op != kStreamOpOrigin && op != kStreamOpProfObj) {
+             GXPC_J3DExits++;
+             s_j3dExit = false;
+@@ -1699,6 +1776,18 @@
+     return s_dlEntries.back();
+ }
+ 
++#if defined(__3DS__)
++// The entry for a list, or null (dlLookup makes one).
++static DlEntry* dlFind(const void* key) {
++    if (s_dlIndex.empty()) return nullptr;
++    const size_t mask = s_dlIndex.size() - 1;
++    for (size_t i = size_t((uint64_t(reinterpret_cast<uintptr_t>(key)) * 0x9E3779B97F4A7C15ull) >> 32) & mask;;
++         i = (i + 1) & mask) {
++        if (s_dlIndex[i].first == key) return s_dlIndex[i].second;
++        if (!s_dlIndex[i].first) return nullptr;
++    }
++}
++#endif
+ static void dlClear() {
+     s_dlEntries.clear();
+     s_dlIndex.clear();
+@@ -1848,6 +1937,9 @@
+ // write stamps describe the list in game memory, so the copy is always hashed, and a match says
+ // nothing about game memory now (the game may have rewritten the list since the copy was made):
+ // the entry's check time is left as it was, so a later call by address still hashes the list.
++#if defined(__3DS__)
++static bool dlDataSame(DlEntry& e, const uint8_t* data, uint32_t size, bool copy, uint64_t ft);
++#endif
+ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size, bool copy = false) {
+ #if defined(__3DS__)
+     uint64_t ft = dlFineNow();
+@@ -1865,6 +1957,11 @@
+ #if defined(__3DS__)
+     if (ft) GXPC_DlFineCount[5] += uint32_t(e.arrays.size());
+     dlFineAdd(1, ft);
++    return dlDataSame(e, data, size, copy, ft);
++}
++// The part of dlReusable that checks the list's bytes and the array data it reads are as they
++// were recorded (3DS port: also the native J3D path's check, which compares the state itself).
++static bool dlDataSame(DlEntry& e, const uint8_t* data, uint32_t size, bool copy, uint64_t ft) {
+ #endif
+     bool unwritten = !copy && trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
+     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
+@@ -2279,6 +2376,691 @@
+     e.valid = true;
+ }
+ 
++#if defined(__3DS__)
++// ------------------------------------------------------------------ native J3D (3DS port)
++// docs/native-j3d.md, stage 1. In the draw buffers settings.txt names, J3D's material and shape
++// draws arrive as one op each (kStreamOpJ3DMat, kStreamOpJ3DShape; decomp patch 3ds-0020) with the
++// values their GX calls would have sent. The GX thread draws a shape from what the display-list
++// cache already holds for its draw lists (recorded the first time it was drawn the usual way), and
++// sends the render thread what a material's list leaves in the registers (J3DImage, worked out
++// once) and the matrices and indices the shape loads, without writing them into g or parsing a
++// list. Whenever the state the cache recorded no longer holds, or a list does something the image
++// cannot say, it replays the very commands the calls would have made instead (exactly the old
++// path).
++// What the native ops left in the registers is kept here (s_np) and written into g, with the
++// usual change reports, just before the next command that is not one of them: g is then what it
++// would have been had the calls been made, for everything that reads it after. The render thread
++// has had the same values all along (the native records apply them to its copy in order).
++// Check mode (settings.txt native_j3d = check): every op is followed by the calls themselves and
++// kStreamOpJ3DEnd. The op is not drawn; what it would have left (s_np) is compared with what the
++// calls left in g, and every difference is counted and the first ones logged.
++extern "C" {
++// [perf] counters: materials native, replayed (list not expressible, or a mask pending), shapes
++// native, replayed (no recorded entry, its state differs, its data changed, runs not resident, the
++// vertex-format list not expressible), hand-overs into g, checks, check differences, runs culled.
++uint32_t GXPC_J3DStats[16];
++// Profile runs (GXPC_Detail): the native ops' time by part, in ticks: 0 material lookup and check,
++// 1 material flush and record, 2 shape lookup and its vertex-format list's check, 3 the entries'
++// state compared, 4 their data checked (write stamps, hashes), 5 matrices, 6 runs (culling and
++// the batch), 7 hand-overs. GXPC_J3DHashed: bytes hashed checking the entries' data.
++uint64_t GXPC_J3DTicks[8];
++uint64_t GXPC_J3DHashed;
++}
++static inline uint64_t njNow() { return GXPC_Detail ? svcGetSystemTick() : 0; }
++static inline void njAdd(int i, uint64_t& t) {
++    if (!t) return;
++    const uint64_t now = svcGetSystemTick();
++    GXPC_J3DTicks[i] += now - t;
++    t = now;
++}
++enum {
++    NJ_MAT, NJ_MAT_REPLAY, NJ_SHAPE, NJ_SHAPE_REPLAY, NJ_R_ENTRY, NJ_R_STATE, NJ_R_DATA, NJ_R_ARENA, NJ_R_VCD,
++    NJ_HANDOVER, NJ_CHECKS, NJ_CHECK_BAD, NJ_CULLED, NJ_XF_SENT, NJ_MAT_SAME, NJ_VERIFIED
++};
++// Verify mode (settings.txt native_j3d = verify; gx_api.cpp sets this): drawn natively, and before
++// each native draw the render thread is told what its registers should hold (g as the native ops
++// leave it: what the old path would have sent it), compares, and logs every difference.
++extern "C" int GXPC_J3DVerify;
++int GXPC_J3DVerify;
++
++// Hands the native ops' registers over to g (see above): just before a command that is not one.
++static void natHandOver() {
++    if (!s_np.any || s_npCheck) return;
++    uint64_t t = njNow();
++    flushBatch();  // the open batch's draws are native ones
++    j3dBatchNative(false);
++    GXPC_J3DStats[NJ_HANDOVER]++;
++    for (uint32_t k = 0; k < 9; k++)
++        for (uint32_t m = s_np.bpDirty[k]; m; m &= m - 1) {
++            const uint32_t i = k * 32 + uint32_t(__builtin_ctz(m));
++            const uint32_t known = s_np.bpKnown[i], val = s_np.bpVal[i];
++            if (i < 256) {
++                const uint32_t v = (g.bp[i] & ~known) | (val & known);
++                if (v != g.bp[i]) {
++                    onStateChange();
++                    g.bp[i] = v;
++                    bpTouched(i);
++                }
++            } else if (g.kreg[i - 256] != val) {
++                onStateChange();
++                g.kreg[i - 256] = val;
++            }
++        }
++    for (int m = 0; m < 8; m++)
++        if ((s_np.texDirty >> m) & 1) {
++            if (g.texImage[m] != s_np.tex[m]) onStateChange();
++            g.texImage[m] = s_np.tex[m];
++        }
++    for (uint32_t k = 0; k < (XF_MEM_WORDS + 31) / 32; k++)
++        for (uint32_t m = s_np.xfMemDirty[k]; m; m &= m - 1) {
++            const uint32_t a = k * 32 + uint32_t(__builtin_ctz(m));
++            writeXF(uint16_t(a), 1, &s_np.xfMem[a]);
++        }
++    for (uint32_t k = 0; k < (XF_REG_COUNT + 31) / 32; k++)
++        for (uint32_t m = s_np.xfRegDirty[k]; m; m &= m - 1) {
++            const uint32_t r = k * 32 + uint32_t(__builtin_ctz(m));
++            writeXF(uint16_t(XF_REG_BASE + r), 1, &s_np.xfReg[r]);
++        }
++    for (uint32_t k = 0; k < 8; k++)
++        for (uint32_t m = s_np.cpDirty[k]; m; m &= m - 1) {
++            const uint32_t r = k * 32 + uint32_t(__builtin_ctz(m));
++            writeCP(uint8_t(r), s_np.cp[r]);
++        }
++    npClear();
++    njAdd(7, t);
++}
++
++// A list's bytes as they were when last checked (write stamps; hashed every kDlRecheckFrames).
++struct NatListCheck {
++    uint32_t clock = 0, frame = 0;
++    uint64_t hash = 0;
++    bool hashAlways = false;
++};
++static bool natListSame(const uint8_t* p, uint32_t n, NatListCheck& c) {
++    const bool unwritten = trustWriteStamps() && !c.hashAlways && unwrittenSince(p, n, c.clock);
++    if (unwritten && g_displayFrames - c.frame < kDlRecheckFrames) return true;
++    const uint32_t clock = writeClock();
++    if (GXPC_HASH(p, n) != c.hash) {
++        if (unwritten) c.hashAlways = true;
++        return false;
++    }
++    c.clock = clock;
++    c.frame = g_displayFrames;
++    return true;
++}
++static void natListTake(const uint8_t* p, uint32_t n, NatListCheck& c) {
++    c.clock = writeClock();
++    c.frame = g_displayFrames;
++    c.hash = GXPC_HASH(p, n);
++}
++
++// What a material's list leaves in the registers, or null when it does more than set registers
++// (CP writes, matrix loads, list calls, draws, BP registers with effects of their own, a masked
++// write to a texture image or a konst colour, a mask left pending).
++static J3DImage* natCompileMaterial(const uint8_t* p, uint32_t size) {
++    J3DImage* img = new J3DImage;
++    const uint8_t* end = p + size;
++    uint32_t mask = 0xFFFFFF;
++    bool ok = true;
++    while (ok && p < end) {
++        const uint8_t op = p[0];
++        const uint32_t avail = uint32_t(end - p);
++        if (op == 0x00 || op == 0x48 || op == 0x44) {
++            p++;
++            continue;
++        }
++        if (op == 0x61) {
++            if (avail < 5) break;
++            const uint32_t v = be32(p + 1), reg = v >> 24, data = v & 0xFFFFFF;
++            p += 5;
++            if (reg == BP_MASK) {
++                mask = data;
++                continue;
++            }
++            const bool texImage = (reg >= BP_TX_IMAGE3 && reg < BP_TX_IMAGE3 + 4) ||
++                                  (reg >= BP_TX_IMAGE3 + 0x20 && reg < BP_TX_IMAGE3 + 0x24);
++            const bool tevReg = reg >= BP_TEV_REG && reg < BP_TEV_REG + 8;
++            switch (reg) {
++            case BP_COPY_EXEC: case BP_PE_TOKEN_INT: case BP_PE_TOKEN: case BP_DRAWDONE: case BP_LOADTLUT1:
++            case BP_TEXINVALIDATE: case BP_COPY_DST:
++                ok = false;
++                continue;
++            default: break;
++            }
++            if (mask != 0xFFFFFF && (texImage || tevReg)) {
++                ok = false;
++                continue;
++            }
++            if (tevReg && (data & 0x800000)) {
++                img->bp.push_back({uint16_t(256 + (reg & 7)), data, 0xFFFFFF});
++            } else {
++                img->bp.push_back({uint16_t(reg), data, mask});
++                if (texImage) {
++                    const int map = int(reg & 3) + ((reg & 0x20) ? 4 : 0);
++                    img->texImage[map] = static_cast<const uint8_t*>(physToPtr(data << 5));
++                    img->texMask |= uint8_t(1u << map);
++                }
++            }
++            mask = 0xFFFFFF;
++        } else if (op == 0x10) {
++            if (avail < 5) break;
++            const uint32_t hdr = be32(p + 1), cnt = (hdr >> 16) + 1;
++            if (avail < 5 + cnt * 4) break;
++            for (uint32_t i = 0; i < cnt; i++) {
++                const uint16_t a = uint16_t((hdr & 0xFFFF) + i);
++                if (a < XF_MEM_WORDS || (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT))
++                    img->xf.push_back({a, be32(p + 5 + i * 4)});
++            }
++            p += 5 + cnt * 4;
++        } else {
++            ok = false;
++        }
++    }
++    if (!ok || p < end || mask != 0xFFFFFF) {
++        delete img;
++        return nullptr;
++    }
++    return img;
++}
++
++// A material list's op: its image, made once per list (again when the list's bytes change; an
++// old image is kept, as records in flight may name it).
++struct NatMat {
++    const uint8_t* list = nullptr;
++    uint32_t size = 0;
++    NatListCheck check;
++    J3DImage* img = nullptr;
++};
++static std::unordered_map<uintptr_t, NatMat> s_natMats;
++static std::vector<J3DImage*> s_natOldImages;
++
++// Whether applying the image would change a register (as the native ops and g leave them). An
++// image writing one register twice is taken as a change when the first value differs.
++static bool natImageChanges(const J3DImage& img) {
++    for (const J3DImage::Bp& b : img.bp) {
++        const uint32_t i = b.reg;
++        uint32_t cur = i < 256 ? g.bp[i] : g.kreg[i - 256];
++        if (bit(s_np.bpDirty, i)) cur = (cur & ~s_np.bpKnown[i]) | (s_np.bpVal[i] & s_np.bpKnown[i]);
++        if ((cur & b.mask) != (b.v & b.mask)) return true;
++    }
++    for (const J3DImage::Xf& x : img.xf)
++        if (effXF(x.addr) != x.v) return true;
++    for (int m = 0; m < 8; m++)
++        if ((img.texMask >> m) & 1) {
++            const uint8_t* cur = ((s_np.texDirty >> m) & 1) ? s_np.tex[m] : g.texImage[m];
++            if (cur != img.texImage[m]) return true;
++        }
++    return false;
++}
++
++static void natMaterial(const uint8_t* list, uint32_t size, bool check) {
++    uint64_t t = njNow();
++    NatMat& m = s_natMats[reinterpret_cast<uintptr_t>(list)];
++    if (m.list != list || m.size != size || !natListSame(list, size, m.check)) {
++        if (m.img) s_natOldImages.push_back(m.img);
++        m.list = list;
++        m.size = size;
++        m.img = natCompileMaterial(list, size);
++        natListTake(list, size, m.check);
++    }
++    njAdd(0, t);
++    if (check) {  // the call follows
++        s_npCheck = true;
++        s_npCheckKind = 0;
++        GXPC_J3DStats[NJ_CHECKS]++;
++        GXPC_J3DStats[m.img ? NJ_MAT : NJ_MAT_REPLAY]++;
++        if (m.img) npApply(*m.img);
++        return;
++    }
++    if (!m.img || g.bpMask != 0xFFFFFF) {
++        GXPC_J3DStats[NJ_MAT_REPLAY]++;
++        natHandOver();
++        callDisplayList(list, size);
++        return;
++    }
++    GXPC_J3DStats[NJ_MAT]++;
++    if (natImageChanges(*m.img)) {  // (the old path flushes only at a change: the batches merge)
++        flushBatch();
++        j3dEmitMaterial(m.img);
++        npApply(*m.img);
++    } else {
++        GXPC_J3DStats[NJ_MAT_SAME]++;
++    }
++    njAdd(1, t);
++}
++
++// A shape's vertex-format list: its CP and XF writes, or not expressible.
++struct NatShape {
++    uint32_t key = 0, vcdvat = 0;
++    NatListCheck check;
++    bool ok = false;
++    std::vector<std::pair<uint8_t, uint32_t>> cp;
++    std::vector<J3DImage::Xf> xf;
++};
++static std::unordered_map<uint32_t, NatShape> s_natShapes;
++
++static void natCompileVcd(NatShape& s, const uint8_t* p, uint32_t size) {
++    s.cp.clear();
++    s.xf.clear();
++    s.ok = true;
++    const uint8_t* end = p + size;
++    while (s.ok && p < end) {
++        const uint8_t op = p[0];
++        const uint32_t avail = uint32_t(end - p);
++        if (op == 0x00 || op == 0x48 || op == 0x44) {
++            p++;
++        } else if (op == 0x08 && avail >= 6) {
++            s.cp.push_back({p[1], be32(p + 2)});
++            p += 6;
++        } else if (op == 0x10 && avail >= 5) {
++            const uint32_t hdr = be32(p + 1), cnt = (hdr >> 16) + 1;
++            if (avail < 5 + cnt * 4) {
++                s.ok = false;
++                break;
++            }
++            for (uint32_t i = 0; i < cnt; i++) {
++                const uint16_t a = uint16_t((hdr & 0xFFFF) + i);
++                if (a < XF_MEM_WORDS || (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT))
++                    s.xf.push_back({a, be32(p + 5 + i * 4)});
++            }
++            p += 5 + cnt * 4;
++        } else {
++            s.ok = false;
++        }
++    }
++}
++
++// The vertex state a shape's draw lists are decoded with: what the native ops and g leave, then
++// its vertex-format list's CP writes and its arrays.
++struct NatVtxState {
++    uint32_t vcdLo, vcdHi, vat[8][3];
++    const uint8_t* base[16];
++    uint32_t stride[16];
++    bool be[16];
++};
++// isBigEndianData for the native path, remembered per base (its range lookup walks a std::map:
++// ~2 us an array with the nodes out of cache, a dozen arrays a shape).
++static bool natBE(const uint8_t* b) {
++    struct Memo {
++        const uint8_t* b;
++        uint32_t gen;
++        bool def, be;
++    };
++    static Memo memo[64];
++    Memo& m = memo[(reinterpret_cast<uintptr_t>(b) >> 4) & 63];
++    if (m.b != b || m.gen != s_beGen || m.def != s_defaultArrayBE)
++        m = Memo{b, s_beGen, s_defaultArrayBE, s_defaultArrayBE || isBigEndianData(b)};
++    return m.be;
++}
++static void natCpInto(NatVtxState& v, uint8_t reg, uint32_t val) {
++    switch (reg & 0xF0) {  // as writeCP
++    case CP_VCD_LO: v.vcdLo = val; break;
++    case CP_VCD_HI: v.vcdHi = val; break;
++    case CP_VAT_A: v.vat[reg & 7][0] = val; break;
++    case CP_VAT_B: v.vat[reg & 7][1] = val; break;
++    case CP_VAT_C: v.vat[reg & 7][2] = val; break;
++    case CP_ARRAY_BASE: {
++        const uint8_t* b = static_cast<const uint8_t*>(physToPtr(val));
++        v.base[reg & 15] = b;
++        v.be[reg & 15] = natBE(b);
++        break;
++    }
++    case CP_ARRAY_STRIDE: v.stride[reg & 15] = val & 0xFF; break;
++    default: break;
++    }
++}
++static void natVtxState(const NatShape& s, const SMS3DSJ3DShapeOp& op, NatVtxState& v) {
++    v.vcdLo = g.cpVcdLo;
++    v.vcdHi = g.cpVcdHi;
++    for (int i = 0; i < 8; i++) {
++        v.vat[i][0] = g.cpVatA[i];
++        v.vat[i][1] = g.cpVatB[i];
++        v.vat[i][2] = g.cpVatC[i];
++    }
++    memcpy(v.base, g.arrayBase, sizeof v.base);
++    memcpy(v.stride, g.arrayStride, sizeof v.stride);
++    memcpy(v.be, g.arrayBigEndian, sizeof v.be);
++    for (uint32_t k = 0; k < 8; k++)
++        for (uint32_t m = s_np.cpDirty[k]; m; m &= m - 1) {
++            const uint32_t r = k * 32 + uint32_t(__builtin_ctz(m));
++            natCpInto(v, uint8_t(r), s_np.cp[r]);
++        }
++    for (const auto& c : s.cp) natCpInto(v, c.first, c.second);
++    natCpInto(v, CP_ARRAY_BASE + 0, op.pos);
++    natCpInto(v, CP_ARRAY_BASE + 1, op.nrm);
++    natCpInto(v, CP_ARRAY_BASE + 2, op.col);
++}
++
++// The draw list's entry can be drawn as recorded: decoded with this draw's vertex state, its data
++// unchanged, every run triangles stored in the arena now.
++static int natEntryOk(DlEntry& e, const uint8_t* list, uint32_t size, const NatVtxState& v,
++                      const SMS3DSJ3DShapeOp& op, uint64_t& t) {
++    if (!e.valid || e.stateOnly || e.skip || e.size != size) return NJ_R_ENTRY;
++    if (e.vcdLo != v.vcdLo || e.vcdHi != v.vcdHi) return NJ_R_STATE;
++    for (int i = 0; i < 8; i++)
++        if ((e.vatMask >> i) & 1)
++            if (e.vat[i][0] != v.vat[i][0] || e.vat[i][1] != v.vat[i][1] || e.vat[i][2] != v.vat[i][2]) return NJ_R_STATE;
++    if (e.usesMtx && (e.matA != op.matA || e.matB != op.matB)) return NJ_R_STATE;
++    for (const DlArray& a : e.arrays)
++        if (a.base != v.base[a.slot] || a.stride != v.stride[a.slot] || a.be != v.be[a.slot]) return NJ_R_STATE;
++    if (!arenaEnabled() || traceFile()) return NJ_R_ARENA;
++    for (const DlRun& r : e.runs)
++        if (r.cls != PRIM_TRIS || r.idx.empty() || r.arena.gen != arenaGeneration()) return NJ_R_ARENA;
++    njAdd(3, t);
++    const uint64_t h0 = GXPC_DlHashed;
++    const bool same = dlDataSame(e, list, size, false, 0);
++    GXPC_J3DHashed += GXPC_DlHashed - h0;
++    njAdd(4, t);
++    return same ? -1 : NJ_R_DATA;
++}
++
++// An indexed matrix load's words, read as loadIndexedXF reads them.
++static void natMtxWords(uint32_t baseHost, uint32_t stride, uint32_t idx, uint32_t n, uint32_t* out) {
++    const uint8_t* base = static_cast<const uint8_t*>(physToPtr(ptrToPhys(reinterpret_cast<const void*>(uintptr_t(baseHost)))));
++    const bool be = natBE(base);
++    const uint8_t* src = base + size_t(idx) * stride;
++    for (uint32_t k = 0; k < n; k++)
++        out[k] = be ? be32(src + k * 4)
++                    : (uint32_t(src[k * 4]) | uint32_t(src[k * 4 + 1]) << 8 | uint32_t(src[k * 4 + 2]) << 16 |
++                       uint32_t(src[k * 4 + 3]) << 24);
++}
++
++// The shape's calls, replayed (the old path).
++static void natReplayShape(const SMS3DSJ3DShapeOp& op) {
++    callDisplayList(reinterpret_cast<const uint8_t*>(uintptr_t(op.vcdvat)), 0xC0);
++    writeCP(CP_ARRAY_BASE + 0, op.pos);
++    writeCP(CP_ARRAY_BASE + 1, op.nrm);
++    writeCP(CP_ARRAY_BASE + 2, op.col);
++    writeCP(CP_ARRAY_BASE + 12, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.drawMtx))));
++    writeCP(CP_ARRAY_STRIDE + 12, 0x30);
++    writeCP(CP_ARRAY_BASE + 13, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.nrmMtx))));
++    writeCP(CP_ARRAY_STRIDE + 13, 0x24);
++    writeCP(CP_MATIDX_A, op.matA);
++    writeCP(CP_MATIDX_B, op.matB);
++    const uint32_t mi[2] = {op.matA, op.matB};
++    writeXF(uint16_t(XF_REG_BASE + XFR_MATIDX_A), 2, mi);
++    for (uint32_t gi = 0; gi < op.ngroups; gi++) {
++        const SMS3DSJ3DShapeOp::Group& gr = op.group[gi];
++        for (uint32_t k = 0; k < gr.nslots; k++) {
++            if (gr.idx[k] == 0xFFFF) continue;
++            loadIndexedXF(0x20, gr.idx[k], (11u << 12) | (k * 12));
++            loadIndexedXF(0x28, gr.idx[k], (8u << 12) | (0x400 + k * 9));
++        }
++        if (gr.list) callDisplayList(reinterpret_cast<const uint8_t*>(uintptr_t(gr.list)), gr.size);
++    }
++}
++
++// The XF words a shape group sets: its matrix indices and its vertex-format list's (first group),
++// its matrices. Sent to the render thread (the open batch drawn first) when one differs.
++static void natGroupXF(const NatShape& s, const SMS3DSJ3DShapeOp& op, uint32_t gi) {
++    static uint32_t pairs[2 * (64 + 2 + 10 * 21)];
++    uint32_t n = 0;
++    auto add = [&](uint32_t a, uint32_t v) {
++        pairs[2 * n] = a;
++        pairs[2 * n + 1] = v;
++        n++;
++    };
++    if (gi == 0) {
++        for (const J3DImage::Xf& x : s.xf)
++            if (n < 64) add(x.addr, x.v);
++        add(XF_REG_BASE + XFR_MATIDX_A, op.matA);
++        add(XF_REG_BASE + XFR_MATIDX_B, op.matB);
++    }
++    const SMS3DSJ3DShapeOp::Group& gr = op.group[gi];
++    for (uint32_t k = 0; k < gr.nslots; k++) {
++        if (gr.idx[k] == 0xFFFF) continue;
++        uint32_t w[12];
++        natMtxWords(op.drawMtx, 0x30, gr.idx[k], 12, w);
++        for (uint32_t i = 0; i < 12; i++) add(k * 12 + i, w[i]);
++        natMtxWords(op.nrmMtx, 0x24, gr.idx[k], 9, w);
++        for (uint32_t i = 0; i < 9; i++) add(0x400 + k * 9 + i, w[i]);
++    }
++    bool differs = false;
++    for (uint32_t i = 0; i < n && !differs; i++) differs = effXF(pairs[2 * i]) != pairs[2 * i + 1];
++    if (!differs) return;
++    flushBatch();
++    j3dEmitXF(pairs, n);
++    GXPC_J3DStats[NJ_XF_SENT]++;
++    for (uint32_t i = 0; i < n; i++) npXF(pairs[2 * i], pairs[2 * i + 1]);
++}
++
++// The konst colours and texture images as the native ops and g leave them: a native draw's
++// record carries them, as every draw record carries g's (the render side gets them only so; an
++// emulated write between a native material and its shapes, a shape packet's callback setting a
++// konst colour or loading a texture, reaches it this way).
++void j3dEffKregTex(uint32_t* kreg, const uint8_t** tex) {
++    for (uint32_t k = 0; k < 8; k++) kreg[k] = bit(s_np.bpDirty, 256 + k) ? s_np.bpVal[256 + k] : g.kreg[k];
++    for (int m = 0; m < 8; m++) tex[m] = ((s_np.texDirty >> m) & 1) ? s_np.tex[m] : g.texImage[m];
++}
++
++// Verify mode: the registers as the native ops and g leave them, for the render thread to compare
++// with its own (BP, konst colours, texture images, XF registers in full; XF memory as 64-word
++// block hashes).
++static void natVerifySig() {
++    static uint32_t w[256 + 8 + 8 + XF_REG_COUNT + (XF_MEM_WORDS + 63) / 64];
++    uint32_t n = 0;
++    for (uint32_t i = 0; i < 264; i++) {
++        uint32_t v = i < 256 ? g.bp[i] : g.kreg[i - 256];
++        if (bit(s_np.bpDirty, i)) v = (v & ~s_np.bpKnown[i]) | (s_np.bpVal[i] & s_np.bpKnown[i]);
++        w[n++] = v;
++    }
++    for (int m = 0; m < 8; m++)
++        w[n++] = uint32_t(uintptr_t(((s_np.texDirty >> m) & 1) ? s_np.tex[m] : g.texImage[m]));
++    for (uint32_t r = 0; r < XF_REG_COUNT; r++) w[n++] = effXF(XF_REG_BASE + r);
++    for (uint32_t b = 0; b < XF_MEM_WORDS; b += 64) {
++        uint32_t h = 2166136261u;
++        for (uint32_t a = b; a < b + 64 && a < XF_MEM_WORDS; a++) h = (h ^ effXF(a)) * 16777619u;
++        w[n++] = h;
++    }
++    j3dEmitSig(w, n);
++    GXPC_J3DStats[NJ_VERIFIED]++;
++}
++
++// dlRunOffscreen for a native draw: the position matrix as the native ops left it.
++static bool natRunOffscreen(const DlRun& r) {
++    if (!r.hasBox || GXPC_CullOff || effXF(XF_REG_BASE + 0x05) != 0) return false;
++    const uint32_t pm = effXF(XF_REG_BASE + XFR_MATIDX_A) & 63;
++    if (pm * 4 + 12 > XF_MEM_WORDS) return false;
++    float m[12], P[6];
++    for (int i = 0; i < 12; i++) {
++        const uint32_t w = effXF(pm * 4 + i);
++        memcpy(&m[i], &w, 4);
++    }
++    for (int i = 0; i < 6; i++) {
++        const uint32_t w = effXF(XF_REG_BASE + XFR_PROJ + i);
++        memcpy(&P[i], &w, 4);
++    }
++    const bool ortho = effXF(XF_REG_BASE + XFR_PROJ + 6) & 1;
++    int l = 0, rt = 0, b = 0, t = 0, behind = 0;
++    for (int c = 0; c < 8; c++) {
++        const float x = r.box[(c & 1) ? 3 : 0], y = r.box[(c & 2) ? 4 : 1], z = r.box[(c & 4) ? 5 : 2];
++        const float vx = m[0] * x + m[1] * y + m[2] * z + m[3];
++        const float vy = m[4] * x + m[5] * y + m[6] * z + m[7];
++        const float vz = m[8] * x + m[9] * y + m[10] * z + m[11];
++        float cx, cy, cw;
++        if (!ortho) {
++            cx = P[0] * vx + P[1] * vz;
++            cy = P[2] * vy + P[3] * vz;
++            cw = -vz;
++        } else {
++            cx = P[0] * vx + P[1];
++            cy = P[2] * vy + P[3];
++            cw = 1.0f;
++        }
++        const float mw = 1.25f * cw;
++        l += cx < -mw;
++        rt += cx > mw;
++        b += cy < -mw;
++        t += cy > mw;
++        behind += cw <= 0.0f;
++    }
++    if (l < 8 && rt < 8 && b < 8 && t < 8 && behind < 8) return false;
++    GXPC_CullRuns++;
++    GXPC_CullVerts += r.nverts;
++    GXPC_J3DStats[NJ_CULLED]++;
++    return true;
++}
++
++static void natShape(const SMS3DSJ3DShapeOp& op, bool check) {
++    uint64_t t = njNow();
++    NatShape& s = s_natShapes[op.shape];
++    const uint8_t* vcd = reinterpret_cast<const uint8_t*>(uintptr_t(op.vcdvat));
++    if (s.key != op.shape || s.vcdvat != op.vcdvat || !natListSame(vcd, 0xC0, s.check)) {
++        s.key = op.shape;
++        s.vcdvat = op.vcdvat;
++        natCompileVcd(s, vcd, 0xC0);
++        natListTake(vcd, 0xC0, s.check);
++    }
++    njAdd(2, t);
++    int why = s.ok && g.bpMask == 0xFFFFFF && op.ngroups ? -1 : NJ_R_VCD;
++    DlEntry* ent[8] = {};
++    if (why < 0) {
++        NatVtxState v;
++        natVtxState(s, op, v);
++        for (uint32_t gi = 0; gi < op.ngroups && why < 0; gi++) {
++            const SMS3DSJ3DShapeOp::Group& gr = op.group[gi];
++            if (!gr.list) continue;
++            ent[gi] = dlFind(reinterpret_cast<const void*>(uintptr_t(gr.list)));
++            why = ent[gi] ? natEntryOk(*ent[gi], reinterpret_cast<const uint8_t*>(uintptr_t(gr.list)), gr.size, v, op, t)
++                          : NJ_R_ENTRY;
++        }
++    }
++    njAdd(3, t);
++    if (check) {  // the calls follow: what they should leave
++        s_npCheck = true;
++        s_npCheckKind = 1;
++        GXPC_J3DStats[NJ_CHECKS]++;
++        GXPC_J3DStats[why < 0 ? NJ_SHAPE : NJ_SHAPE_REPLAY]++;
++        if (why >= 0) GXPC_J3DStats[why]++;
++        for (const auto& c : s.cp) npCP(c.first, c.second);
++        for (const J3DImage::Xf& x : s.xf) npXF(x.addr, x.v);
++        npCP(CP_ARRAY_BASE + 0, op.pos);
++        npCP(CP_ARRAY_BASE + 1, op.nrm);
++        npCP(CP_ARRAY_BASE + 2, op.col);
++        npCP(CP_ARRAY_BASE + 12, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.drawMtx))));
++        npCP(CP_ARRAY_STRIDE + 12, 0x30);
++        npCP(CP_ARRAY_BASE + 13, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.nrmMtx))));
++        npCP(CP_ARRAY_STRIDE + 13, 0x24);
++        npCP(CP_MATIDX_A, op.matA);
++        npCP(CP_MATIDX_B, op.matB);
++        npXF(XF_REG_BASE + XFR_MATIDX_A, op.matA);
++        npXF(XF_REG_BASE + XFR_MATIDX_B, op.matB);
++        for (uint32_t gi = 0; gi < op.ngroups; gi++)
++            for (uint32_t k = 0; k < op.group[gi].nslots; k++) {
++                if (op.group[gi].idx[k] == 0xFFFF) continue;
++                uint32_t w[12];
++                natMtxWords(op.drawMtx, 0x30, op.group[gi].idx[k], 12, w);
++                for (uint32_t i = 0; i < 12; i++) npXF(k * 12 + i, w[i]);
++                natMtxWords(op.nrmMtx, 0x24, op.group[gi].idx[k], 9, w);
++                for (uint32_t i = 0; i < 9; i++) npXF(0x400 + k * 9 + i, w[i]);
++            }
++        return;
++    }
++    if (why >= 0) {
++        GXPC_J3DStats[NJ_SHAPE_REPLAY]++;
++        GXPC_J3DStats[why]++;
++        natHandOver();
++        natReplayShape(op);
++        return;
++    }
++    GXPC_J3DStats[NJ_SHAPE]++;
++    j3dBatchNative(true);
++    j3dStateOut();
++    for (const auto& c : s.cp) npCP(c.first, c.second);
++    npCP(CP_ARRAY_BASE + 0, op.pos);
++    npCP(CP_ARRAY_BASE + 1, op.nrm);
++    npCP(CP_ARRAY_BASE + 2, op.col);
++    npCP(CP_ARRAY_BASE + 12, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.drawMtx))));
++    npCP(CP_ARRAY_STRIDE + 12, 0x30);
++    npCP(CP_ARRAY_BASE + 13, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.nrmMtx))));
++    npCP(CP_ARRAY_STRIDE + 13, 0x24);
++    npCP(CP_MATIDX_A, op.matA);
++    npCP(CP_MATIDX_B, op.matB);
++    njAdd(3, t);
++    for (uint32_t gi = 0; gi < op.ngroups; gi++) {
++        natGroupXF(s, op, gi);
++        if (GXPC_J3DVerify) natVerifySig();
++        njAdd(5, t);
++        DlEntry* e = ent[gi];
++        if (!e) continue;
++        for (DlRun& r : e->runs) {
++            if (natRunOffscreen(r)) continue;
++            appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, uint32_t(r.idx.size()), r.verts.data());
++        }
++        s_vertsLoaded += e->verts;
++        e->misses = 0;
++        njAdd(6, t);
++    }
++}
++
++// kStreamOpJ3DEnd (check mode): what the calls left against what the op said they would.
++static void natCheckEnd() {
++    if (!s_npCheck) return;
++    static uint32_t s_logged;
++    auto bad = [](const char* what, uint32_t reg, uint32_t want, uint32_t got) {
++        GXPC_J3DStats[NJ_CHECK_BAD]++;
++        if (s_logged++ < 40)
++            logmsg("[j3d] check: %s op left %s %03lx = %08lx, the calls %08lx", s_npCheckKind ? "shape" : "material",
++                   what, (unsigned long)reg, (unsigned long)want, (unsigned long)got);
++    };
++    for (uint32_t k = 0; k < 9; k++)
++        for (uint32_t m = s_np.bpDirty[k]; m; m &= m - 1) {
++            const uint32_t i = k * 32 + uint32_t(__builtin_ctz(m));
++            const uint32_t known = s_np.bpKnown[i], val = s_np.bpVal[i];
++            const uint32_t got = i < 256 ? g.bp[i] : g.kreg[i - 256];
++            if ((got & known) != (val & known)) bad(i < 256 ? "BP" : "konst", i, val, got);
++        }
++    for (int m = 0; m < 8; m++)
++        if (((s_np.texDirty >> m) & 1) && g.texImage[m] != s_np.tex[m])
++            bad("texture image", uint32_t(m), uint32_t(uintptr_t(s_np.tex[m])), uint32_t(uintptr_t(g.texImage[m])));
++    for (uint32_t k = 0; k < (XF_MEM_WORDS + 31) / 32; k++)
++        for (uint32_t m = s_np.xfMemDirty[k]; m; m &= m - 1) {
++            const uint32_t a = k * 32 + uint32_t(__builtin_ctz(m));
++            if (g.xfMem[a] != s_np.xfMem[a]) bad("XF memory", a, s_np.xfMem[a], g.xfMem[a]);
++        }
++    for (uint32_t k = 0; k < (XF_REG_COUNT + 31) / 32; k++)
++        for (uint32_t m = s_np.xfRegDirty[k]; m; m &= m - 1) {
++            const uint32_t r = k * 32 + uint32_t(__builtin_ctz(m));
++            if (g.xfReg[r] != s_np.xfReg[r]) bad("XF register", XF_REG_BASE + r, s_np.xfReg[r], g.xfReg[r]);
++        }
++    for (uint32_t k = 0; k < 8; k++)
++        for (uint32_t m = s_np.cpDirty[k]; m; m &= m - 1) {
++            const uint32_t r = k * 32 + uint32_t(__builtin_ctz(m)), v = s_np.cp[r];
++            uint32_t got = v;
++            switch (r & 0xF0) {
++            case CP_MATIDX_A: got = g.cpMatA; break;
++            case CP_MATIDX_B: got = g.cpMatB; break;
++            case CP_VCD_LO: got = g.cpVcdLo; break;
++            case CP_VCD_HI: got = g.cpVcdHi; break;
++            case CP_VAT_A: got = g.cpVatA[r & 7]; break;
++            case CP_VAT_B: got = g.cpVatB[r & 7]; break;
++            case CP_VAT_C: got = g.cpVatC[r & 7]; break;
++            case CP_ARRAY_BASE: got = g.arrayBase[r & 15] == physToPtr(v) ? v : ~v; break;
++            case CP_ARRAY_STRIDE: got = g.arrayStride[r & 15] == (v & 0xFF) ? v : ~v; break;
++            default: break;
++            }
++            if (got != v) bad("CP", r, v, got);
++        }
++    npClear();
++    s_npCheck = false;
++}
++
++// The stream's native J3D ops (streamOpRun).
++static void natOp(const uint8_t* p) {
++    if (p[0] == kStreamOpJ3DMat) {
++        natMaterial(reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 1))), be32(p + 5), p[9] != 0);
++    } else if (p[0] == kStreamOpJ3DShape) {
++        SMS3DSJ3DShapeOp op;
++        memcpy(&op, p + 4, kJ3DShapeHead - 4);
++        op.ngroups = p[2] <= 8 ? p[2] : 8;
++        memcpy(op.group, p + kJ3DShapeHead, op.ngroups * sizeof(op.group[0]));
++        natShape(op, p[1] != 0);
++    } else {
++        natCheckEnd();
++    }
++}
++#endif
++
+ // ------------------------------------------------------------------ write-gather pipe
+ // Bytes written through the pipe collect here until they hold a whole
+ // command (s_pipeNeed bytes), which is then executed.

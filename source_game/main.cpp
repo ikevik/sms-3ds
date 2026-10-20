@@ -303,7 +303,15 @@ static const char kDefaultSettings[] =
     "# The state-only display lists the GX thread has cached (materials, vertex formats) replayed as\n"
     "# register words, skipping writes that change nothing (on), or command by command (off). The\n"
     "# same result either way; off is for comparing the two.\n"
-    "gx_fast_state_lists = on\n";
+    "gx_fast_state_lists = on\n"
+    "\n"
+    "# J3D models drawn natively (docs/native-j3d.md): their GX calls sent as one op per material and\n"
+    "# shape, drawn from what the GX thread compiled (on), the calls as before (off), or both, the\n"
+    "# ops checked against what the calls leave (check), or on with the render thread's registers\n"
+    "# checked before each native draw (verify), in the draw buffers named. Being tested:\n"
+    "# each build has its own default, which a line here overrides.\n"
+    "# native_j3d = off\n"
+    "# native_j3d_buffers = MapOpa,StaticMapObj_SunOpa\n";
 
 // Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
 #ifndef SMS3DS_MIPS_DEFAULT
@@ -321,6 +329,16 @@ extern "C" void GXPC_SetStateBlocks(int on);
 #define SMS3DS_FAST_STATE_LISTS_DEFAULT 1
 #endif
 extern "C" void GXPC_SetFastStateLists(int on);
+// J3D drawn natively (decomp patch 3ds-0020, sms-pc-port patch 0035; settings.txt native_j3d,
+// native_j3d_buffers): 0 off, 1 on, 2 check, 3 verify (on, the render side's registers checked).
+#ifndef SMS3DS_NATIVE_J3D_DEFAULT
+#define SMS3DS_NATIVE_J3D_DEFAULT 0
+#endif
+// The draw buffers (less "DrawBuf ", '_' for a space): the static ones TDrawBufObj draws.
+#define SMS3DS_NATIVE_J3D_BUFFERS \
+	"MapOpa,MapXlu,StaticMapObj_SunOpa,StaticMapObj_ShadowOpa,StaticMapObj_SunXlu,StaticMapObj_ShadowXlu," \
+	"Mirror_Opa,Mirror_Xlu,Sky_Opa,Sky_Xlu,AfterIndirect_Xlu,ChrOpa,ChrXlu"
+extern "C" void GXPC_SetNativeJ3D(int mode, const char* buffers);
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -435,6 +453,14 @@ static void* game_thread(void*)
 		GXPC_SetFastStateLists(fastLists);
 		fprintf(stderr, "[3ds] cached state-only display lists: %s (gx_fast_state_lists)\n",
 		        fastLists ? "replayed as register words" : "replayed command by command");
+		int nativeJ3D = SMS3DS_NATIVE_J3D_DEFAULT;
+		if (setting_value(kSettingsPath, "native_j3d", v, sizeof v))
+			nativeJ3D = strcmp(v, "on") == 0 ? 1 : strcmp(v, "check") == 0 ? 2 : strcmp(v, "verify") == 0 ? 3 : 0;
+		char bufs[256] = SMS3DS_NATIVE_J3D_BUFFERS;
+		setting_value(kSettingsPath, "native_j3d_buffers", bufs, sizeof bufs);
+		GXPC_SetNativeJ3D(nativeJ3D, bufs);
+		fprintf(stderr, "[3ds] J3D drawn natively: %s, in %s (native_j3d, native_j3d_buffers)\n",
+		        nativeJ3D == 1 ? "on" : nativeJ3D == 2 ? "check" : nativeJ3D == 3 ? "verify" : "off", bufs);
 	}
 	g_phase = 1;
 	port_init(2, argv);

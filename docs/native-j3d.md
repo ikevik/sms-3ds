@@ -349,6 +349,48 @@ compile on the GX thread; `RC_J3D` and `drawJ3D`; lazy materialisation; the chec
 Expected: small (1–4 ms GX thread, estimate; the map's game-thread cost is 0.49 ms). Exit: check mode
 reports no mismatch, GPU time unchanged, GX thread and indexed-load counts down by MapOpa's share.
 
+*As built (2026-10-20, decomp patch 3ds-0020, sms-pc-port patch 0035).* The game side sends one op per
+locked material packet (`kStreamOpJ3DMat`: its list) and one per shape draw (`kStreamOpJ3DShape`: the
+vertex-format list, the vertex arrays, the matrix arrays, the matrix-index registers and, per group,
+the matrix indices and the draw list), in the buffers `native_j3d_buffers` names. A shape qualifies
+when every matrix is loaded by index (pipeline 0), it has no NBT normals and its groups are
+`J3DShapeMtx` or `J3DShapeMtxMulti`; callbacks and flag 2 are allowed. On the GX thread:
+
+- a material's list is turned once into a `J3DImage` (BP words with their masks, konst colours, XF
+  words, texture images). A list with anything else (CP writes, loads, calls, TLUT loads, copies,
+  tokens) is replayed as a list call. The image goes to the render thread as `RC_J3DMAT`, which
+  applies it to `rs`;
+- a shape draws from the display-list cache's own entries for its draw lists, recorded when it was
+  last drawn the usual way. They are checked against the vertex state this draw sets (format,
+  arrays, matrix indices), their data against the write stamps, and every run must be resident.
+  The matrices are read from the arrays as the indexed loads read them and go to the render thread
+  as `RC_J3DXF`, only when a word changed, so shapes sharing a material and matrices still merge
+  into one batch;
+- otherwise the shape's calls are replayed from the op, which is exactly the old path;
+- what native ops leave in the registers is collected and written into `g`, with the usual change
+  reports, before the next command that is not a native op (the "hand-over");
+- the render thread's TEV translation and cache are unchanged: native draws only skip the GX
+  thread's list work and the game thread's GX calls. A per-material TEV cache is the next step.
+
+Check mode (`native_j3d = check`): each op is followed by the calls themselves; the op is not drawn,
+and what it would have left is compared with what the calls left in `g` (`[j3d] check` lines, a
+count in `[perf]`). Verify mode (`native_j3d = verify`) draws natively and has the render thread
+compare its registers, before each native draw, with what the old path would have sent it.
+
+*Results on hardware (2026-10-20, all 13 static `TDrawBufObj` buffers, Delfino Plaza).* Check and
+verify both found 0 differences. One real bug was found on the way: the render side gets konst
+colours and texture images only from draw records, so native draws must carry them as the GX
+thread has them (`j3dEffKregTex`); without that, a shape packet callback's colour or texture
+change was lost (cloned water waves, a corrupted quad in the sky). The GX thread's J3D time did
+not go down (26.4 ms off, 26.7 on): a native material op costs ~15 us (mostly flushing the batch
+before it), a shape op ~32 us (vertex state compared 12.6, matrices 7.8, data stamps 5.4, runs 4).
+That is no cheaper than the tuned list calls: the time is in scattered heap structures (entries,
+runs, arrays, hash nodes), cold every frame, at ~210 ns a main-memory load on core 1. To pay off,
+shapes need compiling into compact packages (vertex state validated once, data stamps checked
+once a frame, spans precomputed, one bounding box per shape), for ~5-8 us a shape. Even then the
+frame gains at most ~4 ms while the GPU (~40 ms) and the game thread (~39 ms) stay where they are,
+so measuring those comes first. `native_j3d` stays off by default.
+
 **Stage 2: the other static buffers.** MapXlu (blended: reordering stays off by the same rule), Sky
 Opa/Xlu, StaticMapObj Sun/Shadow Opa/Xlu (SDL instancing: one material op, many shape ops), Mirror
 Opa/Xlu (view number), AfterIndirect (EFB-copy textures).

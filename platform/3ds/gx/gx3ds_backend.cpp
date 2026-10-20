@@ -226,6 +226,9 @@ extern "C" uint64_t GXPC_DlTicks[4];
 extern "C" uint64_t GXPC_DlFineTicks[8];  // patch 0032: list calls split finer, in profile runs
 extern "C" uint32_t GXPC_DlFineCount[8];
 extern "C" uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
+extern "C" uint32_t GXPC_J3DStats[16];  // native J3D (patch 0035, gx_fifo.cpp)
+extern "C" uint64_t GXPC_J3DTicks[8], GXPC_J3DHashed;
+static uint32_t s_j3dSigs, s_j3dSigBad;  // verify mode (renderJ3DSig): native draws checked, differences
 extern "C" uint64_t GXPC_DlHashed;
 // Hashing by where the bytes are (patch 0021, and the texture cache below): outside the write stamps'
 // window (64 MiB from MEM1's base) the caches cannot trust stamps and hash on every check.
@@ -475,6 +478,40 @@ static void perfFrameEnd() {
 				        "%.2f\n",
 				        ft[0], ft[1], fc[2] + fc[0] > 0 ? fc[5] / (fc[2] + fc[0]) : 0.0, ft[2], ft[3], fc[6], ft[4], fc[0], fc[1],
 				        fc[7], ft[5], fc[2], fc[3], fc[4], ft[6]);
+		}
+		{
+			// Native J3D (patch 0035): ops drawn natively and replayed as calls, by reason.
+			static uint32_t j0[16];
+			double j[16], any = 0;
+			for (int i = 0; i < 16; i++) {
+				j[i] = (GXPC_J3DStats[i] - j0[i]) / frames;
+				j0[i] = GXPC_J3DStats[i];
+				any += j[i];
+			}
+			if (any > 0)
+				fprintf(stderr,
+				        "[perf]   native J3D per frame: materials %.1f native (%.1f changing nothing), %.1f replayed | shapes %.1f "
+				        "native, %.1f replayed (no entry %.1f, state %.1f, data %.1f, not resident %.1f, vertex format %.1f) | "
+				        "matrix updates %.1f, runs culled %.1f, hand-overs %.1f | checks %.1f, differences %.1f | render side "
+				        "verified %.1f, differences so far %lu\n",
+				        j[0], j[14], j[1], j[2], j[3], j[4], j[5], j[6], j[7], j[8], j[13], j[12], j[9], j[10], j[11], j[15],
+				        (unsigned long)s_j3dSigBad);
+			static uint64_t t0[8], h0;
+			double t[8], tall = 0;
+			for (int i = 0; i < 8; i++) {
+				t[i] = double(GXPC_J3DTicks[i] - t0[i]) * perMs;
+				t0[i] = GXPC_J3DTicks[i];
+				tall += t[i];
+			}
+			const double kb = double(GXPC_J3DHashed - h0) / frames / 1024.0;
+			h0 = GXPC_J3DHashed;
+			if (tall > 0)  // profile runs
+				fprintf(stderr,
+				        "[perf]   native J3D's GX time (ms/frame, profile runs): materials: lookup %.2f, flush and record %.2f | "
+				        "shapes: lookup %.2f, state compared %.2f, data checked %.2f (%.0f KB hashed), matrices %.2f, runs %.2f "
+				        "| hand-overs %.2f | %.1f us a material, %.1f us a shape\n",
+				        t[0], t[1], t[2], t[3], t[4], kb, t[5], t[6], t[7], j[0] > 0 ? (t[0] + t[1]) * 1000.0 / j[0] : 0.0,
+				        j[2] > 0 ? (t[2] + t[3] + t[4] + t[5] + t[6]) * 1000.0 / j[2] : 0.0);
 		}
 		{
 			static uint64_t do0, th0, to0, tl0;
@@ -3397,7 +3434,7 @@ static void drawBatch() {
 // (a resident batch: its indices only), and each EFB copy. The game thread runs at most one frame
 // ahead of the render thread. GX3DS_SetRenderThread(0) (D-pad left at launch) draws each record
 // as it is queued, on the game thread.
-enum RecType : uint32_t { RC_WRAP = 1, RC_STATE, RC_DRAW, RC_COPY };
+enum RecType : uint32_t { RC_WRAP = 1, RC_STATE, RC_DRAW, RC_COPY, RC_J3DMAT, RC_J3DXF, RC_J3DSIG };
 struct RecHdr {
 	uint32_t type, size;  // size: the whole record, a multiple of 8
 };
@@ -3415,6 +3452,7 @@ struct DrawRec {
 	uint8_t pnMax, texMtx[8];
 	uint32_t nspans;       // non-zero: a resident batch, its data nspans IdxSpans (arena at the page's start)
 	uint32_t bmin;         // its first vertex in the page
+	uint8_t native;        // native J3D draws (kreg and texture images as the native ops leave them)
 };
 // Where a draw record's data starts (vertices, then indices; or nothing, with ext).
 static const uint32_t kDrawHead = uint32_t(sizeof(RecHdr) + sizeof(DrawRec) + 7) & ~7u;
@@ -3436,6 +3474,7 @@ static std::atomic<int> s_rSleeping{0}, s_gSleeping{0};
 static bool s_rtWanted = true;
 static int s_rtCore = -1;                             // the render thread's core; -1: none
 static uint32_t s_gFrames;                            // display copies queued
+static bool s_bNative;                                // the open batch's draws are native J3D ones (j3dBatchNative)
 // Registers written since the last state record (game side).
 static uint32_t s_dBp[8], s_dXm[4], s_dTlut[32];  // BP registers, 16-word XF memory blocks, 512-byte TLUT blocks
 static bool s_dXr, s_dAny, s_dAll = true;
@@ -3756,8 +3795,12 @@ static void enqueueDraw() {
 	d->arena = s_bArena ? verts : nullptr;
 	d->ext = ext;
 	d->L = vtxFmtLayout(s_bfmt);
-	memcpy(d->kreg, g.kreg, sizeof d->kreg);
-	memcpy(d->texImage, g.texImage, sizeof d->texImage);
+	if (s_bNative) {  // as the native ops leave them (not yet in g)
+		j3dEffKregTex(d->kreg, d->texImage);
+	} else {
+		memcpy(d->kreg, g.kreg, sizeof d->kreg);
+		memcpy(d->texImage, g.texImage, sizeof d->texImage);
+	}
 	d->copyDest = g.copyDest;
 	d->stateOff = stateOff;
 	d->cut = s_bcut;
@@ -3766,6 +3809,7 @@ static void enqueueDraw() {
 	memcpy(d->texMtx, s_bTexMtx, sizeof d->texMtx);
 	d->nspans = nspans;
 	d->bmin = s_bArena ? s_bmin : 0;
+	d->native = s_bNative;
 	uint8_t* data = ext ? ext : p + head;
 	if (!s_bArena && !inPlace) {
 		PerfScope pv(PERF_QVERT);
@@ -3813,6 +3857,117 @@ static void renderDraw(const RecHdr* h) {
 
 static void renderCopy(const CopyRec* c);
 
+// Native J3D (sms-pc-port patch 0035, gx_fifo.cpp; docs/native-j3d.md stage 1). GX thread: a
+// material's image, the XF words a shape loads, and the native flag of the batches that follow,
+// as records in order with everything else. Render thread: applied to its registers as the
+// commands they stand for would have been.
+void j3dBatchNative(bool native) {
+	if (native == s_bNative) return;
+	if (batchHasVertices()) flushBatch();
+	s_bNative = native;
+}
+void j3dStateOut() {
+	rcInit();
+	if (!stateBytes()) return;
+	if (batchHasVertices()) flushBatch();
+	emitState();
+}
+void j3dEmitMaterial(const J3DImage* img) {
+	rcInit();
+	emitState();
+	const uint32_t size = (uint32_t(sizeof(RecHdr)) + 8 + 7) & ~7u;
+	uint8_t* p = rcReserve(size);
+	RecHdr* h = reinterpret_cast<RecHdr*>(p);
+	h->type = RC_J3DMAT;
+	h->size = size;
+	memcpy(p + sizeof(RecHdr), &img, sizeof img);
+	rcCommit(size);
+}
+void j3dEmitXF(const uint32_t* pairs, uint32_t n) {
+	rcInit();
+	const uint32_t size = (uint32_t(sizeof(RecHdr)) + 8 + n * 8 + 7) & ~7u;
+	uint8_t* p = rcReserve(size);
+	RecHdr* h = reinterpret_cast<RecHdr*>(p);
+	h->type = RC_J3DXF;
+	h->size = size;
+	uint32_t* w = reinterpret_cast<uint32_t*>(p + sizeof(RecHdr));
+	w[0] = n;
+	memcpy(w + 2, pairs, size_t(n) * 8);
+	rcCommit(size);
+}
+static void renderXFWord(uint32_t a, uint32_t v) {
+	if (a < XF_MEM_WORDS) {
+		rs.xfMem[a] = v;
+		s_xfDirty = true;
+	} else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT) {
+		rs.xfReg[a - XF_REG_BASE] = v;
+	}
+}
+static void renderJ3DMat(const uint8_t* body) {
+	const J3DImage* img;
+	memcpy(&img, body, sizeof img);
+	for (const J3DImage::Bp& b : img->bp) {
+		if (b.reg < 256) rs.bp[b.reg] = (rs.bp[b.reg] & ~b.mask) | (b.v & b.mask);
+		else rs.kreg[b.reg - 256] = b.v;
+	}
+	for (const J3DImage::Xf& x : img->xf) renderXFWord(x.addr, x.v);
+	for (int m = 0; m < 8; m++)
+		if ((img->texMask >> m) & 1) rs.texImage[m] = img->texImage[m];
+}
+void j3dEmitSig(const uint32_t* w, uint32_t n) {
+	rcInit();
+	const uint32_t size = (uint32_t(sizeof(RecHdr)) + 8 + n * 4 + 7) & ~7u;
+	uint8_t* p = rcReserve(size);
+	RecHdr* h = reinterpret_cast<RecHdr*>(p);
+	h->type = RC_J3DSIG;
+	h->size = size;
+	uint32_t* d = reinterpret_cast<uint32_t*>(p + sizeof(RecHdr));
+	d[0] = n;
+	memcpy(d + 2, w, size_t(n) * 4);
+	rcCommit(size);
+}
+// Verify mode: the render side's registers against what the GX thread says they should be (see
+// gx_fifo.cpp, natVerifySig); each difference counted (s_j3dSigBad), the first ones logged.
+static void renderJ3DSig(const uint8_t* body) {
+	const uint32_t* w = reinterpret_cast<const uint32_t*>(body);
+	const uint32_t* v = w + 2;
+	s_j3dSigs++;
+	static uint32_t logged;
+	auto bad = [&](const char* what, uint32_t i, uint32_t want, uint32_t got) {
+		s_j3dSigBad++;
+		if (logged++ < 60)
+			fprintf(stderr, "[j3d] verify (native draw check %lu): %s %03lx: render side %08lx, should be %08lx\n",
+			        (unsigned long)s_j3dSigs, what, (unsigned long)i, (unsigned long)got, (unsigned long)want);
+	};
+	uint32_t k = 0;
+	for (uint32_t i = 0; i < 256; i++, k++)
+		if ((rs.bp[i] & 0xFFFFFF) != (v[k] & 0xFFFFFF)) bad("BP", i, v[k], rs.bp[i]);
+	k += 16;  // konst colours and texture images: from the draw's record, as for every draw
+	for (uint32_t i = 0; i < XF_REG_COUNT; i++, k++)
+		if (rs.xfReg[i] != v[k]) bad("XF register", XF_REG_BASE + i, v[k], rs.xfReg[i]);
+	for (uint32_t b = 0; b < XF_MEM_WORDS; b += 64, k++) {
+		uint32_t h = 2166136261u;
+		for (uint32_t a = b; a < b + 64 && a < XF_MEM_WORDS; a++) h = (h ^ rs.xfMem[a]) * 16777619u;
+		if (h != v[k]) {
+			bad("XF memory block at", b, v[k], h);
+			if (logged <= 60)
+				for (uint32_t a = b; a < b + 64 && a < XF_MEM_WORDS; a += 16)
+					fprintf(stderr, "[j3d]   render side XF %03lx: %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\n",
+					        (unsigned long)a, (unsigned long)rs.xfMem[a], (unsigned long)rs.xfMem[a + 1], (unsigned long)rs.xfMem[a + 2],
+					        (unsigned long)rs.xfMem[a + 3], (unsigned long)rs.xfMem[a + 4], (unsigned long)rs.xfMem[a + 5],
+					        (unsigned long)rs.xfMem[a + 6], (unsigned long)rs.xfMem[a + 7], (unsigned long)rs.xfMem[a + 8],
+					        (unsigned long)rs.xfMem[a + 9], (unsigned long)rs.xfMem[a + 10], (unsigned long)rs.xfMem[a + 11],
+					        (unsigned long)rs.xfMem[a + 12], (unsigned long)rs.xfMem[a + 13], (unsigned long)rs.xfMem[a + 14],
+					        (unsigned long)rs.xfMem[a + 15]);
+		}
+	}
+}
+static void renderJ3DXF(const uint8_t* body) {
+	const uint32_t* w = reinterpret_cast<const uint32_t*>(body);
+	const uint32_t n = w[0];
+	for (uint32_t i = 0; i < n; i++) renderXFWord(w[2 + 2 * i], w[3 + 2 * i]);
+}
+
 // Draws every record queued so far.
 static void renderDrain() {
 	uint32_t t = s_tail.load(std::memory_order_relaxed);
@@ -3824,6 +3979,9 @@ static void renderDrain() {
 		case RC_STATE: renderState(body); break;
 		case RC_DRAW: renderDraw(h); break;
 		case RC_COPY: renderCopy(reinterpret_cast<const CopyRec*>(body)); break;
+		case RC_J3DMAT: renderJ3DMat(body); break;
+		case RC_J3DXF: renderJ3DXF(body); break;
+		case RC_J3DSIG: renderJ3DSig(body); break;
 		default: break;
 		}
 		t += h->size;

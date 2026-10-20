@@ -1,0 +1,194 @@
+--- /dev/null
++++ b/include/sms3ds_j3d.h
+@@ -0,0 +1,41 @@
++// 3DS port (decomp patch 3ds-0020, native J3D stage 1, docs/native-j3d.md): J3D's material and
++// shape draws sent to the GX thread as one op each, with the values their GX calls would have
++// sent, instead of the calls. The GX thread (sms-pc-port patch 0035, gx_fifo.cpp) draws a shape
++// from what it compiled the first time, or replays the very commands the calls would have made.
++// Only in the draw buffers settings.txt names (native_j3d_buffers), while TDrawBufObj::perform
++// draws them (SMS3DS_J3DNative).
++#ifndef SMS3DS_J3D_H
++#define SMS3DS_J3D_H
++#if defined(__3DS__)
++#include <stdint.h>
++
++// What J3DShape::draw sends (pipeline 0: every matrix loaded by index), as values.
++struct SMS3DSJ3DShapeOp {
++	uint32_t shape;          // the J3DShape: the key
++	uint32_t vcdvat;         // its vertex-format list (host pointer, J3DShape::kVcdVatDLSize bytes)
++	uint32_t pos, nrm, col;  // J3DLoadArrayBasePtr's CP values for GX_VA_POS, NRM and CLR0
++	uint32_t drawMtx;        // GX_POS_MTX_ARRAY's base (host pointer; stride sizeof(Mtx))
++	uint32_t nrmMtx;         // GX_NRM_MTX_ARRAY's base (host pointer; stride sizeof(Mtx33))
++	uint32_t matA, matB;     // JRNLoadCurrentMtx's matrix-index registers (CP and XF)
++	uint32_t ngroups;
++	struct Group {
++		uint32_t list, size;  // the group's draw list (host pointer; 0: none)
++		uint16_t nslots;      // matrices loaded, slot by slot (0: none)
++		uint16_t idx[10];     // each slot's matrix index; 0xFFFF: skipped
++	} group[8];
++};
++
++extern "C" {
++// Set while a draw buffer settings.txt names is drawn: 1 natively, 2 natively checked against the
++// calls (the calls are made too, and the GX thread compares what each left).
++extern int SMS3DS_J3DNative;
++// The mode for the draw buffer called name (TDrawBufObj::perform).
++int SMS3DS_J3DBufferMode(const char* name);
++// Each returns 0 when it sent nothing (make the calls), 1 when it sent the op (skip them), 2 when
++// it sent it to be checked (make the calls, then SMS3DS_J3DEnd).
++int SMS3DS_J3DMat(const void* list, uint32_t size);
++int SMS3DS_J3DShape(const SMS3DSJ3DShapeOp* op);
++void SMS3DS_J3DEnd(void);
++}
++#endif
++#endif
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DShape.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DShape.cpp
+@@ -1,4 +1,5 @@
+ #include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0019
++#include "sms3ds_j3d.h"   // 3DS port: decomp patch 3ds-0020
+ #include <JSystem/J3D/J3DGraphBase/J3DShape.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DTevs.hpp>
+@@ -6,6 +7,9 @@
+ #include <JSystem/JRenderer.hpp>
+ #include <dolphin/gx.h>
+ #include <dolphin/gd.h>
++#if defined(__3DS__)
++#include <dolphin/gd/GDTransform.h>
++#endif
+ 
+ J3DShapeMtx::LoadPipeline J3DShapeMtx::mtxLoadPipeline[4] = {
+ 	&J3DShapeMtx::loadMtxIndx_PNGP,
+@@ -225,8 +229,64 @@
+ 	J3DLoadArrayBasePtr(GX_VA_CLR0, j3dSys.getVtxCol());
+ }
+ 
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0020, native J3D): the matrix groups the native op can express are
++// J3DShapeMtx and J3DShapeMtxMulti themselves (their loads go by index); told apart from the
++// other kinds (display-list loads, billboards) by their virtual tables.
++static const void* sms3dsVtable(const void* obj) { return *(const void* const*)obj; }
++static const J3DShapeMtx sms3dsSingleMtx(0);
++static const J3DShapeMtxMulti sms3dsMultiMtx(0, 0, nullptr);
++#endif
++
+ void J3DShape::draw() const
+ {
++#if defined(__3DS__)
++	// 3DS port: in a draw buffer drawn natively (SMS3DS_J3DNative), one op with the values the
++	// calls below would send, when every matrix is loaded by index (pipeline 0) and no normal is
++	// bump-mapped (NBT). The game-side state the calls set is set as they would.
++	int sms3dsNative = 0;
++	if (SMS3DS_J3DNative && (mFlags >> 2 & 3) == 0 && !mHasNBT && mMtxGroupNum <= 8) {
++		SMS3DSJ3DShapeOp op;
++		bool ok = true;
++		op.shape   = (uint32_t)(uintptr_t)this;
++		op.vcdvat  = (uint32_t)(uintptr_t)mVcdVatCmd;
++		op.pos     = OSCachedToPhysical(j3dSys.getVtxPos());
++		op.nrm     = OSCachedToPhysical(j3dSys.getVtxNrm());
++		op.col     = OSCachedToPhysical(j3dSys.getVtxCol());
++		op.drawMtx = (uint32_t)(uintptr_t)mDrawMatrices[*mCurrentViewNo];
++		op.nrmMtx  = (uint32_t)(uintptr_t)mNormMatrices[*mCurrentViewNo];
++		op.matA    = CP_MTX_REG_A(GX_PNMTX0, mCurrentTexMtx[0], mCurrentTexMtx[1], mCurrentTexMtx[2], mCurrentTexMtx[3]);
++		op.matB    = CP_MTX_REG_B(mCurrentTexMtx[4], mCurrentTexMtx[5], mCurrentTexMtx[6], mCurrentTexMtx[7]);
++		op.ngroups = mMtxGroupNum;
++		for (u16 i = 0; ok && i < mMtxGroupNum; ++i) {
++			SMS3DSJ3DShapeOp::Group& gr = op.group[i];
++			gr.list   = mDraws[i] ? (uint32_t)(uintptr_t)mDraws[i]->getDisplayList() : 0;
++			gr.size   = mDraws[i] ? mDraws[i]->getDisplayListSize() : 0;
++			gr.nslots = 0;
++			const J3DShapeMtx* m = mMatrices[i];
++			if (!m)
++				continue;
++			if (sms3dsVtable(m) == sms3dsVtable(&sms3dsSingleMtx)) {
++				gr.nslots = 1;
++				gr.idx[0] = m->getUseMtxIndex(0);
++			} else if (sms3dsVtable(m) == sms3dsVtable(&sms3dsMultiMtx) && m->getUseMtxNum() <= 10) {
++				gr.nslots = (uint16_t)m->getUseMtxNum();
++				for (u16 k = 0; k < gr.nslots; ++k)
++					gr.idx[k] = m->getUseMtxIndex(k);
++			} else {
++				ok = false;
++			}
++		}
++		if (ok)
++			sms3dsNative = SMS3DS_J3DShape(&op);
++		if (sms3dsNative == 1) {
++			J3DShapeMtx::currentPipeline = 0;
++			j3dSys.mCurrentDrawMtx = mDrawMatrices[*mCurrentViewNo];
++			j3dSys.mCurrentNormMtx = mNormMatrices[*mCurrentViewNo];
++			return;
++		}
++	}
++#endif
+ 	SMS3DS_GX_ORIGIN(SMS3DS_GX_J3D_VTX_FORMAT);
+ 	GXCallDisplayList(mVcdVatCmd, J3DShape::kVcdVatDLSize);
+ 
+@@ -249,4 +309,8 @@
+ 		if (mDraws[i])
+ 			mDraws[i]->draw();
+ 	}
+-}
++#if defined(__3DS__)
++	if (sms3dsNative == 2)
++		SMS3DS_J3DEnd();
++#endif
++}
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DMaterial.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DMaterial.cpp
+@@ -1,5 +1,6 @@
+ #include <string.h>
+ #include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0019
++#include "sms3ds_j3d.h"   // 3DS port: decomp patch 3ds-0020
+ #include <JSystem/J3D/J3DGraphBase/J3DMaterial.hpp>
+ 
+ #include <JSystem/J3D/J3DGraphBase/Blocks/J3DTevBlocks.hpp>
+@@ -861,7 +862,22 @@
+ 	j3dSys.unk50 = mMaterialMode;
+ 	if (!j3dSys.checkFlag2()) {
+ 		SMS3DS_GX_ORIGIN(SMS3DS_GX_J3D_MATERIAL);
++#if defined(__3DS__)
++		// 3DS port (decomp patch 3ds-0020): a locked packet's list (built once) as a native op in a
++		// draw buffer drawn natively.
++		int sms3dsNative = 0;
++		J3DMatPacket* pkt = j3dSys.getMatPacket();
++		if (SMS3DS_J3DNative && pkt->isLocked()) {
++			J3DDisplayListObj* dl = pkt->getDisplayListObj();
++			sms3dsNative = SMS3DS_J3DMat(dl->getDisplayList(0), dl->getDisplayListSize());
++		}
++		if (sms3dsNative != 1)
++			j3dSys.getMatPacket()->getDisplayListObj()->callDL();
++		if (sms3dsNative == 2)
++			SMS3DS_J3DEnd();
++#else
+ 		j3dSys.getMatPacket()->getDisplayListObj()->callDL();
++#endif
+ 		loadNBTScale(*mTexGenBlock->getNBTScale());
+ 	}
+ }
+--- a/libs/JSystem/src/JDrama/JDRDrawBufObj.cpp
++++ b/libs/JSystem/src/JDrama/JDRDrawBufObj.cpp
+@@ -1,6 +1,7 @@
+ #include <JSystem/JDrama/JDRDrawBufObj.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DDrawBuffer.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
++#include "sms3ds_j3d.h"  // 3DS port: decomp patch 3ds-0020
+ 
+ using namespace JDrama;
+ 
+@@ -43,6 +44,14 @@
+ 
+ 	if (cue & CUE_DRAW) {
+ 		j3dSys.unk4C = unk18;
++#if defined(__3DS__)
++		// 3DS port (decomp patch 3ds-0020): the buffers settings.txt names draw their J3D natively.
++		const int sms3dsPrev = SMS3DS_J3DNative;
++		SMS3DS_J3DNative = SMS3DS_J3DBufferMode(getName());
+ 		mDrawBuffer->draw();
++		SMS3DS_J3DNative = sms3dsPrev;
++#else
++		mDrawBuffer->draw();
++#endif
+ 	}
+ }
