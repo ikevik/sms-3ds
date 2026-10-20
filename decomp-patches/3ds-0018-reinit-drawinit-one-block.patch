@@ -1,0 +1,176 @@
+--- a/src/MarioUtil/gd-reinit-gx.cpp
++++ b/src/MarioUtil/gd-reinit-gx.cpp
+@@ -30,35 +30,33 @@
+ static void ReInitPixelProc();
+ 
+ #if defined(__3DS__)
+-// 3DS port: the state these set is written as two state blocks (sms-pc-port patch 0031,
+-// GXPC_StateBlock: each register once, with the value these calls leave it), around the texture
+-// loads, which stay calls (their region callback keeps a cursor). 33 calls a frame on Delfino
+-// Plaza, 4.6 ms of the game thread as calls.
++// 3DS port: the state these set is written as a state block (sms-pc-port patch 0031,
++// GXPC_StateBlock: each register once, with the value these calls leave it). The texture loads
++// stay calls (their region callback keeps a cursor) and go first: they set only the texture
++// registers, which nothing else here touches. 33 calls a frame on Delfino Plaza, 4.6 ms of the
++// game thread as calls. Most come with SMS_DrawInit right after: SMS3DS_ReInitAndDrawInit
++// (MarioUtil/DrawUtil.cpp) makes the two one block.
+ extern "C" void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name);
+-static void ReInitState1()
++extern "C" void SMS3DS_ReInitState()
+ {
+ 	ReInitGenMode();
+ 	ReInitGeometry();
+ 	ReInitLighting();
+ 	ReInitTransform();
+-}
+-static void ReInitState2()
+-{
+ 	ReInitTevStages();
+ 	ReInitIndStages();
+ 	ReInitPixelProc();
+ }
++extern "C" void SMS3DS_ReInitTexture() { ReInitTexture(); }
+ #endif
+ 
+ extern "C" void ReInitializeGX()
+ {
+ 	SMS3DS_ZONE(0);
+ #if defined(__3DS__)
+-	static void* block1;
+-	static void* block2;
+-	GXPC_StateBlock(&block1, ReInitState1, "ReInitializeGX 1");
++	static void* block;
+ 	ReInitTexture();
+-	GXPC_StateBlock(&block2, ReInitState2, "ReInitializeGX 2");
++	GXPC_StateBlock(&block, SMS3DS_ReInitState, "ReInitializeGX");
+ #else
+ 	ReInitGenMode();
+ 	ReInitGeometry();
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DSys.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DSys.cpp
+@@ -114,9 +114,11 @@
+ }
+ 
+ #if defined(__3DS__)
+-// 3DS port: the state set here is written as two state blocks (sms-pc-port patch 0031,
+-// GXPC_StateBlock) around the texture loads, the paired-single setup and the texture cache
+-// region, which stay calls. 30 calls a frame on Delfino Plaza, 2.4 ms of the game thread as calls.
++// 3DS port: the state set here is written as a state block (sms-pc-port patch 0031,
++// GXPC_StateBlock). The texture loads stay calls and go first (they set only the texture
++// registers, which nothing else here touches); the paired-single setup and the texture cache
++// region stay calls, after it as before. 30 calls a frame on Delfino Plaza, 2.4 ms of the game
++// thread as calls.
+ extern "C" void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name);
+ static void drawInitState1()
+ {
+@@ -261,14 +263,17 @@
+ 	}
+ 
+ }
++extern "C" void SMS3DS_DrawInitState()
++{
++	drawInitState1();
++	drawInitState2();
++}
+ void J3DSys::drawInit()
+ {
+ 	SMS3DS_ZONE(2);
+-	static void* block1;
+-	static void* block2;
+-	GXPC_StateBlock(&block1, drawInitState1, "J3DSys::drawInit 1");
++	static void* block;
+ 	reinitTexture();
+-	GXPC_StateBlock(&block2, drawInitState2, "J3DSys::drawInit 2");
++	GXPC_StateBlock(&block, SMS3DS_DrawInitState, "J3DSys::drawInit");
+ 	OSInitFastCast();
+ 	setTexCacheRegion(GX_TEXCACHE_32K);
+ }
+--- a/src/MarioUtil/DrawUtil.cpp
++++ b/src/MarioUtil/DrawUtil.cpp
+@@ -872,6 +872,35 @@
+ 	SMS_ResetTexCacheRegion();
+ }
+ 
++#if defined(__3DS__)
++// 3DS port: ReInitializeGX(); SMS_DrawInit(); as one state block (sms-pc-port patch 0031), each
++// register written once with the value the two leave it. The lights call the pair some 27 times a
++// frame on Delfino Plaza, and SMS_DrawInit rewrites much of what ReInitializeGX has just sent.
++// The texture loads of both go first, in their order (they set only the texture registers, which
++// the blocks do not touch); the paired-single setup and the texture cache regions come last, as
++// they did.
++extern "C" void SMS3DS_ReInitState();
++extern "C" void SMS3DS_ReInitTexture();
++extern "C" void SMS3DS_DrawInitState();
++extern "C" void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name);
++static void ReInitAndDrawInitState()
++{
++	SMS3DS_ReInitState();
++	SMS3DS_DrawInitState();
++}
++void SMS3DS_ReInitAndDrawInit()
++{
++	SMS3DS_ZONE(8);
++	static void* block;
++	SMS3DS_ReInitTexture();
++	j3dSys.reinitTexture();
++	GXPC_StateBlock(&block, ReInitAndDrawInitState, "ReInitializeGX + SMS_DrawInit");
++	OSInitFastCast();
++	j3dSys.setTexCacheRegion(GX_TEXCACHE_32K);
++	SMS_ResetTexCacheRegion();
++}
++#endif
++
+ void SMS_ShowJoint(J3DMaterial* param_1, bool param_2)
+ {
+ 	if (param_2) {
+--- a/src/MarioUtil/LightUtil.cpp
++++ b/src/MarioUtil/LightUtil.cpp
+@@ -3,6 +3,9 @@
+ // carry it without SMS_NO_MEMORY_MESSAGE.
+ #include <System/DummyMactorString.hpp>
+ #include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
++#if defined(__3DS__)
++void SMS3DS_ReInitAndDrawInit();  // MarioUtil/DrawUtil.cpp (decomp patch 3ds-0018)
++#endif
+ 
+ #include <MarioUtil/LightUtil.hpp>
+ #include <MarioUtil/DrawUtil.hpp>
+@@ -106,8 +109,12 @@
+ void TLightCommon::setLight(const JDrama::TGraphics* gfx, int index)
+ {
+ 	SMS3DS_ZONE(3);
++#if defined(__3DS__)
++	SMS3DS_ReInitAndDrawInit();  // ReInitializeGX(); SMS_DrawInit(); as one block
++#else
+ 	ReInitializeGX();
+ 	SMS_DrawInit();
++#endif
+ 	int lightIndex = index * 2;
+ 
+ 	GXLightObj light = {};
+@@ -141,8 +148,12 @@
+ void TLightCommon::perform(u32 cue, JDrama::TGraphics* graphics)
+ {
+ 	if (cue & CUE_DRAW_INIT) {
++#if defined(__3DS__)
++		SMS3DS_ReInitAndDrawInit();  // ReInitializeGX(); SMS_DrawInit(); as one block
++#else
+ 		ReInitializeGX();
+ 		SMS_DrawInit();
++#endif
+ 		GXLightObj light = {};
+ 		GXInitLightPos(&light, getLightPosition(0)->x, getLightPosition(0)->y,
+ 		               getLightPosition(0)->z);
+@@ -171,8 +182,12 @@
+ void TLightMario::setLight(const JDrama::TGraphics* gfx, int index)
+ {
+ 	SMS3DS_ZONE(4);
++#if defined(__3DS__)
++	SMS3DS_ReInitAndDrawInit();  // ReInitializeGX(); SMS_DrawInit(); as one block
++#else
+ 	ReInitializeGX();
+ 	SMS_DrawInit();
++#endif
+ 	int lightIndex = index * 2;
+ 
+ 	GXLightObj light = {};

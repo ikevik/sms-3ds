@@ -123,10 +123,10 @@ uint64_t s_calls;
 
 // Drawing routines timed in part 1 (decomp patch 3ds-0016), nested ones included: calls, ticks,
 // GX stream bytes. The open ones are a stack (they nest, on the game thread).
-enum { kZones = 8 };
+enum { kZones = 9 };
 const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
                                        "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
-                                       "TMapObjWave::draw"};
+                                       "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit"};
 uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
 uint32_t s_zoneCalls[kZones];
 struct ZoneOpen {
