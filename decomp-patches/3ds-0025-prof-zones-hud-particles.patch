@@ -1,0 +1,77 @@
+--- a/src/GC2D/GCConsole2.cpp
++++ b/src/GC2D/GCConsole2.cpp
+@@ -4825,6 +4825,7 @@
+ 
+ 	if (console->unk44 && !console->unk43 && !console->unk42
+ 	    && console->unk520->getPane()->isVisible()) {
++		SMS3DS_ZONE(30);
+ #ifdef TARGET_PC
+ 		GXPC_HudPaneBegin(console->unk544.x1, console->unk544.x2);
+ #endif
+@@ -4844,6 +4845,7 @@
+ #endif
+ 	}
+ 
++	SMS3DS_ZONE(31);
+ 	graphics->setScissor(graphics->mViewportRect);
+ 	graph.setup2D();
+ 
+--- a/libs/JSystem/src/JParticle/JPADraw.cpp
++++ b/libs/JSystem/src/JParticle/JPADraw.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/JParticle/JPADraw.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0025 (profile-run timers)
+ #include <JSystem/JParticle/JPABaseShape.hpp>
+ #include <JSystem/JParticle/JPAExtraShape.hpp>
+ #include <JSystem/JParticle/JPAExTexShape.hpp>
+@@ -147,6 +148,7 @@
+ 
+ void JPADraw::draw(MtxPtr view_mtx)
+ {
++	SMS3DS_ZONE(32);
+ 	GXClearVtxDesc();
+ 	GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+ 	GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+@@ -173,10 +175,13 @@
+ 
+ 	cb.mViewMtx = view_mtx;
+ 
+-	cb.mSetupTev.setupTev(mDrawCtx.mBaseShape, mDrawCtx.mExTexShape);
++	{
++		SMS3DS_ZONE(35);
++		cb.mSetupTev.setupTev(mDrawCtx.mBaseShape, mDrawCtx.mExTexShape);
+ 
+-	for (int i = 0; i < execEmtrVisNum; ++i)
+-		mpExecEmtrVis[i]->exec(&mDrawCtx);
++		for (int i = 0; i < execEmtrVisNum; ++i)
++			mpExecEmtrVis[i]->exec(&mDrawCtx);
++	}
+ 
+ 	if (mDrawCtx.mBaseShape->isEnableAnmTone())
+ 		zDraw();
+@@ -1004,6 +1009,7 @@
+ 
+ void JPADraw::drawParticle()
+ {
++	SMS3DS_ZONE(33);
+ 	unkC2 &= ~0x2;
+ 	setParticleClipBoard();
+ 	mDrawCtx.unk18 = mDrawCtx.mBaseEmitter->getParticleList();
+@@ -1056,6 +1062,7 @@
+ 
+ void JPADraw::drawChild()
+ {
++	SMS3DS_ZONE(34);
+ 	unkC2 |= 0x2;
+ 	setChildClipBoard();
+ 	mDrawCtx.unk18 = mDrawCtx.mBaseEmitter->getChildParticleList();
+--- a/src/MarioUtil/ShadowUtil.cpp
++++ b/src/MarioUtil/ShadowUtil.cpp
+@@ -1110,6 +1110,7 @@
+ static inline void initShadowGX(const GXColor& color,
+                                 JDrama::TGraphics* graphics)
+ {
++	SMS3DS_ZONE(36);
+ 	ReInitializeGX();
+ 	GXSetZCompLoc(GX_TRUE);
+ 	GXClearVtxDesc();

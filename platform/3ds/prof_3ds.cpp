@@ -22,14 +22,16 @@
 // Part 5, on its own (the bottom right of the bottom screen, low down): the game thread by object,
 // each big drawing object's drawing left out in turn (below, kSkipTargets).
 // Part 4, the game thread (kGameSteps, after part 3): its time by phase for kFrames frames in each step, with only the phases timed (object
-// timing costs the game thread some 10 ms a frame, far more than its estimate). The steps (a table,
-// kGameSteps): the state blocks' command worked out entry by entry (sms-port patch 0038) and
-// compiled (patch 0039, GXPC_SetStateBlockCompiled), alternately (A B A B A: the view drifts), then
-// compiled with every register checked on the GX thread afterwards. Each reports the game thread's
-// work by phase, the state blocks and their parts (draw zones 26-29, also timed with phases only),
-// the GX and render threads' busy time; the drawing routines' table follows. Earlier runs' steps,
-// kept as settings in the table: the lights' reset loading its textures once (decomp patch
-// 3ds-0024) saved it 0.26 ms; the GX state resets as one
+// timing costs the game thread some 10 ms a frame, far more than its estimate). The standard run
+// (a table, kGameSteps), the same for every build: the build's batch of changes off and on,
+// alternately (A B A B A: the view drifts), then on with every correctness check this port has
+// (state blocks against their separate writes, the sea against its original vertices). It ends
+// with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
+// (draw zones, also timed with phases only). The batch now: none (the whole-linear-heap flush left
+// out hung the GPU at a scene change: pica_draw.c), so its two halves differ only by drift.
+// Earlier runs' steps, kept as settings in the table: the state blocks compiled (sms-port patch
+// 0039) saved 1.85 ms, 0 differing; the lights' reset loading its
+// textures once (decomp patch 3ds-0024) saved it 0.26 ms; the GX state resets as one
 // command each (sms-port patch 0038) saved 1.1 ms of resets, 0 registers differing; the sea
 // precomputed (decomp patch 3ds-0022) saved its draw 1.3 ms; compact stream buffers
 // and render queue (GX3DS_SetCompactRings) changed nothing beyond drift; native J3D off, on through stage 1's path,
@@ -70,6 +72,7 @@ extern int sms_math_fast;          // mtx.cpp: inexact maths (part 4)
 void GXPC_SetMute(int on);         // gx_api.cpp: the GX writes dropped (part 4)
 void GX3DS_SetDropDraws(int on);   // gx3ds_backend.cpp: the render thread draws nothing (part 4)
 void pica_set_heap_flush(int on);  // pica_draw.c: the whole-linear-heap flush at frame end (part 4)
+int pica_heap_flush(void);
 void GXPC_SetNativeJ3DMode(int mode);  // gx_api.cpp: native J3D's mode, its buffers kept (part 4)
 int GXPC_NativeJ3DMode(void);
 extern int GXPC_J3DPackages;       // gx_fifo.cpp: native J3D's compiled shapes (part 4)
@@ -189,9 +192,10 @@ uint64_t s_calls;
 
 // Drawing routines timed in profile runs (decomp patches 3ds-0016; from 9 on 3ds-0023, the HUD
 // and the shadows; from 22 on 3ds-0024, the parts of the reset the lights call; from 26 on
-// sms-port patch 0039, the state blocks and their commands' parts), nested ones included: calls, ticks, GX stream bytes. The open ones are a
+// sms-port patch 0039, the state blocks and their commands' parts; from 30 on 3ds-0025, the HUD's
+// and the particles' parts and the shadows' GX setup), nested ones included: calls, ticks, GX stream bytes. The open ones are a
 // stack (they nest, on the game thread).
-enum { kZones = 30 };
+enum { kZones = 37 };
 const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
                                        "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
                                        "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit",
@@ -202,7 +206,10 @@ const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys
                                        "SMS_SettingDrawShape", "reset: ReInitializeGX's texture loads",
                                        "reset: J3DSys::reinitTexture", "reset: its state block",
                                        "reset: texture cache regions", "state blocks (all)", "block: values worked out",
-                                       "block: API copy and filter", "block: the command"};
+                                       "block: API copy and filter", "block: the command", "HUD: the balloon",
+                                       "HUD: scissor, setup and gauge", "JPADraw::draw (an emitter)",
+                                       "JPADraw::drawParticle", "JPADraw::drawChild", "JPA: TEV and emitter setup",
+                                       "shadows: GX setup (initShadowGX)"};
 uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
 uint32_t s_zoneCalls[kZones];
 struct ZoneOpen {
@@ -608,15 +615,16 @@ struct GameStep {
 	uint32_t hog;
 	int native, packages, rings, wave, blockOps, texOnce, compiled;
 };
-enum { kGsEntry1, kGsComp1, kGsEntry2, kGsComp2, kGsEntry3, kGsCompChecked, kGameStepN };
+enum { kGsOff1, kGsOn1, kGsOff2, kGsOn2, kGsOff3, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"state blocks entry by entry", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 0},
-    {"state blocks compiled", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 1},
-    {"state blocks entry by entry", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 0},
-    {"state blocks compiled", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 1},
-    {"state blocks entry by entry", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 0},
-    {"state blocks compiled, every register checked (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 2, -1, 1},
+    {"this build (no batch: off)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
+    {"this build (no batch: on)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
+    {"this build (no batch: off)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
+    {"this build (no batch: on)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
+    {"this build (no batch: off)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
+    {"this build, every check run (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 2, 2, -1, -1},
 };
+int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
 int s_texOnceSaved = 1;        // SMS3DS_ResetTexOnce before part 4 (put back after it)
 int s_blockOpsSaved = 1;  // GXPC_StateBlockOps before part 4 (put back after it)
@@ -647,7 +655,7 @@ void setGameStep(int k) {
 	sms_math_fast = g ? g->math : 0;
 	GXPC_SetMute(g ? g->mute : 0);
 	GX3DS_SetDropDraws(g ? g->dropDraws : 0);
-	pica_set_heap_flush(g ? g->heapFlush : 1);
+	pica_set_heap_flush(g ? g->heapFlush : s_heapFlushSaved);
 	GXPC_SetNativeJ3DMode(g && g->native >= 0 ? g->native : s_nativeSaved);
 	GXPC_J3DPackages = g && g->packages >= 0 ? g->packages : s_packagesSaved;
 	GX3DS_SetCompactRings(g ? g->rings : 0);
@@ -678,8 +686,8 @@ void reportGameStep(int k) {
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
 	char hog[96] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
-	else snprintf(hog, sizeof hog, "; state blocks %.2f ms (values %.2f, API copy %.2f, command %.2f)", s_gameZoneMs[k][26],
-	              s_gameZoneMs[k][27], s_gameZoneMs[k][28], s_gameZoneMs[k][29]);
+	else snprintf(hog, sizeof hog, "; HUD %.2f ms, particles %.2f, shadows %.2f, state blocks %.2f", s_gameZoneMs[k][9],
+	              s_gameZoneMs[k][6], s_gameZoneMs[k][16], s_gameZoneMs[k][26]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -696,27 +704,29 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	// Entry by entry: steps 0, 2, 4; compiled: 1, 3 (the checked step is not timed).
+	// Batch off: steps 0, 2, 4; on: 1, 3 (the checks step is not timed).
 	auto ab = [](const double* v, double& w, double& o) {
-		w = (v[kGsEntry1] + v[kGsEntry2] + v[kGsEntry3]) / 3;
-		o = (v[kGsComp1] + v[kGsComp2]) / 2;
+		w = (v[kGsOff1] + v[kGsOff2] + v[kGsOff3]) / 3;
+		o = (v[kGsOn1] + v[kGsOn2]) / 2;
 	};
-	double works[kGameStepN], blocks[kGameStepN], resets[kGameStepN];
-	for (int k = 0; k < kGameStepN; k++) {
-		works[k] = gameWork(k);
-		blocks[k] = s_gameZoneMs[k][26];
-		resets[k] = s_gameZoneMs[k][0] + s_gameZoneMs[k][1] + s_gameZoneMs[k][8];
-	}
-	double bw, bo, rw, ro, ww, wo, gw, go, fw, fo;
-	ab(blocks, bw, bo);
-	ab(resets, rw, ro);
+	double works[kGameStepN];
+	for (int k = 0; k < kGameStepN; k++) works[k] = gameWork(k);
+	double ww, wo, gw, go, rw, ro, pw, po, fw, fo;
 	ab(works, ww, wo);
 	ab(s_gameGx, gw, go);
+	ab(s_gameRender, rw, ro);
+	ab(s_gameGpu, pw, po);
 	ab(s_gameFrame, fw, fo);
 	fprintf(stderr,
-	        "[prof] state blocks, entry by entry (3 windows) -> compiled (2), ms/frame: the blocks %.2f -> %.2f | the resets "
-	        "in all %.2f -> %.2f | game thread's work %.1f -> %.1f | GX thread %.1f -> %.1f | frame %.1f -> %.1f\n",
-	        bw, bo, rw, ro, ww, wo, gw, go, fw, fo);
+	        "[prof] the batch, off (3 windows) -> on (2), ms/frame: game thread's work %.1f -> %.1f | GX thread %.1f -> %.1f | "
+	        "render thread %.1f -> %.1f | GPU %.1f -> %.1f | frame %.1f -> %.1f\n",
+	        ww, wo, gw, go, rw, ro, pw, po, fw, fo);
+	// The scorecard: the frame's limits with the batch on, against 33.3 ms (30 fps).
+	const double end = (s_gamePh[kGsOn1][15] + s_gamePh[kGsOn2][15]) / 2;
+	fprintf(stderr,
+	        "[prof] scorecard (batch on; 30 fps needs every figure under 33.3): frame %.1f ms (%.1f fps) | game thread %.1f of "
+	        "work + %.1f at the frame's end | GX thread %.1f | render thread %.1f | GPU %.1f\n",
+	        fo, fo > 0 ? 1000.0 / fo : 0.0, wo, end, go, ro, po);
 	// The drawing routines, averaged over the windows (each window's figure in brackets): nested
 	// ones are inside their callers' (the HUD's J2D screen inside the HUD's draw, setup2D, pictures,
 	// text and pane matrices inside both; shadow volumes and SMS_DrawShape inside drawShadow).
@@ -745,6 +755,7 @@ void startGame() {
 	s_blockOpsSaved = GXPC_StateBlockOps();
 	s_texOnceSaved = SMS3DS_ResetTexOnce;
 	s_compiledSaved = GXPC_StateBlockCompiled();
+	s_heapFlushSaved = pica_heap_flush();
 	s_nativeSaved = GXPC_NativeJ3DMode();
 	s_packagesSaved = GXPC_J3DPackages;
 	s_gameStep = 0;

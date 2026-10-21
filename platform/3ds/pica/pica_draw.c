@@ -779,12 +779,15 @@ static u32* s_c3dCmdBuf;                  /* citro3d's command buffer (seen at i
 static u32 s_c3dCmdWords;
 void pica_set_overlap(int on) { s_ovlWanted = on; }
 /* The whole linear heap written back at each frame's end, as C3D_FrameEnd does (pica_set_heap_flush;
- * the profiler's game-thread steps turn it off). Everything the GPU reads that the CPU writes is
- * also flushed by its own range: the vertex and index rings, resident vertices, textures, command
- * lists. The whole heap takes the kernel's whole-cache maintenance (some 1.3-1.7 ms even on an
- * empty frame), which may empty the L2 cache the cores share. */
+ * settings.txt heap_flush). The vertex and index rings, resident vertices, textures and command
+ * lists are also flushed by their own ranges, but something the GPU reads still needs the whole
+ * heap: with it left out from launch, the GPU stopped completing work at the first scene change
+ * (the Nintendo logo to the intro movie), every frame then waiting 500 ms. Left out only while
+ * standing in Delfino Plaza it saved the game thread 0.6 ms and the frame 1.1 (the profiler's
+ * game-thread steps). On by default until what else needs it is found. */
 static int s_heapFlush = 1;
 void pica_set_heap_flush(int on) { s_heapFlush = on; }
+int pica_heap_flush(void) { return s_heapFlush; }
 int pica_overlap(void) { return s_ovl; }
 
 static void ovl_done(gxCmdQueue_s* q)
