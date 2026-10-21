@@ -173,12 +173,18 @@ uint32_t s_phaseEntries[PHASES];
 int s_phase;
 uint64_t s_calls;
 
-// Drawing routines timed in part 1 (decomp patch 3ds-0016), nested ones included: calls, ticks,
-// GX stream bytes. The open ones are a stack (they nest, on the game thread).
-enum { kZones = 9 };
+// Drawing routines timed in profile runs (decomp patches 3ds-0016 and, from 9 on, 3ds-0023: the
+// HUD and the shadows), nested ones included: calls, ticks, GX stream bytes. The open ones are a
+// stack (they nest, on the game thread).
+enum { kZones = 22 };
 const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
                                        "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
-                                       "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit"};
+                                       "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit",
+                                       "HUD (TGCConsole2) draw", "HUD: its J2D screen", "HUD: water gauge",
+                                       "J2DGrafContext::setup2D", "J2DPicture::drawFullSet", "J2DTextBox::drawSelf",
+                                       "J2DPane::makeMatrix", "shadows: TMBindShadowManager::drawShadow",
+                                       "shadows: drawShadowVolume", "shadows: calcVtx", "SMS_DrawShape", "SMS_DrawCube",
+                                       "SMS_SettingDrawShape"};
 uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
 uint32_t s_zoneCalls[kZones];
 struct ZoneOpen {
@@ -582,15 +588,15 @@ struct GameStep {
 	uint32_t hog;
 	int native, packages, rings, wave;
 };
-enum { kGsOld1, kGsNew1, kGsOld2, kGsNew2, kGsOld3, kGsChecked, kGameStepN };
+enum { kGameStepN = 3 };
 const GameStep kGameSteps[kGameStepN] = {
-    {"the sea as before", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 0},
-    {"the sea precomputed", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 1},
-    {"the sea as before", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 0},
-    {"the sea precomputed", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 1},
-    {"the sea as before", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 0},
-    {"the sea precomputed, checked against the original (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 2},
+    {"drawing normally", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1},
+    {"drawing normally", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1},
+    {"drawing normally", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1},
 };
+// Each window's drawing routines (draw zones): calls and ms per frame, the timer's own cost taken
+// out.
+double s_gameZoneMs[kGameStepN][kZones], s_gameZoneCalls[kGameStepN][kZones];
 const int kGsVerify = -1;  // (no native J3D verify step in this table)
 int s_waveSaved = 1;     // SMS3DS_WaveMode before part 4 (put back after it)
 uint32_t s_wave0[2];     // the checked step's counters at its start
@@ -642,7 +648,7 @@ void reportGameStep(int k) {
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
 	char hog[96] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
-	else snprintf(hog, sizeof hog, "; the sea's draw %.2f ms", s_gameSea[k]);
+	else snprintf(hog, sizeof hog, "; the HUD's draw %.2f ms, the shadows' %.2f", s_gameZoneMs[k][9], s_gameZoneMs[k][16]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -659,26 +665,27 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	// Before: steps 0, 2, 4; precomputed: 1, 3 (the checked step is not timed).
-	auto oldNew = [](const double* v, double& o, double& n) {
-		o = (v[kGsOld1] + v[kGsOld2] + v[kGsOld3]) / 3;
-		n = (v[kGsNew1] + v[kGsNew2]) / 2;
-	};
-	double work[kGameStepN], post[kGameStepN];
-	for (int k = 0; k < kGameStepN; k++) {
-		work[k] = gameWork(k);
-		post[k] = s_gamePh[k][12];
+	// The drawing routines, averaged over the windows (each window's figure in brackets): nested
+	// ones are inside their callers' (the HUD's J2D screen inside the HUD's draw, setup2D, pictures,
+	// text and pane matrices inside both; shadow volumes and SMS_DrawShape inside drawShadow).
+	double work = 0;
+	for (int k = 0; k < kGameStepN; k++) work += gameWork(k) / kGameStepN;
+	fprintf(stderr, "[prof] drawing routines, %d windows of %d frames (game thread's work %.1f ms/frame), calls/frame x ms each = "
+	        "ms/frame [each window]:\n", kGameStepN, kFrames, work);
+	for (int z = 0; z < kZones; z++) {
+		double ms = 0, calls = 0;
+		for (int k = 0; k < kGameStepN; k++) {
+			ms += s_gameZoneMs[k][z] / kGameStepN;
+			calls += s_gameZoneCalls[k][z] / kGameStepN;
+		}
+		if (calls <= 0) continue;
+		char each[96];
+		int at = 0;
+		for (int k = 0; k < kGameStepN; k++)
+			at += snprintf(each + at, sizeof each - at, "%s%.2f", k ? ", " : "", s_gameZoneMs[k][z]);
+		fprintf(stderr, "[prof]   %-42s %6.1f x %.3f = %5.2f ms [%s]\n", kZoneName[z], calls, calls > 0 ? ms / calls : 0.0, ms,
+		        each);
 	}
-	double wo, wn, so, sn, po, pn, go, gn, fo, fn;
-	oldNew(work, wo, wn);
-	oldNew(s_gameSea, so, sn);
-	oldNew(post, po, pn);
-	oldNew(s_gameGx, go, gn);
-	oldNew(s_gameFrame, fo, fn);
-	fprintf(stderr,
-	        "[prof] the sea, as before (3 windows) -> precomputed (2), ms/frame: its draw %.2f -> %.2f | GX post phase "
-	        "%.1f -> %.1f | game thread's work %.1f -> %.1f | GX thread %.1f -> %.1f | frame %.1f -> %.1f\n",
-	        so, sn, po, pn, wo, wn, go, gn, fo, fn);
 }
 void startGame() {
 	GXPC_Detail = 0;  // as in normal play
@@ -1410,6 +1417,14 @@ void SMS3DS_ProfFrame(void) {
 			s_gameRender[k] = double(th[1] - s_thread0[1]) / kFrames / kTicksPerMs;
 			GX3DS_RingStats(s_gameRing[k]);
 			s_gameSea[k] = double(s_zoneTicks[7]) / kFrames / kTicksPerMs;
+			{
+				const double tick = tickCostMs();
+				for (int z = 0; z < kZones; z++) {
+					const double calls = s_zoneCalls[z] / double(kFrames);
+					s_gameZoneCalls[k][z] = calls;
+					s_gameZoneMs[k][z] = s_zoneTicks[z] / double(kFrames) / kTicksPerMs - calls * tick;
+				}
+			}
 			reportGameStep(k);
 			if (kGameSteps[k].wave == 2)
 				fprintf(stderr, "[prof] the sea precomputed, checked: %lu vertices compared with the original's, %lu differing\n",

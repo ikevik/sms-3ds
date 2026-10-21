@@ -1,0 +1,176 @@
+--- a/src/GC2D/GCConsole2.cpp
++++ b/src/GC2D/GCConsole2.cpp
+@@ -1,4 +1,5 @@
+ #include <GC2D/GCConsole2.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
+ #include <GC2D/BoundPane.hpp>
+ #include <GC2D/BlendPane.hpp>
+ #include <GC2D/ConsoleStr.hpp>
+@@ -1987,6 +1988,7 @@
+ // (`cmpwi`) in the ROM after an unsigned `< 10`, hence the `(int)` casts.
+ void TGCConsole2::drawWaterBack()
+ {
++	SMS3DS_ZONE(11);
+ 	if (gpMarioOriginal->getHealth() == 0 || gpMarioOriginal->getAir() == 0)
+ 		return;
+ 
+@@ -3502,6 +3504,7 @@
+ 
+ void TGCConsole2::drawJuice(J2DOrthoGraph& graph, u32 color)
+ {
++	SMS3DS_ZONE(11);
+ 	if (unk50)
+ 		return;
+ 
+@@ -3598,6 +3601,7 @@
+ 
+ void TGCConsole2::drawWater(J2DOrthoGraph& graph)
+ {
++	SMS3DS_ZONE(11);
+ 	Mtx mtx;
+ 	MTXIdentity(mtx);
+ 	GXLoadPosMtxImm(mtx, 0);
+@@ -4814,7 +4818,10 @@
+ 
+ 	graph.setup2D();
+ 
+-	console->unkB0->draw(0, 0, &graph);
++	{
++		SMS3DS_ZONE(10);
++		console->unkB0->draw(0, 0, &graph);
++	}
+ 
+ 	if (console->unk44 && !console->unk43 && !console->unk42
+ 	    && console->unk520->getPane()->isVisible()) {
+@@ -4901,6 +4908,8 @@
+ 	if (flags & 2)
+ 		updateBalloon(this);
+ 
+-	if (flags & 8)
++	if (flags & 8) {
++		SMS3DS_ZONE(9);
+ 		drawConsole(this, graphics);
++	}
+ }
+--- a/libs/JSystem/src/J2D/J2DGrafContext.cpp
++++ b/libs/JSystem/src/J2D/J2DGrafContext.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/J2D/J2DGrafContext.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
+ #include <dolphin/gx.h>
+ 
+ J2DGrafContext::J2DGrafContext(const JUTRect& rect)
+@@ -29,6 +30,7 @@
+ 
+ void J2DGrafContext::setup2D()
+ {
++	SMS3DS_ZONE(12);
+ 	GXClearVtxDesc();
+ 	GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+ 	GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+--- a/libs/JSystem/src/J2D/J2DPicture.cpp
++++ b/libs/JSystem/src/J2D/J2DPicture.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/J2D/J2DPicture.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
+ #include <JSystem/JUtility/JUTPalette.hpp>
+ #include <JSystem/JUtility/JUTTexture.hpp>
+ #include <JSystem/JUtility/JUTResource.hpp>
+@@ -242,6 +243,7 @@
+                              J2DMirror mirror, bool flip, J2DWrapmode wrap_hor,
+                              J2DWrapmode wrap_vert, Mtx* mtx)
+ {
++	SMS3DS_ZONE(13);
+ 	int renderX = x;
+ 	int renderY = y;
+ 	float texSize;
+--- a/libs/JSystem/src/J2D/J2DTextBox.cpp
++++ b/libs/JSystem/src/J2D/J2DTextBox.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/J2D/J2DTextBox.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
+ #include <JSystem/J2D/J2DPrint.hpp>
+ #include <JSystem/JUtility/JUTResFont.hpp>
+ #include <JSystem/JUtility/JUTResource.hpp>
+@@ -297,6 +298,7 @@
+ 
+ void J2DTextBox::drawSelf(int x, int y, Mtx* mtx)
+ {
++	SMS3DS_ZONE(14);
+ 	J2DPrint print(mFont, mCharSpace, mLineSpace, mCharColor, mGradColor);
+ 	print.setFontSize(mFontSizeX, mFontSizeY);
+ 	print.setSomeColors(mBlack, mWhite);
+--- a/libs/JSystem/src/J2D/J2DPane.cpp
++++ b/libs/JSystem/src/J2D/J2DPane.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/J2D/J2DPane.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
+ #include <JSystem/J2D/J2DOrthoGraph.hpp>
+ #include <JSystem/JSupport/JSURandomInputStream.hpp>
+ #include <JSystem/JUtility/JUTResource.hpp>
+@@ -270,6 +271,7 @@
+ 
+ void J2DPane::makeMatrix(int x, int y)
+ {
++	SMS3DS_ZONE(15);
+ 	Mtx transBack, rotate, trans;
+ 	if (mRotation != 0.0f) {
+ 		MTXTrans(transBack, -mRotateOffsetX, -mRotateOffsetY, 0.0f);
+--- a/src/MarioUtil/ShadowUtil.cpp
++++ b/src/MarioUtil/ShadowUtil.cpp
+@@ -1,4 +1,5 @@
+ #include <MarioUtil/ShadowUtil.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
+ #include <MarioUtil/GDUtil.hpp>
+ #include <MarioUtil/DrawUtil.hpp>
+ #include <MarioUtil/ReinitGX.hpp>
+@@ -592,6 +593,7 @@
+ void TMBindShadowManager::drawShadowVolume(bool param_1,
+                                            TAlphaShadowQuad* param_2)
+ {
++	SMS3DS_ZONE(17);
+ 	if (param_2->mRequest->mShadowType == SHADOW_TYPE_SQUARE) {
+ 		if (param_2->mSquareOutline == nullptr) {
+ 			SMS_SettingDrawShape(mModelDatas[2]->getModelData(), 0);
+@@ -1132,6 +1134,7 @@
+ 
+ void TMBindShadowManager::drawShadow(u32 param_1, JDrama::TGraphics* param_2)
+ {
++	SMS3DS_ZONE(16);
+ 	// TODO: instruction-identical but the frame is 0x128 against retail's
+ 	// 0xf8. Three dead 4-byte slots come from the named GXColor locals and
+ 	// the second initShadowGX colour temporary sits 0x18 lower than retail's
+@@ -1434,6 +1437,7 @@
+ // merge loop also indexes arrays[i]/[j] through byte offsets in retail.
+ void TMBindShadowManager::calcVtx()
+ {
++	SMS3DS_ZONE(18);
+ 	static const f32 calctablex[4] = { -1.0f, 1.0f, 1.0f, -1.0f };
+ 	static const f32 calctablez[4] = { -1.0f, -1.0f, 1.0f, 1.0f };
+ 
+--- a/src/MarioUtil/DrawUtil.cpp
++++ b/src/MarioUtil/DrawUtil.cpp
+@@ -803,6 +803,7 @@
+ void SMS_DrawCube(const JGeometry::TVec3<f32>& param_1,
+                   const JGeometry::TVec3<f32>& param_2)
+ {
++	SMS3DS_ZONE(20);
+ 	GXBegin(GX_QUADS, GX_VTXFMT0, 24);
+ 
+ 	GXPosition3f32(param_1.x, param_1.y, param_1.z);
+@@ -840,6 +841,7 @@
+ 
+ void SMS_SettingDrawShape(J3DModelData* param_1, u16 param_2)
+ {
++	SMS3DS_ZONE(21);
+ 	J3DShape* shape = param_1->getShapeNodePointer(param_2);
+ 	GXCallDisplayList(shape->getVcdVatCmd(), J3DShape::kVcdVatDLSize);
+ 	j3dSys.setVtxPos(param_1->getVtxPosArray());
+@@ -849,6 +851,7 @@
+ 
+ void SMS_DrawShape(J3DModelData* param_1, u16 param_2)
+ {
++	SMS3DS_ZONE(19);
+ 	J3DShape* shape = param_1->getShapeNodePointer(param_2);
+ 	for (u16 i = 0; i < shape->getMtxGroupNum(); ++i)
+ 		shape->getShapeDraw(i)->draw();
