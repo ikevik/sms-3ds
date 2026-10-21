@@ -22,12 +22,14 @@
 // Part 4, the game thread (kGameSteps; also on its own: the bottom right of the bottom screen, low
 // down): its time by phase for kFrames frames in each step, with only the phases timed (object
 // timing costs the game thread some 10 ms a frame, far more than its estimate). The steps (a table,
-// kGameSteps): native J3D off (decomp patch 3ds-0020: the static draw buffers' J3D draws as one op
-// each), on through stage 1's path only (GXPC_J3DPackages 0), on with compiled shapes (sms-port
-// patch 0037), off again (how far the view drifted), and on with compiled shapes in verify mode
-// (the render thread compares its registers before each native draw with what the old path would
-// have sent it: correctness, not timing). Each reports the game thread's work by phase and the GX
-// and render threads' busy time. Earlier runs' steps, kept as settings in the table:
+// kGameSteps): the stream's buffers and the render queue used as today (each cycling through 1 MB),
+// then compact (GX3DS_SetCompactRings: the stream's lowest free buffer first; the queue started
+// again at its beginning whenever the render thread has caught up), each alone and both, then as
+// today again (how far the view drifted). Each reports the game thread's work by phase, the GX and
+// render threads' busy time, the stream buffers taken and how far into the queue records reached.
+// Earlier runs' steps, kept as settings in the table: native J3D off, on through stage 1's path,
+// on with compiled shapes (GX thread 32.7, 33.6, 32.0 ms; the game thread unchanged; verify mode
+// 0 differences);
 // objects timed too cost 10.1 ms a frame; inexact maths (sms_math_fast) saved nothing; of the game
 // thread's 41.8 ms, the GPU's drawing slowed it by 3.2, the render thread's by 1.2, the GX
 // thread's work and the stream's buffers by 5.0, its GX calls cost 3.3; alone, a thread on core 2
@@ -67,6 +69,8 @@ void GXPC_SetNativeJ3DMode(int mode);  // gx_api.cpp: native J3D's mode, its buf
 int GXPC_NativeJ3DMode(void);
 extern int GXPC_J3DPackages;       // gx_fifo.cpp: native J3D's compiled shapes (part 4)
 void GX3DS_ThreadTicks(uint64_t out[2]);  // gx3ds_backend.cpp: the GX and render threads' busy ticks
+void GX3DS_SetCompactRings(int mask);  // ... the stream's buffers (1) and the render queue (2) compact
+void GX3DS_RingStats(uint32_t out[2]);  // ... since the last call: stream buffers taken, queue bytes reached
 uint32_t GX3DS_J3DSigBad(void);    // ... native J3D's verify mode: differences found so far
 extern uint32_t GXPC_J3DStats[16], GXPC_J3DPkgStats[4];  // gx_fifo.cpp: native J3D's counters
 int SMS3DS_ProfOn;
@@ -561,21 +565,23 @@ double hogRate() {
 
 // Part 4's steps: SMS3DS_ProfOn (1 objects timed too, 2 phases only), sms_math_fast, the GPU test,
 // the GX mute level (GXPC_SetMute), the render thread's draws dropped, the whole-heap flush, the
-// hog's buffer (0: none), native J3D (-1 as the settings set it, 0 off, 1 on), compiled shapes.
+// hog's buffer (0: none), native J3D (-1 as the settings set it, 0 off, 1 on, 3 verify), compiled
+// shapes (-1 as set), compact rings (GX3DS_SetCompactRings).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages;
+	int native, packages, rings;
 };
-enum { kGsOff, kGsStage1, kGsCompiled, kGsOffAgain, kGsVerify, kGameStepN };
+enum { kGsToday, kGsStream, kGsQueue, kGsBoth, kGsTodayAgain, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"native J3D off", 2, 0, 0, 0, 0, 1, 0, 0, 1},
-    {"native J3D on, stage 1's path", 2, 0, 0, 0, 0, 1, 0, 1, 0},
-    {"native J3D on, compiled shapes", 2, 0, 0, 0, 0, 1, 0, 1, 1},
-    {"native J3D off again", 2, 0, 0, 0, 0, 1, 0, 0, 1},
-    {"native J3D on, compiled shapes, verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1},
+    {"rings as today", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0},
+    {"compact stream buffers", 2, 0, 0, 0, 0, 1, 0, -1, -1, 1},
+    {"compact render queue", 2, 0, 0, 0, 0, 1, 0, -1, -1, 2},
+    {"both compact", 2, 0, 0, 0, 0, 1, 0, -1, -1, 3},
+    {"rings as today again", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0},
 };
+const int kGsVerify = -1;  // (no verify step in this table)
 // The verify step's counters at its start: native draws verified, shape ops drawn from compiled
 // shapes, differences.
 uint32_t s_verify0[3];
@@ -585,6 +591,7 @@ int s_nativeSaved = -1, s_packagesSaved = 1;
 // started); the step being measured.
 double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN], s_gameHog[kGameStepN];
 double s_gameGx[kGameStepN], s_gameRender[kGameStepN];  // the GX and render threads' busy ms/frame
+uint32_t s_gameRing[kGameStepN][2];  // stream buffers taken, render queue bytes reached
 uint64_t s_thread0[2];
 int s_gameStep;
 // Puts step k's settings in place; past the last, normal play's (the GPU test stays until the
@@ -596,7 +603,8 @@ void setGameStep(int k) {
 	GX3DS_SetDropDraws(g ? g->dropDraws : 0);
 	pica_set_heap_flush(g ? g->heapFlush : 1);
 	GXPC_SetNativeJ3DMode(g && g->native >= 0 ? g->native : s_nativeSaved);
-	GXPC_J3DPackages = g ? g->packages : s_packagesSaved;
+	GXPC_J3DPackages = g && g->packages >= 0 ? g->packages : s_packagesSaved;
+	GX3DS_SetCompactRings(g ? g->rings : 0);
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -618,8 +626,10 @@ void reportGameStep(int k) {
 	for (int i = 0; i < PHASES; i++)
 		if (i != 15 && s_gamePh[k][i] >= 0.05)
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
-	char hog[48] = "";
+	char hog[96] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
+	else snprintf(hog, sizeof hog, "; stream buffers %lu, queue reached %lu KB", (unsigned long)s_gameRing[k][0],
+	              (unsigned long)(s_gameRing[k][1] >> 10));
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -636,15 +646,19 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	fprintf(stderr,
-	        "[prof] native J3D, ms/frame: game thread's work %.1f off, %.1f stage 1, %.1f compiled shapes (%.1f off "
-	        "again) | GX thread %.1f, %.1f, %.1f (%.1f) | render thread %.1f, %.1f, %.1f (%.1f) | frame %.1f, %.1f, "
-	        "%.1f (%.1f) | GPU %.1f, %.1f, %.1f (%.1f)\n",
-	        gameWork(kGsOff), gameWork(kGsStage1), gameWork(kGsCompiled), gameWork(kGsOffAgain), s_gameGx[kGsOff],
-	        s_gameGx[kGsStage1], s_gameGx[kGsCompiled], s_gameGx[kGsOffAgain], s_gameRender[kGsOff],
-	        s_gameRender[kGsStage1], s_gameRender[kGsCompiled], s_gameRender[kGsOffAgain], s_gameFrame[kGsOff],
-	        s_gameFrame[kGsStage1], s_gameFrame[kGsCompiled], s_gameFrame[kGsOffAgain], s_gameGpu[kGsOff],
-	        s_gameGpu[kGsStage1], s_gameGpu[kGsCompiled], s_gameGpu[kGsOffAgain]);
+	auto row = [](const char* what, const double* v) {
+		fprintf(stderr, " | %s %.1f, %.1f, %.1f, %.1f (%.1f)", what, v[kGsToday], v[kGsStream], v[kGsQueue], v[kGsBoth],
+		        v[kGsTodayAgain]);
+	};
+	double work[kGameStepN];
+	for (int k = 0; k < kGameStepN; k++) work[k] = gameWork(k);
+	fprintf(stderr, "[prof] rings today, stream compact, queue compact, both (today again), ms/frame:");
+	row("game thread's work", work);
+	row("GX thread", s_gameGx);
+	row("render thread", s_gameRender);
+	row("frame", s_gameFrame);
+	row("GPU", s_gameGpu);
+	fprintf(stderr, "\n");
 }
 void startGame() {
 	GXPC_Detail = 0;  // as in normal play
@@ -1230,6 +1244,8 @@ void SMS3DS_ProfFrame(void) {
 			s_phase = 0;
 			s_gpu0 = pica_gpu_ms_sum();
 			GX3DS_ThreadTicks(s_thread0);
+			uint32_t rs0[2];
+			GX3DS_RingStats(rs0);  // (from now)
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
 			s_verify0[2] = GX3DS_J3DSigBad();
@@ -1245,6 +1261,7 @@ void SMS3DS_ProfFrame(void) {
 			GX3DS_ThreadTicks(th);
 			s_gameGx[k] = double(th[0] - s_thread0[0]) / kFrames / kTicksPerMs;
 			s_gameRender[k] = double(th[1] - s_thread0[1]) / kFrames / kTicksPerMs;
+			GX3DS_RingStats(s_gameRing[k]);
 			reportGameStep(k);
 			if (k == kGsVerify)
 				fprintf(stderr,

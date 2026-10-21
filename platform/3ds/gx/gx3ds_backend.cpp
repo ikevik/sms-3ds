@@ -3656,8 +3656,28 @@ static void rcInit() {
 		        s_rtWanted ? "could not start" : "off (Left held at launch)", unsigned(s_ringCap >> 10));
 }
 
+// Compact rings (GX3DS_SetCompactRings, bit 1; profile runs): when the render thread has caught up
+// and the next record would start past kRewindAt, the queue starts again at its beginning (a wrap
+// record), so it keeps reusing the same few hundred KB, which stay in the L2 cache the cores share,
+// instead of cycling through the whole 1 MB (the game thread slows down sharply when another core
+// sweeps the L2: prof_3ds.cpp's part 4). s_qSpan: the furthest a record has reached into the ring
+// since GX3DS_RingStats last read it.
+static const uint32_t kRewindAt = 128u << 10;
+static std::atomic<bool> s_qCompact{false};
+static uint32_t s_qSpan;
+static void rcRewind() {
+	const uint32_t off = s_wpos & s_ringMask;
+	if (!s_qCompact.load(std::memory_order_relaxed) || off < kRewindAt || s_tail.load() != s_wpos) return;
+	RecHdr* h = reinterpret_cast<RecHdr*>(s_ring + off);
+	h->type = RC_WRAP;
+	h->size = s_ringCap - off;
+	s_wpos += s_ringCap - off;
+	s_head.store(s_wpos);
+}
+
 // Room for a record of `size` bytes (a multiple of 8, at most the ring's size), contiguous.
 static uint8_t* rcReserve(uint32_t size) {
+	if (!s_vdata.inRing()) rcRewind();  // (a batch being written in the queue stays where it is)
 	uint32_t off = s_wpos & s_ringMask;
 	if (off + size > s_ringCap) {  // not before the end: a wrap record there, and on from the start
 		const uint32_t pad = s_ringCap - off;
@@ -3672,6 +3692,7 @@ static uint8_t* rcReserve(uint32_t size) {
 	gameWaitFor(s_gWait[0], [&] { return s_wpos + size - s_tail.load() <= s_ringCap; });
 	const uint32_t used = s_wpos + size - s_tail.load();
 	if (used > s_qPeak) s_qPeak = used;
+	if (off + size > s_qSpan) s_qSpan = off + size;
 	return s_ring + off;
 }
 
@@ -3751,6 +3772,7 @@ static void emitState() {
 
 static uint8_t* rcOpenBatch(size_t* cap) {
 	rcInit();
+	rcRewind();
 	const uint32_t want = 128u << 10;  // room before the ring's end, else it starts at the beginning
 	uint32_t off = s_wpos & s_ringMask;
 	if (off + kDrawHead + want > s_ringCap) {
@@ -3772,6 +3794,8 @@ static void rcBatchRoom(size_t bytes) {
 	gameWaitFor(s_gWait[0], [&] { return s_wpos + need - s_tail.load() <= s_ringCap; });
 	const uint32_t used = s_wpos + need - s_tail.load();
 	if (used > s_qPeak) s_qPeak = used;
+	const uint32_t end = (s_wpos & s_ringMask) + need;
+	if (end > s_qSpan) s_qSpan = end;
 }
 
 static void renderState(const uint8_t* p) {
@@ -4667,6 +4691,15 @@ static void arenaFrameEnd() {
 static const uint32_t kStreamChunk = 64u << 10, kStreamChunks = 16;
 static uint8_t* s_sChunk[kStreamChunks];
 static uint32_t s_sLen[kStreamChunks];
+// Which buffer each chunk fills (by chunk number), and the buffers free. Taken in turn, or with
+// compact rings (GX3DS_SetCompactRings, bit 0; profile runs) the lowest free one: the few in use
+// are then the ones the GX thread has just read, still in the L2 cache, instead of all 16 (1 MB)
+// in turn. The GX thread frees a chunk's buffer before it marks the chunk done. s_sUsed: buffers
+// taken since GX3DS_RingStats last read it.
+static uint8_t s_sBufOf[kStreamChunks];
+static std::atomic<uint32_t> s_sFree{(1u << kStreamChunks) - 1};
+static std::atomic<bool> s_sCompact{false};
+static uint32_t s_sNext, s_sUsed;
 static std::atomic<uint32_t> s_sHead{0}, s_sTail{0};  // chunks handed over; done (released after parsing)
 static std::atomic<uint32_t> s_sFramesDone{0};        // display copies the GX thread has run
 static uint32_t s_sFramesSent;                         // ... and the game thread has sent
@@ -4706,7 +4739,19 @@ static uint8_t* streamSwap(uint8_t* buf, uint32_t len, uint32_t* cap) {
 	}
 	const uint32_t h = s_sHead.load(std::memory_order_relaxed);
 	streamWait(s_sWait[0], [h] { return h - s_sTail.load(std::memory_order_acquire) < kStreamChunks; });
-	return s_sChunk[h % kStreamChunks];
+	const uint32_t free = s_sFree.load(std::memory_order_acquire);  // (at least one: a chunk is free)
+	uint32_t i;
+	if (s_sCompact.load(std::memory_order_relaxed)) {
+		i = uint32_t(__builtin_ctz(free));
+	} else {
+		i = s_sNext;
+		while (!((free >> i) & 1)) i = (i + 1) % kStreamChunks;
+		s_sNext = (i + 1) % kStreamChunks;
+	}
+	s_sFree.fetch_and(~(1u << i), std::memory_order_relaxed);
+	s_sBufOf[h % kStreamChunks] = uint8_t(i);
+	s_sUsed |= 1u << i;
+	return s_sChunk[i];
 }
 
 // Display lists the game rewrites in place. J3D rebuilds a material's list (GD) every time a model
@@ -4822,7 +4867,8 @@ static void gxMain(void*) {
 		s_sIdle += t1 - t0;
 		GX3DS_GxWaitTicks += t1 - t0;
 		const uint32_t t = s_sTail.load(std::memory_order_relaxed);
-		const uint8_t* p = s_sChunk[t % kStreamChunks];
+		const uint32_t buf = s_sBufOf[t % kStreamChunks];
+		const uint8_t* p = s_sChunk[buf];
 		uint32_t n = s_sLen[t % kStreamChunks];
 		while (!carry.empty() && n) {
 			const uint32_t k = std::min(n, carryNeed - uint32_t(carry.size()));
@@ -4843,6 +4889,7 @@ static void gxMain(void*) {
 				carryNeed = need;
 			}
 		}
+		s_sFree.fetch_or(1u << buf, std::memory_order_release);  // (before the chunk is marked done)
 		s_sTail.store(t + 1, std::memory_order_release);
 		pica_event_signal(EV_GAME);
 		s_sBusy += svcGetSystemTick() - t1;
@@ -5267,6 +5314,20 @@ void GX3DS_SetGpuTransform(int on) { gx::s_gpuTransform = on != 0; }
 // Off before the first frame: the renderer draws on the game thread (no render thread).
 void GX3DS_SetRenderThread(int on) { gx::s_rtWanted = on != 0; }
 void GX3DS_SetDropDraws(int on) { gx::s_dropDraws.store(on != 0); }
+// Compact rings (profile runs): bit 0 the stream's buffers, lowest free first; bit 1 the render
+// queue started again at its beginning when the render thread has caught up.
+void GX3DS_SetCompactRings(int mask) {
+	gx::s_sCompact.store((mask & 1) != 0);
+	gx::s_qCompact.store((mask & 2) != 0);
+}
+// Since the last call: the stream buffers taken (how many), the furthest into the render queue a
+// record reached (bytes).
+void GX3DS_RingStats(uint32_t out[2]) {
+	out[0] = uint32_t(__builtin_popcount(gx::s_sUsed));
+	out[1] = gx::s_qSpan;
+	gx::s_sUsed = 0;
+	gx::s_qSpan = 0;
+}
 // Native J3D's verify mode: differences the render thread has found so far.
 uint32_t GX3DS_J3DSigBad(void) { return uint32_t(gx::s_j3dSigBad); }
 // The GX thread's and the render thread's busy time so far, in ticks (profile runs).
