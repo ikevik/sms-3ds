@@ -1,0 +1,23 @@
+--- a/libs/JSystem/src/JDrama/JDRViewObj.cpp
++++ b/libs/JSystem/src/JDrama/JDRViewObj.cpp
+@@ -6,6 +6,9 @@
+ extern "C" int SMS3DS_ProfOn;
+ extern "C" void SMS3DS_ProfObjBegin(const void* vtable, const char* name);
+ extern "C" void SMS3DS_ProfObjEnd(void);
++// ... and while it measures the game thread by object, one object's drawing is left out.
++extern "C" int SMS3DS_ProfSkipOn;
++extern "C" int SMS3DS_ProfSkip(const void* vtable, const char* name);
+ #endif
+ 
+ void JDrama::TViewObj::testPerform(u32 cue, JDrama::TGraphics* graphics)
+@@ -19,6 +22,10 @@
+ 	cue &= ~unkC.get();
+ 	if (cue) {
+ #if defined(__3DS__)
++		if (SMS3DS_ProfSkipOn && (cue & CUE_DRAW) && SMS3DS_ProfSkip(*(const void* const*)this, getName())) {
++			cue &= ~CUE_DRAW;
++			if (!cue) return;
++		}
+ 		if (SMS3DS_ProfOn) {
+ 			SMS3DS_ProfObjBegin(*(const void* const*)this, getName());
+ 			perform(cue, graphics);

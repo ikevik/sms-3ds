@@ -19,8 +19,9 @@
 // The GX thread's own time is credited there too (SMS3DS_ProfGxTicks), by object and by where the
 // commands came from: the J3D draw code says which of its parts is sending (decomp patch 3ds-0019,
 // SMS3DS_GxOrigin, kStreamOpOrigin: native J3D stage 0, docs/native-j3d.md).
-// Part 4, the game thread (kGameSteps; also on its own: the bottom right of the bottom screen, low
-// down): its time by phase for kFrames frames in each step, with only the phases timed (object
+// Part 5, on its own (the bottom right of the bottom screen, low down): the game thread by object,
+// each big drawing object's drawing left out in turn (below, kSkipTargets).
+// Part 4, the game thread (kGameSteps, after part 3): its time by phase for kFrames frames in each step, with only the phases timed (object
 // timing costs the game thread some 10 ms a frame, far more than its estimate). The steps (a table,
 // kGameSteps): the stream's buffers and the render queue used as today (each cycling through 1 MB),
 // then compact (GX3DS_SetCompactRings: the stream's lowest free buffer first; the queue started
@@ -74,6 +75,8 @@ void GX3DS_RingStats(uint32_t out[2]);  // ... since the last call: stream buffe
 uint32_t GX3DS_J3DSigBad(void);    // ... native J3D's verify mode: differences found so far
 extern uint32_t GXPC_J3DStats[16], GXPC_J3DPkgStats[4];  // gx_fifo.cpp: native J3D's counters
 int SMS3DS_ProfOn;
+int SMS3DS_ProfSkipOn;  // part 5: an object's drawing is being left out (SMS3DS_ProfSkip; decomp patch 3ds-0021)
+int SMS3DS_ProfSkip(const void* vtable, const char* name);
 void SMS3DS_ProfPhase(int phase);
 void SMS3DS_ProfObjBegin(const void* vtable, const char* name);
 void SMS3DS_ProfObjEnd(void);
@@ -670,6 +673,110 @@ void startGame() {
 	s_frame = 0;
 }
 
+// Part 5, the game thread by object (the bottom right of the bottom screen, low down): one window
+// with objects timed ranks the objects drawing in the GX list, silhouette and GX post phases by
+// their own time; then the top kSkipTargets have their drawing left out one at a time (decomp
+// patch 3ds-0021: the object's perform loses CUE_DRAW, its children's drawing with it), timed by
+// phase only, with every object drawn again before every kSkipPerBase of them and at the end. What
+// a target's window saves against the window drawing everything before it is what the object's
+// drawing costs in all: its own work, its GX calls, and what the GX thread, the render thread and
+// the GPU then spend on it and take from the game thread through the memory they share.
+const int kSkipTargets = 14, kSkipPerBase = 4;
+struct SkipTarget {
+	const void* vt;
+	const char* name;
+	int phase;
+	bool byName;  // a draw buffer: told apart by name (as lookup)
+	double rankMs;
+	uint32_t performs;
+};
+SkipTarget s_skip[kSkipTargets];
+int s_nSkip, s_skipStep, s_skipNext;
+const SkipTarget* s_skipNow;  // the object left out now (null: none)
+uint32_t s_skipFired;         // performs left out this window
+bool s_skipDone;              // the last target measured: one more window drawing everything, then the end
+// A window's measurements: game thread's work, GX thread, render thread, GPU, frame (ms/frame).
+struct SkipWin {
+	double work, gx, render, gpu, frame;
+};
+SkipWin s_skipBase, s_skipRes[kSkipTargets], s_skipResBase[kSkipTargets];
+uint32_t s_skipFiredRes[kSkipTargets];
+
+void pickSkipTargets() {
+	static Entry* order[kTable];
+	int n = 0;
+	for (int i = 0; i < kTable; i++) {
+		const Entry& e = s_table[i];
+		if (!e.vt || e.phase < 10 || e.phase > 12 || !e.ticks) continue;
+		if (e.name && strcmp(e.name, "ReInitGX") == 0) continue;  // (the GX state every later draw starts from)
+		order[n++] = &s_table[i];
+	}
+	qsort(order, n, sizeof order[0], [](const void* a, const void* b) {
+		const uint64_t x = (*(Entry* const*)a)->ticks, y = (*(Entry* const*)b)->ticks;
+		return x < y ? 1 : x > y ? -1 : 0;
+	});
+	s_nSkip = 0;
+	for (int i = 0; i < n && s_nSkip < kSkipTargets; i++) {
+		const Entry& e = *order[i];
+		SkipTarget& t = s_skip[s_nSkip++];
+		t.vt = e.vt;
+		t.name = e.name;
+		t.phase = e.phase;
+		t.byName = e.name && strncmp(e.name, "DrawBuf", 7) == 0;
+		t.rankMs = double(e.ticks) / kFrames / kTicksPerMs;
+		t.performs = e.calls;
+	}
+}
+
+void skipWinMeasure(uint64_t now, SkipWin& w) {
+	double sum = 0;
+	for (int i = 0; i < PHASES; i++)
+		if (i != 15) sum += s_phaseTicks[i];
+	w.work = sum / kFrames / kTicksPerMs;
+	w.frame = double(now - s_winStart) / kFrames / kTicksPerMs;
+	w.gpu = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
+	uint64_t th[2];
+	GX3DS_ThreadTicks(th);
+	w.gx = double(th[0] - s_thread0[0]) / kFrames / kTicksPerMs;
+	w.render = double(th[1] - s_thread0[1]) / kFrames / kTicksPerMs;
+}
+
+void printSkip(const char* tag, int t) {
+	const SkipTarget& s = s_skip[t];
+	const SkipWin &w = s_skipRes[t], &b = s_skipResBase[t];
+	fprintf(stderr,
+	        "[prof] %s %5.2f ms game thread (work %.1f -> %.1f), GX thread %.2f, render thread %.2f, GPU %.2f, frame "
+	        "%.1f -> %.1f | %.1f performs/frame left out | ranked %.2f ms, %s, vt %08lx \"%s\"\n",
+	        tag, b.work - w.work, b.work, w.work, b.gx - w.gx, b.render - w.render, b.gpu - w.gpu, b.frame, w.frame,
+	        double(s_skipFiredRes[t]) / kFrames, s.rankMs, kPhaseName[s.phase], (unsigned long)uintptr_t(s.vt),
+	        s.name ? s.name : "");
+}
+
+void reportSkip() {
+	int order[kSkipTargets];
+	for (int i = 0; i < s_nSkip; i++) order[i] = i;
+	for (int i = 1; i < s_nSkip; i++)
+		for (int j = i; j > 0; j--) {
+			const double a = s_skipResBase[order[j]].work - s_skipRes[order[j]].work;
+			const double b = s_skipResBase[order[j - 1]].work - s_skipRes[order[j - 1]].work;
+			if (a <= b) break;
+			const int t = order[j];
+			order[j] = order[j - 1];
+			order[j - 1] = t;
+		}
+	fprintf(stderr, "[prof] game thread by object, done; most game-thread ms/frame saved first:\n");
+	for (int i = 0; i < s_nSkip; i++) printSkip(" ", order[i]);
+}
+
+void startSkip() {
+	GXPC_Detail = 0;  // as in normal play
+	SMS3DS_ProfSkipOn = 0;
+	s_skipNow = nullptr;
+	s_skipDone = false;
+	s_state = 15;
+	s_frame = 0;
+}
+
 void pickTargets() {
 	static Entry* order[kTable];
 	int n = 0;
@@ -1004,7 +1111,16 @@ void SMS3DS_ProfRequestGame(void) {
 	if (s_state == 0) s_request = 2;
 }
 
-// 0 idle, 1 CPU part, 2 GPU part, 3 GPU by object, 4 the game thread's steps (for the status screen)
+// 0 idle, 1 CPU part, 2 GPU part, 3 GPU by object, 4 the game thread's steps or objects (for the status screen)
+// Part 5 (decomp patch 3ds-0021, JDrama::TViewObj::testPerform with CUE_DRAW): 1 to leave this
+// object's drawing out.
+int SMS3DS_ProfSkip(const void* vtable, const char* name) {
+	const SkipTarget* t = s_skipNow;
+	if (!t || t->vt != vtable || t->phase != s_phase || (t->byName && name != t->name)) return 0;
+	s_skipFired++;
+	return 1;
+}
+
 int SMS3DS_ProfState(void) {
 	return s_state >= 13 || s_request == 2 ? 4 : s_state == 4 ? 3 : (s_state == 3 || (s_state >= 5 && s_state <= 12)) ? 2 : s_state == 2 || s_request ? 1 : 0;
 }
@@ -1077,10 +1193,11 @@ void SMS3DS_ProfFrame(void) {
 		if (!s_request) return;
 		if (s_request == 2) {
 			s_request = 0;
-			fprintf(stderr, "[prof] game-thread run: %d frames each ", kFrames);
-			for (int k = 0; k < kGameStepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", kGameSteps[k].name);
-			fprintf(stderr, " (stand still until \"[prof] done\")\n");
-			startGame();
+			fprintf(stderr,
+			        "[prof] game thread by object: %d frames ranking the drawing objects (objects timed), then %d each with "
+			        "the biggest left out one at a time (phases timed; about a minute: stand still until \"[prof] done\")\n",
+			        kFrames, kFrames);
+			startSkip();
 			return;
 		}
 		s_request = 0;
@@ -1280,6 +1397,76 @@ void SMS3DS_ProfFrame(void) {
 			reportGameSaved();
 			fprintf(stderr, "[prof] done\n");
 			s_state = 0;
+		}
+		return;
+	case 15:  // part 5: the drawing objects ranked (objects timed)
+		if (++s_frame == kSettle) {
+			resetCpu();
+			s_winStart = s_phaseLast = now;
+			s_phase = 0;
+			SMS3DS_ProfOn = 1;
+		} else if (s_frame == kSettle + kFrames) {
+			pickSkipTargets();
+			SMS3DS_ProfOn = 2;  // phases only from here, settling frames too (the skip reads the phase)
+			if (!s_nSkip) {
+				SMS3DS_ProfOn = 0;
+				fprintf(stderr, "[prof] game thread by object: no drawing objects found\n[prof] done\n");
+				s_state = 0;
+				return;
+			}
+			fprintf(stderr,
+			        "[prof] game thread by object: %d objects' drawing left out one at a time, everything drawn before "
+			        "every %d and at the end, each line printed as it is measured (keep standing still until \"[prof] "
+			        "done\")\n",
+			        s_nSkip, kSkipPerBase);
+			s_skipStep = -1;
+			s_skipNext = 0;
+			s_skipNow = nullptr;
+			SMS3DS_ProfSkipOn = 0;
+			s_state = 16;
+			s_frame = 0;
+		}
+		return;
+	case 16:  // part 5: one object's drawing left out (s_skipStep), or none (-1)
+		if (++s_frame == kSettle) {
+			resetCpu();
+			s_winStart = s_phaseLast = now;
+			s_phase = 0;
+			s_gpu0 = pica_gpu_ms_sum();
+			GX3DS_ThreadTicks(s_thread0);
+			s_skipFired = 0;
+		} else if (s_frame == kSettle + kFrames) {
+			SkipWin w;
+			skipWinMeasure(now, w);
+			if (s_skipStep < 0) {
+				s_skipBase = w;
+				fprintf(stderr,
+				        "[prof]   drawing everything: game thread's work %.1f ms/frame, GX thread %.1f, render thread "
+				        "%.1f, GPU %.1f, frame %.1f\n",
+				        w.work, w.gx, w.render, w.gpu, w.frame);
+				if (s_skipDone) {
+					SMS3DS_ProfOn = 0;
+					SMS3DS_ProfSkipOn = 0;
+					reportSkip();
+					fprintf(stderr, "[prof] done\n");
+					s_state = 0;
+					return;
+				}
+			} else {
+				s_skipRes[s_skipStep] = w;
+				s_skipResBase[s_skipStep] = s_skipBase;
+				s_skipFiredRes[s_skipStep] = s_skipFired;
+				printSkip(" ", s_skipStep);
+			}
+			if (s_skipStep >= 0 && s_skipNext >= s_nSkip) {
+				s_skipDone = true;  // everything drawn once more, then the end
+				s_skipStep = -1;
+			} else {
+				s_skipStep = (s_skipStep >= 0 && s_skipNext % kSkipPerBase == 0) ? -1 : s_skipNext++;
+			}
+			s_skipNow = s_skipStep >= 0 ? &s_skip[s_skipStep] : nullptr;
+			SMS3DS_ProfSkipOn = s_skipNow != nullptr;
+			s_frame = 0;
 		}
 		return;
 	}
