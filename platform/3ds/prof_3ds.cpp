@@ -173,12 +173,17 @@ double s_hookUs;          // what a pair costs (calibrate)
 
 // state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 7 GPU
 // part (pixels cut, the picture shrunk 8x: nothing clipped at the screen's sides), 5 GPU part
-// (positions collapsed), 6 GPU part (no draws), 4 GPU by object
+// (positions collapsed), 6 GPU part (no draws), 8-12 GPU part (GPU tests 5, 6, 0, 7, 8: see
+// s_gpuMinShaderMs), 4 GPU by object
 volatile int s_request;
 int s_state, s_frame;
 uint64_t s_winStart;
 double s_gpu0, s_cpuFrameMs, s_cpuGpuMs, s_gpuCutMs, s_gpuCollapsedMs, s_cutFrame, s_collapsedFrame, s_gpuShrunkMs,
-    s_shrunkFrame;
+    s_shrunkFrame, s_gpuNoDrawMs, s_noDrawFrame;
+// Part 2's further steps (pica_draw.c GPU tests 5-8): pixels cut with a minimal vertex shader, and
+// with only positions fetched; drawing normally again, then with textures outside VRAM swapped for
+// one small texture, and every texture.
+double s_gpuMinShaderMs, s_gpuPosOnlyMs, s_gpuNormal2Ms, s_gpuTexMainMs, s_gpuTexAllMs;
 
 Entry* lookup(const void* vt, int phase, const char* name) {
 	// JDrama::TDrawBufObj (every "DrawBuf ..." object) draws a whole buffer of models: one entry
@@ -805,7 +810,7 @@ void SMS3DS_ProfRequest(void) {
 
 // 0 idle, 1 CPU part, 2 GPU part (for the status screen)
 int SMS3DS_ProfState(void) {
-	return s_state == 4 ? 3 : (s_state == 3 || s_state == 5 || s_state == 6 || s_state == 7) ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0;
+	return s_state == 4 ? 3 : (s_state == 3 || (s_state >= 5 && s_state <= 12)) ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0;
 }
 
 void SMS3DS_ProfPhase(int phase) {
@@ -878,7 +883,9 @@ void SMS3DS_ProfFrame(void) {
 		GXPC_Detail = 1;  // the GX thread's per-write counters and command timing, for this run
 		fprintf(stderr,
 		        "[prof] profile run: %d frames timed, then %d each with pixels cut to 8x8, that and the picture shrunk 8x, "
-		        "positions collapsed and no draws, then objects' pixels cut one at a time (stand still)\n",
+		        "positions collapsed, no draws, pixels cut with a minimal vertex shader, that with only positions "
+		        "fetched, drawing normally, textures outside VRAM swapped for a small one, every texture swapped, "
+		        "then objects' pixels cut one at a time (stand still)\n",
 		        kFrames, kFrames);
 		return;
 	case 2:  // CPU part
@@ -906,6 +913,11 @@ void SMS3DS_ProfFrame(void) {
 	case 7:  // pixels cut, the picture shrunk 8x about the centre
 	case 5:  // positions collapsed
 	case 6:  // no draws
+	case 8:  // pixels cut, minimal vertex shader
+	case 9:  // that, only positions fetched
+	case 10: // drawing normally again
+	case 11: // textures outside VRAM swapped for a small one
+	case 12: // every texture swapped
 		if (++s_frame == kSettle) {
 			s_winStart = now;
 			s_gpu0 = pica_gpu_ms_sum();
@@ -936,20 +948,42 @@ void SMS3DS_ProfFrame(void) {
 				s_frame = 0;
 				return;
 			}
+			// the further steps, each to the next
+			static const int kNext[13][2] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}, {8, 5}, {0, 0},
+			                                 {9, 6}, {10, 0}, {11, 7}, {12, 8}, {0, 0}};
+			double* const kSlot[13] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &s_gpuNoDrawMs, nullptr,
+			                           &s_gpuMinShaderMs, &s_gpuPosOnlyMs, &s_gpuNormal2Ms, &s_gpuTexMainMs, &s_gpuTexAllMs};
+			*kSlot[s_state] = gpuMs;
+			if (s_state == 6) s_noDrawFrame = frameMs;
+			if (s_state != 12) {
+				pica_set_gpu_test(kNext[s_state][1]);
+				s_state = kNext[s_state][0];
+				s_frame = 0;
+				return;
+			}
 			pica_set_gpu_test(0);
+			const double noDrawMs = s_gpuNoDrawMs, noDrawFrame = s_noDrawFrame;
 			const double gpuCut = s_gpuCutMs;
 			fprintf(stderr,
 			        "[prof] GPU: %.1f ms/frame drawing normally (frame %.1f ms), %.1f with pixels cut to 8x8 (frame %.1f "
 			        "ms), %.1f with that and the picture shrunk 8x (frame %.1f), %.1f with positions collapsed (frame "
 			        "%.1f), %.1f with no draws (frame %.1f)\n",
 			        s_cpuGpuMs, s_cpuFrameMs, gpuCut, s_cutFrame, s_gpuShrunkMs, s_shrunkFrame, s_gpuCollapsedMs,
-			        s_collapsedFrame, gpuMs, frameMs);
+			        s_collapsedFrame, noDrawMs, noDrawFrame);
 			fprintf(stderr,
 			        "[prof] GPU split: pixels %.1f ms | triangles running past the screen's sides (the rasteriser "
 			        "walks them; clipping is what limits it) %.1f ms | triangle setup and near-plane clipping %.1f ms | "
 			        "vertex fetch and shading %.1f ms | the rest (state, commands, copies, the present) %.1f ms\n",
 			        s_cpuGpuMs - gpuCut, gpuCut - s_gpuShrunkMs, s_gpuShrunkMs - s_gpuCollapsedMs,
-			        s_gpuCollapsedMs - gpuMs, gpuMs);
+			        s_gpuCollapsedMs - noDrawMs, noDrawMs);
+			fprintf(stderr,
+			        "[prof] GPU, what lighter work would save: pixels cut and a minimal vertex shader (no lighting, no "
+			        "texture coordinates) %.1f ms/frame, %.1f less than pixels cut alone | and only positions fetched "
+			        "%.1f, %.1f less again | drawing normally again %.1f; textures outside VRAM swapped for one small "
+			        "texture %.1f, %.1f less; every texture swapped %.1f, %.1f less\n",
+			        s_gpuMinShaderMs, gpuCut - s_gpuMinShaderMs, s_gpuPosOnlyMs, s_gpuMinShaderMs - s_gpuPosOnlyMs,
+			        s_gpuNormal2Ms, s_gpuTexMainMs, s_gpuNormal2Ms - s_gpuTexMainMs, s_gpuTexAllMs,
+			        s_gpuNormal2Ms - s_gpuTexAllMs);
 			// Part 3 needs the objects' open/close calls (the entries stay as part 1 left them).
 			pickTargets();
 			fprintf(stderr,

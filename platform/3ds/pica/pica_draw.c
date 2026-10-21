@@ -677,8 +677,14 @@ void pica_end_ticks(uint64_t out[PICA_END_COUNT]) { memcpy(out, s_endTicks, size
  * GPU still transforms every vertex but shades almost no pixels; 2 (GX-mode draws) puts every
  * vertex at one point, so they are still fetched and shaded but nothing is clipped, set up or
  * drawn; 3 sends every GX-mode draw's setup but not the draw. The steps between their GPU times
- * are pixels, clipping and triangle setup, vertex work, and what is left (state, copies). */
+ * are pixels, clipping and triangle setup, vertex work, and what is left (state, copies).
+ * 5 is 1 with the GX-mode shader's work beyond the position left out (no lighting, no texture
+ * coordinates), 6 is 5 with only the position (and matrix index) fetched: what lighter shaders and
+ * fewer attributes would save. 7 binds one small texture in place of every texture without a VRAM
+ * copy, 8 in place of every texture: what textures in main memory, and textures at all, cost. */
 static int s_gpuTest;
+static C3D_Tex s_smallTex; /* tests 7 and 8: 8x8 white */
+static int s_smallTexReady;
 int pica_cycle_gpu_test(void)
 {
 	s_gpuTest = (s_gpuTest + 1) % 2;
@@ -686,7 +692,19 @@ int pica_cycle_gpu_test(void)
 	return s_gpuTest;
 }
 int pica_gpu_test(void) { return s_gpuTest; }
-void pica_set_gpu_test(int mode) { s_gpuTest = mode; }
+void pica_set_gpu_test(int mode)
+{
+	s_gpuTest = mode;
+	s_last_valid = 0;    /* the scissor, the textures: set again */
+	s_gxLayoutValid = 0; /* test 6 changes the attributes */
+	if ((mode == 7 || mode == 8) && !s_smallTexReady && C3D_TexInit(&s_smallTex, 8, 8, GPU_RGBA8)) {
+		memset(s_smallTex.data, 0xFF, s_smallTex.size);
+		GSPGPU_FlushDataCache(s_smallTex.data, s_smallTex.size);
+		C3D_TexSetFilter(&s_smallTex, GPU_LINEAR, GPU_LINEAR);
+		C3D_TexSetWrap(&s_smallTex, GPU_REPEAT, GPU_REPEAT);
+		s_smallTexReady = 1;
+	}
+}
 /* One object's draws cut to 8x8 pixels (the profiler's per-object part). */
 static int s_drawCut;
 void pica_set_draw_cut(int cut)
@@ -1236,6 +1254,14 @@ static void set_buffer(const void* verts, int stride, int entries, u64 perm)
  * v(3+N), the usual case) skips building the source. */
 static void gx_shortcuts(const PicaGxUniforms* u)
 {
+	if (s_gpuTest == 5 || s_gpuTest == 6) { /* only the position and the colour */
+		bunif(s_bLit, false);
+		for (int k = 0; k < 3; k++) {
+			bunif(s_bTu[k], false);
+			bunif(s_bTd[k], false);
+		}
+		return;
+	}
 	bunif(s_bLit, u->LD[3] != 0.f);
 	for (int k = 0; k < 3; k++) {
 		const float* w0 = u->W[2 * k];
@@ -1302,6 +1328,13 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, int matrices_dirty,
                     const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st)
 {
+	static PicaGxLayout s_posOnly;
+	if (s_gpuTest == 6) { /* only the position and the matrix index fetched */
+		s_posOnly = *L;
+		s_posOnly.off_nrm = s_posOnly.off_clr = -1;
+		for (int k = 0; k < 3; k++) s_posOnly.off_tex[k] = -1;
+		L = &s_posOnly;
+	}
 	if (s_mode != MODE_GX || !s_gxLayoutValid || memcmp(L, &s_gxLayout, sizeof *L) != 0) {
 		u64 perm;
 		int n = gx_attribs(L, &perm);
@@ -1437,6 +1470,9 @@ static void apply_state(const PicaState* st)
 			pt->vtex.data = pt->vram;
 			tex = &pt->vtex;
 		}
+		if (s_smallTexReady &&
+		    (s_gpuTest == 8 || (s_gpuTest == 7 && (uintptr_t)tex->data - 0x1F000000u >= 0x600000u)))
+			tex = &s_smallTex; /* GPU tests 7, 8: in place of a texture outside VRAM, or of any */
 		if (u == 0 && st->proj0) { /* (s, t) divided by q (texcoord0w) per pixel */
 			s_projTex = *tex;
 			s_projTex.param = (s_projTex.param & ~GPU_TEXTURE_MODE(7)) | GPU_TEXTURE_MODE(GPU_TEX_PROJECTION);
@@ -1484,7 +1520,7 @@ static void apply_state(const PicaState* st)
 	}
 	if (!L || st->scissor != L->scissor || st->sc_x0 != L->sc_x0 || st->sc_y0 != L->sc_y0 || st->sc_x1 != L->sc_x1 ||
 	    st->sc_y1 != L->sc_y1) {
-		if (s_gpuTest == 1 || s_gpuTest == 4 || s_drawCut) {
+		if (s_gpuTest == 1 || s_gpuTest == 4 || s_gpuTest == 5 || s_gpuTest == 6 || s_drawCut) {
 			C3D_SetScissor(GPU_SCISSOR_NORMAL, 0, 0, 8, 8);
 		} else if (st->scissor) {
 			/* The EFB texture holds the EFB with its bottom row first (pica_efb_uv); scissor
