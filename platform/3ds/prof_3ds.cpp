@@ -23,12 +23,12 @@
 // each big drawing object's drawing left out in turn (below, kSkipTargets).
 // Part 4, the game thread (kGameSteps, after part 3): its time by phase for kFrames frames in each step, with only the phases timed (object
 // timing costs the game thread some 10 ms a frame, far more than its estimate). The steps (a table,
-// kGameSteps): the stream's buffers and the render queue used as today (each cycling through 1 MB),
-// then compact (GX3DS_SetCompactRings: the stream's lowest free buffer first; the queue started
-// again at its beginning whenever the render thread has caught up), each alone and both, then as
-// today again (how far the view drifted). Each reports the game thread's work by phase, the GX and
-// render threads' busy time, the stream buffers taken and how far into the queue records reached.
-// Earlier runs' steps, kept as settings in the table: native J3D off, on through stage 1's path,
+// kGameSteps): the sea drawn as before and with its vertices worked out once per column and row
+// (decomp patch 3ds-0022, SMS3DS_WaveMode), alternately (A B A B A: the view drifts), then that
+// checked against the original's values vertex by vertex. Each reports the game thread's work by
+// phase, the sea's draw on its own (draw zone 7, also timed with phases only), the GX and render
+// threads' busy time. Earlier runs' steps, kept as settings in the table: compact stream buffers
+// and render queue (GX3DS_SetCompactRings) changed nothing beyond drift; native J3D off, on through stage 1's path,
 // on with compiled shapes (GX thread 32.7, 33.6, 32.0 ms; the game thread unchanged; verify mode
 // 0 differences);
 // objects timed too cost 10.1 ms a frame; inexact maths (sms_math_fast) saved nothing; of the game
@@ -75,6 +75,11 @@ void GX3DS_RingStats(uint32_t out[2]);  // ... since the last call: stream buffe
 uint32_t GX3DS_J3DSigBad(void);    // ... native J3D's verify mode: differences found so far
 extern uint32_t GXPC_J3DStats[16], GXPC_J3DPkgStats[4];  // gx_fifo.cpp: native J3D's counters
 int SMS3DS_ProfOn;
+// The sea's draw (decomp patch 3ds-0022): 0 vertex by vertex, 1 once per column and row (the
+// default; settings.txt sea_precomputed), 2 that checked against the original's values.
+int SMS3DS_WaveMode = 1;
+unsigned long SMS3DS_WaveChecked, SMS3DS_WaveDiffs;
+void SMS3DS_ProfSetLowTouch(int part);  // the low touch's run: 4 the game thread's steps, 5 by object
 int SMS3DS_ProfSkipOn;  // part 5: an object's drawing is being left out (SMS3DS_ProfSkip; decomp patch 3ds-0021)
 int SMS3DS_ProfSkip(const void* vtable, const char* name);
 void SMS3DS_ProfPhase(int phase);
@@ -569,22 +574,27 @@ double hogRate() {
 // Part 4's steps: SMS3DS_ProfOn (1 objects timed too, 2 phases only), sms_math_fast, the GPU test,
 // the GX mute level (GXPC_SetMute), the render thread's draws dropped, the whole-heap flush, the
 // hog's buffer (0: none), native J3D (-1 as the settings set it, 0 off, 1 on, 3 verify), compiled
-// shapes (-1 as set), compact rings (GX3DS_SetCompactRings).
+// shapes (-1 as set), compact rings (GX3DS_SetCompactRings), the sea's draw (SMS3DS_WaveMode; -1 as
+// set).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages, rings;
+	int native, packages, rings, wave;
 };
-enum { kGsToday, kGsStream, kGsQueue, kGsBoth, kGsTodayAgain, kGameStepN };
+enum { kGsOld1, kGsNew1, kGsOld2, kGsNew2, kGsOld3, kGsChecked, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"rings as today", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0},
-    {"compact stream buffers", 2, 0, 0, 0, 0, 1, 0, -1, -1, 1},
-    {"compact render queue", 2, 0, 0, 0, 0, 1, 0, -1, -1, 2},
-    {"both compact", 2, 0, 0, 0, 0, 1, 0, -1, -1, 3},
-    {"rings as today again", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0},
+    {"the sea as before", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 0},
+    {"the sea precomputed", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 1},
+    {"the sea as before", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 0},
+    {"the sea precomputed", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 1},
+    {"the sea as before", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 0},
+    {"the sea precomputed, checked against the original (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 2},
 };
-const int kGsVerify = -1;  // (no verify step in this table)
+const int kGsVerify = -1;  // (no native J3D verify step in this table)
+int s_waveSaved = 1;     // SMS3DS_WaveMode before part 4 (put back after it)
+uint32_t s_wave0[2];     // the checked step's counters at its start
+double s_gameSea[kGameStepN];  // the sea's draw, ms/frame (draw zone 7)
 // The verify step's counters at its start: native draws verified, shape ops drawn from compiled
 // shapes, differences.
 uint32_t s_verify0[3];
@@ -608,6 +618,7 @@ void setGameStep(int k) {
 	GXPC_SetNativeJ3DMode(g && g->native >= 0 ? g->native : s_nativeSaved);
 	GXPC_J3DPackages = g && g->packages >= 0 ? g->packages : s_packagesSaved;
 	GX3DS_SetCompactRings(g ? g->rings : 0);
+	SMS3DS_WaveMode = g && g->wave >= 0 ? g->wave : s_waveSaved;
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -631,8 +642,7 @@ void reportGameStep(int k) {
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
 	char hog[96] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
-	else snprintf(hog, sizeof hog, "; stream buffers %lu, queue reached %lu KB", (unsigned long)s_gameRing[k][0],
-	              (unsigned long)(s_gameRing[k][1] >> 10));
+	else snprintf(hog, sizeof hog, "; the sea's draw %.2f ms", s_gameSea[k]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -649,22 +659,30 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	auto row = [](const char* what, const double* v) {
-		fprintf(stderr, " | %s %.1f, %.1f, %.1f, %.1f (%.1f)", what, v[kGsToday], v[kGsStream], v[kGsQueue], v[kGsBoth],
-		        v[kGsTodayAgain]);
+	// Before: steps 0, 2, 4; precomputed: 1, 3 (the checked step is not timed).
+	auto oldNew = [](const double* v, double& o, double& n) {
+		o = (v[kGsOld1] + v[kGsOld2] + v[kGsOld3]) / 3;
+		n = (v[kGsNew1] + v[kGsNew2]) / 2;
 	};
-	double work[kGameStepN];
-	for (int k = 0; k < kGameStepN; k++) work[k] = gameWork(k);
-	fprintf(stderr, "[prof] rings today, stream compact, queue compact, both (today again), ms/frame:");
-	row("game thread's work", work);
-	row("GX thread", s_gameGx);
-	row("render thread", s_gameRender);
-	row("frame", s_gameFrame);
-	row("GPU", s_gameGpu);
-	fprintf(stderr, "\n");
+	double work[kGameStepN], post[kGameStepN];
+	for (int k = 0; k < kGameStepN; k++) {
+		work[k] = gameWork(k);
+		post[k] = s_gamePh[k][12];
+	}
+	double wo, wn, so, sn, po, pn, go, gn, fo, fn;
+	oldNew(work, wo, wn);
+	oldNew(s_gameSea, so, sn);
+	oldNew(post, po, pn);
+	oldNew(s_gameGx, go, gn);
+	oldNew(s_gameFrame, fo, fn);
+	fprintf(stderr,
+	        "[prof] the sea, as before (3 windows) -> precomputed (2), ms/frame: its draw %.2f -> %.2f | GX post phase "
+	        "%.1f -> %.1f | game thread's work %.1f -> %.1f | GX thread %.1f -> %.1f | frame %.1f -> %.1f\n",
+	        so, sn, po, pn, wo, wn, go, gn, fo, fn);
 }
 void startGame() {
 	GXPC_Detail = 0;  // as in normal play
+	s_waveSaved = SMS3DS_WaveMode;
 	s_nativeSaved = GXPC_NativeJ3DMode();
 	s_packagesSaved = GXPC_J3DPackages;
 	s_gameStep = 0;
@@ -1088,7 +1106,7 @@ int SMS3DS_GxOrigin(int origin) {
 }
 
 int SMS3DS_ZoneBegin(int zone) {
-	if (SMS3DS_ProfOn != 1 || zone < 0 || zone >= kZones || s_zoneDepth >= int(sizeof s_zoneStack / sizeof s_zoneStack[0])) return -1;
+	if (!SMS3DS_ProfOn || zone < 0 || zone >= kZones || s_zoneDepth >= int(sizeof s_zoneStack / sizeof s_zoneStack[0])) return -1;
 	s_zoneStack[s_zoneDepth] = {svcGetSystemTick(), GX3DS_StreamWritten()};
 	return s_zoneDepth++;
 }
@@ -1110,6 +1128,8 @@ void SMS3DS_ProfRequest(void) {
 void SMS3DS_ProfRequestGame(void) {
 	if (s_state == 0) s_request = 2;
 }
+static int s_lowPart = 4;
+void SMS3DS_ProfSetLowTouch(int part) { s_lowPart = part == 5 ? 5 : 4; }
 
 // 0 idle, 1 CPU part, 2 GPU part, 3 GPU by object, 4 the game thread's steps or objects (for the status screen)
 // Part 5 (decomp patch 3ds-0021, JDrama::TViewObj::testPerform): 1 to leave this object's perform
@@ -1191,13 +1211,21 @@ void SMS3DS_ProfFrame(void) {
 	switch (s_state) {
 	case 0:
 		if (!s_request) return;
-		if (s_request == 2) {
+		if (s_request == 2 && s_lowPart == 5) {
 			s_request = 0;
 			fprintf(stderr,
 			        "[prof] game thread by object: %d frames ranking the drawing objects (objects timed), then %d each with "
 			        "the biggest left out one at a time (phases timed; about a minute: stand still until \"[prof] done\")\n",
 			        kFrames, kFrames);
 			startSkip();
+			return;
+		}
+		if (s_request == 2) {
+			s_request = 0;
+			fprintf(stderr, "[prof] game-thread run: %d frames each ", kFrames);
+			for (int k = 0; k < kGameStepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", kGameSteps[k].name);
+			fprintf(stderr, " (stand still until \"[prof] done\")\n");
+			startGame();
 			return;
 		}
 		s_request = 0;
@@ -1363,6 +1391,8 @@ void SMS3DS_ProfFrame(void) {
 			GX3DS_ThreadTicks(s_thread0);
 			uint32_t rs0[2];
 			GX3DS_RingStats(rs0);  // (from now)
+			s_wave0[0] = uint32_t(SMS3DS_WaveChecked);
+			s_wave0[1] = uint32_t(SMS3DS_WaveDiffs);
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
 			s_verify0[2] = GX3DS_J3DSigBad();
@@ -1379,7 +1409,12 @@ void SMS3DS_ProfFrame(void) {
 			s_gameGx[k] = double(th[0] - s_thread0[0]) / kFrames / kTicksPerMs;
 			s_gameRender[k] = double(th[1] - s_thread0[1]) / kFrames / kTicksPerMs;
 			GX3DS_RingStats(s_gameRing[k]);
+			s_gameSea[k] = double(s_zoneTicks[7]) / kFrames / kTicksPerMs;
 			reportGameStep(k);
+			if (kGameSteps[k].wave == 2)
+				fprintf(stderr, "[prof] the sea precomputed, checked: %lu vertices compared with the original's, %lu differing\n",
+				        (unsigned long)(uint32_t(SMS3DS_WaveChecked) - s_wave0[0]),
+				        (unsigned long)(uint32_t(SMS3DS_WaveDiffs) - s_wave0[1]));
 			if (k == kGsVerify)
 				fprintf(stderr,
 				        "[prof] compiled shapes verified: %lu native draws checked by the render thread, %lu shape ops "

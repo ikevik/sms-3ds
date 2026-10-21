@@ -1,0 +1,101 @@
+--- a/src/MoveBG/MapObjWave.cpp
++++ b/src/MoveBG/MapObjWave.cpp
+@@ -25,6 +25,15 @@
+ 
+ TMapObjWave* gpMapObjWave;
+ 
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0022, platform/3ds/prof_3ds.cpp): how TMapObjWave::draw works its
++// vertices out: 0 vertex by vertex, as the original; 1 once per column and row; 2 that, checked
++// against the original's values (SMS3DS_WaveChecked vertices, SMS3DS_WaveDiffs differing).
++extern "C" int SMS3DS_WaveMode;
++extern "C" unsigned long SMS3DS_WaveChecked, SMS3DS_WaveDiffs;
++#include <string.h>
++#endif
++
+ void TMapObjWave::initDraw()
+ {
+ 	GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+@@ -157,6 +166,82 @@
+ void TMapObjWave::draw()
+ {
+ 	SMS3DS_ZONE(7);
++#if defined(__3DS__)
++	// 3DS port: the same vertices, with what depends only on a column (its x, its half of the
++	// height, its texture coordinates) worked out once per column, and what depends only on a row
++	// once per row. getWaveHeight is a column's term plus a row's, so a frame takes about three
++	// sines a strip instead of two a vertex (some 2,700 on Delfino Plaza, each an exact MSL sine).
++	// Bit for bit the original's values: each is the same expression on the same operands, in the
++	// same order (the x loop runs as each row's did; a row's z1 is z0 + mGridSize, as there).
++	if (SMS3DS_WaveMode) {
++		enum { kMaxCols = 128 };
++		f32 colX[kMaxCols], colX0[kMaxCols], colH[kMaxCols], colT0[kMaxCols], colT1[kMaxCols];
++		const bool flat = mTexture == nullptr;  // (getWaveHeight's 0)
++		int n = 0;
++		for (f32 x = -mHalfSize; x <= mHalfSize - mGridSize; x += mGridSize) {
++			if (n == kMaxCols) {
++				n = -1;
++				break;
++			}
++			const f32 x0 = x + SMS_GetMarioX();
++			colX[n]  = x;
++			colX0[n] = x0;
++			colH[n]  = flat ? 0.0f : mWaveHeightX * sinf(mWaveFreqX * (x0 * (1.0f / 6.28318f)) + mWavePhaseX);
++			colT0[n] = getMoveTexPos0(x0);
++			colT1[n] = 0.8f * getStaticTexPos1(x0);
++			n++;
++		}
++		if (n >= 0) {
++			const bool check = SMS3DS_WaveMode == 2;
++			for (f32 z = -mHalfSize; z <= mHalfSize - mGridSize; z += mGridSize) {
++				const f32 z0  = z + SMS_GetMarioZ();
++				const f32 z1  = z0 + mGridSize;
++				const f32 hz0 = flat ? 0.0f : mWaveHeightZ * sinf(mWaveFreqZ * (z0 * (1.0f / 6.28318f)) + mWavePhaseZ);
++				const f32 hz1 = flat ? 0.0f : mWaveHeightZ * sinf(mWaveFreqZ * (z1 * (1.0f / 6.28318f)) + mWavePhaseZ);
++				const f32 s0 = getStaticTexPos0(z0), s1 = getStaticTexPos0(z1);
++				const f32 m0 = getMoveTexPos1(z0), m1 = getMoveTexPos1(z1);
++
++				GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT0, mDivideNum * 2);
++				for (int i = 0; i < n; i++) {
++					const f32 x0     = colX0[i];
++					const int alpha0 = getAlpha(colX[i], z);
++					const int alpha1 = getAlpha(colX[i], z + mGridSize);
++					const f32 y0     = flat ? 0.0f : colH[i] + hz0;
++					const f32 y1     = flat ? 0.0f : colH[i] + hz1;
++					if (check) {
++						const f32 ox0  = colX[i] + SMS_GetMarioX();
++						const f32 want[10] = {ox0,
++						                      getWaveHeight(ox0, z0),
++						                      getMoveTexPos0(ox0),
++						                      getStaticTexPos0(z0),
++						                      0.8f * getStaticTexPos1(ox0),
++						                      getMoveTexPos1(z0),
++						                      getWaveHeight(ox0, z1),
++						                      getStaticTexPos0(z1),
++						                      getMoveTexPos1(z1),
++						                      0.0f};
++						const f32 got[10] = {x0, y0, colT0[i], s0, colT1[i], m0, y1, s1, m1, 0.0f};
++						SMS3DS_WaveChecked++;
++						if (memcmp(want, got, sizeof want) != 0)
++							SMS3DS_WaveDiffs++;
++					}
++
++					GXPosition3f32(x0, y0, z0);
++					GXColor4u8(sColor.r, sColor.g, sColor.b, alpha0);
++					GXTexCoord2f32(colT0[i], s0);
++					GXTexCoord2f32(colT1[i], m0);
++
++					GXPosition3f32(x0, y1, z1);
++					GXColor4u8(sColor.r, sColor.g, sColor.b, alpha1);
++					GXTexCoord2f32(colT0[i], s1);
++					GXTexCoord2f32(colT1[i], m1);
++				}
++				GXEnd();
++			}
++			return;
++		}
++	}
++#endif
+ 	for (f32 z = -mHalfSize; z <= mHalfSize - mGridSize; z += mGridSize) {
+ 		f32 z0 = z + SMS_GetMarioZ();
+ 		f32 z1 = z0 + mGridSize;

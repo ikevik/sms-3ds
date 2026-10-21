@@ -315,7 +315,15 @@ static const char kDefaultSettings[] =
     "# native_j3d_buffers = MapOpa,StaticMapObj_SunOpa\n"
     "# Native shapes drawn from compiled blocks once they have drawn natively (on), or found and\n"
     "# checked in the display-list cache on every draw (off). The same draws either way.\n"
-    "# native_j3d_packages = on\n";
+    "# native_j3d_packages = on\n"
+    "\n"
+    "# The sea's vertices worked out once per column and row (on), or vertex by vertex as the\n"
+    "# original (off). The same vertices, bit for bit; on saves most of its exact sines.\n"
+    "sea_precomputed = on\n"
+    "\n"
+    "# What touching the bottom right of the bottom screen low down runs: the game thread's steps\n"
+    "# (steps) or the game thread by object (objects). Higher up it starts the whole profile run.\n"
+    "profile_low_touch = steps\n";
 
 // Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
 #ifndef SMS3DS_MIPS_DEFAULT
@@ -344,6 +352,8 @@ extern "C" void GXPC_SetFastStateLists(int on);
 	"Mirror_Opa,Mirror_Xlu,Sky_Opa,Sky_Xlu,AfterIndirect_Xlu,ChrOpa,ChrXlu"
 extern "C" void GXPC_SetNativeJ3D(int mode, const char* buffers);
 extern "C" int GXPC_J3DPackages;  // patch 0037: native shapes from compiled blocks (settings.txt native_j3d_packages)
+extern "C" int SMS3DS_WaveMode;    // decomp patch 3ds-0022: the sea precomputed (settings.txt sea_precomputed)
+extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt profile_low_touch)
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -465,6 +475,10 @@ static void* game_thread(void*)
 		setting_value(kSettingsPath, "native_j3d_buffers", bufs, sizeof bufs);
 		GXPC_SetNativeJ3D(nativeJ3D, bufs);
 		if (setting_value(kSettingsPath, "native_j3d_packages", v, sizeof v)) GXPC_J3DPackages = strcmp(v, "off") != 0;
+		if (setting_value(kSettingsPath, "sea_precomputed", v, sizeof v)) SMS3DS_WaveMode = strcmp(v, "off") != 0;
+		fprintf(stderr, "[3ds] the sea: %s (sea_precomputed)\n", SMS3DS_WaveMode ? "worked out once per column and row" : "vertex by vertex");
+		if (setting_value(kSettingsPath, "profile_low_touch", v, sizeof v))
+			SMS3DS_ProfSetLowTouch(strcmp(v, "objects") == 0 ? 5 : 4);
 		fprintf(stderr, "[3ds] J3D drawn natively: %s, in %s, %s (native_j3d, native_j3d_buffers, native_j3d_packages)\n",
 		        nativeJ3D == 1 ? "on" : nativeJ3D == 2 ? "check" : nativeJ3D == 3 ? "verify" : "off", bufs,
 		        GXPC_J3DPackages ? "compiled shapes" : "no compiled shapes");
