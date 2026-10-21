@@ -1,0 +1,154 @@
+--- a/libs/JSystem/src/J2D/J2DPrint.cpp
++++ b/libs/JSystem/src/J2D/J2DPrint.cpp
+@@ -7,6 +7,51 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0026, platform/3ds/prof_3ds.cpp): a caller whose scissor leaves no
++// pixel outside a band of x gives the band in the print's own x (SMS3DS_PrintClip set,
++// SMS3DS_PrintClipX0/X1, a margin included; for a JUTResFont); parse then leaves out each glyph
++// whose quad, as drawChar_scale works it out, lies wholly outside the band, as it would draw no
++// pixel. The last glyph left out is drawn after all when no glyph is drawn after it, so the font's
++// texture page and the vertex format end as the original leaves them; a glyph drawn loads its own
++// page, as there. SMS3DS_PrintGlyphs counts the glyphs drawn and those left out under a band.
++extern "C" int SMS3DS_PrintClip;
++extern "C" float SMS3DS_PrintClipX0, SMS3DS_PrintClipX1;
++extern "C" unsigned long SMS3DS_PrintGlyphs[2];
++namespace {
++struct PrintLeftOut {
++	bool on, flag;
++	f32 x, y;
++	int sizeX, sizeY, chr;
++	PrintLeftOut()
++	    : on(false), flag(false), x(0.0f), y(0.0f), sizeX(0), sizeY(0), chr(0)
++	{
++	}
++	// true: the glyph at (at, atY) is left out (and kept as the last left out)
++	bool leaveOut(JUTFont* font, f32 at, f32 atY, int sx, int sy, int c, bool f)
++	{
++		if (!SMS3DS_PrintClip)
++			return false;
++		f32 x1 = at;  // drawChar_scale's x1 and x2
++		if (!font->isFixed() && f) {
++			JUTFont::TWidth w;
++			font->getWidthEntry(c, &w);
++			x1 = at - w.field_0x0 * ((f32)sx / font->getWidth());
++		}
++		const f32 x2 = x1 + sx;
++		if (x2 < SMS3DS_PrintClipX0 || x1 > SMS3DS_PrintClipX1) {
++			on = true, flag = f, x = at, y = atY, sizeX = sx, sizeY = sy, chr = c;
++			SMS3DS_PrintGlyphs[1]++;
++			return true;
++		}
++		on = false;
++		SMS3DS_PrintGlyphs[0]++;
++		return false;
++	}
++};
++}  // namespace
++#endif
++
+ OSMutex J2DPrint::mMutex;
+ 
+ char* J2DPrint::mStrBuff;
+@@ -287,6 +332,9 @@
+ 	bool r19 = false;
+ 	bool r18;
+ 	bool r17;
++#if defined(__3DS__)
++	PrintLeftOut leftOut;
++#endif
+ 	do {
+ 		r18 = false;
+ 		if (mFont->isLeadByte(r27)) {
+@@ -384,7 +432,15 @@
+ 				mCursorH = unk1C;
+ 				f24      = 0.0f;
+ 			} else {
+-				if (param_7) {
++				if (param_7
++#if defined(__3DS__)
++				    && !leftOut.leaveOut(mFont,
++				                         param_4 != nullptr
++				                             ? mCursorH + (f32)(s16)param_4[r21]
++				                             : mCursorH,
++				                         mCursorV, unk34, unk38, r27, r19)
++#endif
++				) {
+ 					if (param_4 != nullptr) {
+ 						mFont->drawChar_scale(mCursorH + (f32)(s16)param_4[r21],
+ 						                      mCursorV, unk34, unk38, r27, r19);
+@@ -437,6 +493,13 @@
+ 		r27 = *(param_1++);
+ 	} while (true);
+ 
++#if defined(__3DS__)
++	if (leftOut.on) {  // the last glyph left out, drawn after all for the state it leaves
++		mFont->drawChar_scale(leftOut.x, leftOut.y, leftOut.sizeX, leftOut.sizeY,
++		                      leftOut.chr, leftOut.flag);
++		SMS3DS_PrintGlyphs[1]--, SMS3DS_PrintGlyphs[0]++;
++	}
++#endif
+ 	if (param_4 != nullptr) {
+ 		param_4[r21] = 0xffff;
+ 	}
+--- a/src/GC2D/GCConsole2.cpp
++++ b/src/GC2D/GCConsole2.cpp
+@@ -4792,7 +4792,38 @@
+ 			console->unk324->hide();
+ 		}
+ 	}
++}
++
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0026, platform/3ds/prof_3ds.cpp): the news ticker's two text boxes
++// (the text and its shadow) hold the whole message and draw every glyph of it each frame, while
++// the scissor shows only the ticker's window. With SMS3DS_TelopClip set, each box's print is given
++// the window in the text's own x, widened by 16 pixels each side (J2DPrint.cpp, the same patch),
++// and leaves out the glyphs wholly outside it. The window comes from the scissor and the GX
++// projection and viewport in force, and only for an orthographic projection and an unrotated box
++// (its matrix then a translation by x); otherwise every glyph is drawn.
++extern "C" int SMS3DS_TelopClip;
++extern "C" int SMS3DS_PrintClip;
++extern "C" float SMS3DS_PrintClipX0, SMS3DS_PrintClipX1;
++static void telopClip(const J2DTextBox* box, int x, const JDrama::TRect& scissor)
++{
++	SMS3DS_PrintClip = 0;
++	if (!SMS3DS_TelopClip || box->getRotation() != 0.0f)
++		return;
++	f32 p[7], vp[6];
++	GXGetProjectionv(p);
++	GXGetViewportv(vp);
++	if (p[0] != (f32)GX_ORTHOGRAPHIC || !(p[1] > 0.0f) || !(vp[2] > 0.0f))
++		return;
++	// an x of u on the 2D plane lands on EFB x vp[0] + vp[2] * (p[1] * u + p[2] + 1) / 2
++	const f32 margin = 16.0f;
++	SMS3DS_PrintClipX0
++	    = ((scissor.x1 - margin - vp[0]) * 2.0f / vp[2] - 1.0f - p[2]) / p[1] - x;
++	SMS3DS_PrintClipX1
++	    = ((scissor.x2 + margin - vp[0]) * 2.0f / vp[2] - 1.0f - p[2]) / p[1] - x;
++	SMS3DS_PrintClip = 1;
+ }
++#endif
+ 
+ // fabricated: the flags&8 draw pass. Retail's `graph` sits below the
+ // setScissor TRect temporary, i.e. both are locals of one inlined callee.
+@@ -4836,8 +4867,17 @@
+ 		graph.setup2D();
+ 		console->unk528->show();
+ 		console->unk52C->show();
++#if defined(__3DS__)
++		telopClip(console->unk52C, console->unk534.x1 + 2, graphics->getScissor());
++#endif
+ 		console->unk52C->draw(console->unk534.x1 + 2, console->unk534.y1 + 2);
++#if defined(__3DS__)
++		telopClip(console->unk528, console->unk534.x1, graphics->getScissor());
++#endif
+ 		console->unk528->draw(console->unk534.x1, console->unk534.y1);
++#if defined(__3DS__)
++		SMS3DS_PrintClip = 0;
++#endif
+ 		console->unk528->hide();
+ 		console->unk52C->hide();
+ #ifdef TARGET_PC

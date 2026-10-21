@@ -27,10 +27,11 @@
 // alternately (A B A B A: the view drifts), then on with every correctness check this port has
 // (state blocks against their separate writes, the sea against its original vertices). It ends
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
-// (draw zones, also timed with phases only). The batch now: none (the whole-linear-heap flush left
-// out hung the GPU at a scene change: pica_draw.c), so its two halves differ only by drift.
-// Earlier runs' steps, kept as settings in the table: the state blocks compiled (sms-port patch
-// 0039) saved 1.85 ms, 0 differing; the lights' reset loading its
+// (draw zones, also timed with phases only). The batch now: the news ticker's glyphs outside its
+// window left out (decomp patch 3ds-0026, SMS3DS_TelopClip), each window showing the ticker's time
+// and its glyphs drawn and left out. Earlier runs' steps, kept as settings in the table: none in
+// one run (the whole-linear-heap flush left out hung the GPU at a scene change: pica_draw.c); the
+// state blocks compiled (sms-port patch 0039) saved 1.85 ms, 0 differing; the lights' reset loading its
 // textures once (decomp patch 3ds-0024) saved it 0.26 ms; the GX state resets as one
 // command each (sms-port patch 0038) saved 1.1 ms of resets, 0 registers differing; the sea
 // precomputed (decomp patch 3ds-0022) saved its draw 1.3 ms; compact stream buffers
@@ -95,6 +96,13 @@ int SMS3DS_WaveMode = 1;
 // The reset the lights call loads its textures once (decomp patch 3ds-0024; settings.txt
 // reset_textures_once), not twice.
 int SMS3DS_ResetTexOnce = 1;
+// The news ticker's glyphs outside its window left out (decomp patch 3ds-0026; settings.txt
+// ticker_clipped); J2DPrint's band for that (set around each of the ticker's draws) and its glyph
+// counts under a band: drawn, left out.
+int SMS3DS_TelopClip = 1;
+int SMS3DS_PrintClip;
+float SMS3DS_PrintClipX0, SMS3DS_PrintClipX1;
+unsigned long SMS3DS_PrintGlyphs[2];
 unsigned long SMS3DS_WaveChecked, SMS3DS_WaveDiffs;
 void SMS3DS_ProfSetLowTouch(int part);  // the low touch's run: 4 the game thread's steps, 5 by object
 int SMS3DS_ProfSkipOn;  // part 5: an object's drawing is being left out (SMS3DS_ProfSkip; decomp patch 3ds-0021)
@@ -608,26 +616,30 @@ double hogRate() {
 // shapes (-1 as set), compact rings (GX3DS_SetCompactRings), the sea's draw (SMS3DS_WaveMode; -1 as
 // set), the state blocks (GXPC_SetStateBlockOps; -1 as set), the lights' reset loading its textures
 // once (SMS3DS_ResetTexOnce; -1 as set), the state blocks' command compiled
-// (GXPC_SetStateBlockCompiled; -1 as set).
+// (GXPC_SetStateBlockCompiled; -1 as set), the news ticker's glyphs outside its window left out
+// (SMS3DS_TelopClip; -1 as set).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages, rings, wave, blockOps, texOnce, compiled;
+	int native, packages, rings, wave, blockOps, texOnce, compiled, telop;
 };
 enum { kGsOff1, kGsOn1, kGsOff2, kGsOn2, kGsOff3, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"this build (no batch: off)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
-    {"this build (no batch: on)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
-    {"this build (no batch: off)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
-    {"this build (no batch: on)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
-    {"this build (no batch: off)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1},
-    {"this build, every check run (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 2, 2, -1, -1},
+    {"the batch off (the ticker drawn whole)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, 0},
+    {"the batch on (the ticker clipped)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1},
+    {"the batch off (the ticker drawn whole)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, 0},
+    {"the batch on (the ticker clipped)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1},
+    {"the batch off (the ticker drawn whole)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, 0},
+    {"this build, every check run (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 2, 2, -1, -1, -1},
 };
 int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
 int s_texOnceSaved = 1;        // SMS3DS_ResetTexOnce before part 4 (put back after it)
 int s_blockOpsSaved = 1;  // GXPC_StateBlockOps before part 4 (put back after it)
+int s_telopSaved = 1;     // SMS3DS_TelopClip before part 4 (put back after it)
+unsigned long s_glyph0[2];                // SMS3DS_PrintGlyphs at the window's start
+double s_gameGlyphs[kGameStepN][2];       // the ticker's glyphs a frame: drawn, left out
 uint32_t s_check0[4];     // the checked step's counters at its start: checks, differing, blocks as commands, compiled differing
 // Each window's drawing routines (draw zones): calls and ms per frame, the timer's own cost taken
 // out.
@@ -663,6 +675,7 @@ void setGameStep(int k) {
 	GXPC_SetStateBlockOps(g && g->blockOps >= 0 ? g->blockOps : s_blockOpsSaved);
 	SMS3DS_ResetTexOnce = g && g->texOnce >= 0 ? g->texOnce : s_texOnceSaved;
 	GXPC_SetStateBlockCompiled(g && g->compiled >= 0 ? g->compiled : s_compiledSaved);
+	SMS3DS_TelopClip = g && g->telop >= 0 ? g->telop : s_telopSaved;
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -684,10 +697,13 @@ void reportGameStep(int k) {
 	for (int i = 0; i < PHASES; i++)
 		if (i != 15 && s_gamePh[k][i] >= 0.05)
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
-	char hog[96] = "";
+	char hog[192] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
-	else snprintf(hog, sizeof hog, "; HUD %.2f ms, particles %.2f, shadows %.2f, state blocks %.2f", s_gameZoneMs[k][9],
-	              s_gameZoneMs[k][6], s_gameZoneMs[k][16], s_gameZoneMs[k][26]);
+	else
+		snprintf(hog, sizeof hog,
+		         "; HUD %.2f ms (the ticker %.2f: %.0f glyphs drawn, %.0f left out a frame), particles %.2f, shadows %.2f",
+		         s_gameZoneMs[k][9], s_gameZoneMs[k][30], s_gameGlyphs[k][0], s_gameGlyphs[k][1], s_gameZoneMs[k][6],
+		         s_gameZoneMs[k][16]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -755,6 +771,7 @@ void startGame() {
 	s_blockOpsSaved = GXPC_StateBlockOps();
 	s_texOnceSaved = SMS3DS_ResetTexOnce;
 	s_compiledSaved = GXPC_StateBlockCompiled();
+	s_telopSaved = SMS3DS_TelopClip;
 	s_heapFlushSaved = pica_heap_flush();
 	s_nativeSaved = GXPC_NativeJ3DMode();
 	s_packagesSaved = GXPC_J3DPackages;
@@ -1470,6 +1487,8 @@ void SMS3DS_ProfFrame(void) {
 			s_check0[1] = GXPC_FltWrong[0] + GXPC_FltWrong[1] + GXPC_FltWrong[2];
 			s_check0[2] = GXPC_BlockOps[0];
 			s_check0[3] = GXPC_BlockCompiledBad;
+			s_glyph0[0] = SMS3DS_PrintGlyphs[0];
+			s_glyph0[1] = SMS3DS_PrintGlyphs[1];
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
 			s_verify0[2] = GX3DS_J3DSigBad();
@@ -1487,6 +1506,7 @@ void SMS3DS_ProfFrame(void) {
 			s_gameRender[k] = double(th[1] - s_thread0[1]) / kFrames / kTicksPerMs;
 			GX3DS_RingStats(s_gameRing[k]);
 			s_gameSea[k] = double(s_zoneTicks[7]) / kFrames / kTicksPerMs;
+			for (int i = 0; i < 2; i++) s_gameGlyphs[k][i] = double(SMS3DS_PrintGlyphs[i] - s_glyph0[i]) / kFrames;
 			{
 				const double tick = tickCostMs();
 				for (int z = 0; z < kZones; z++) {
