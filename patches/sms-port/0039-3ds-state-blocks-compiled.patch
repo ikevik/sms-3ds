@@ -1,0 +1,250 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <math.h>
+ #include <string.h>
++#include <algorithm>
+ #include <stddef.h>
+ 
+ #include "port_fpu.h"  // port_cvt_fp2unsigned: MWCC's __cvt_fp2unsigned, as the SDK converts
+@@ -401,6 +402,7 @@
+ // call or a command of the stream's own is caught (the pipe is redirected meanwhile) and the block
+ // is left to run fn every time. Circle pad up at launch: off (GXPC_SetStateBlocks).
+ namespace {
++struct SbCompiled;
+ struct SbEntry {
+     uint8_t kind;    // 0 BP, 1 CP, 2 XF, 3 another API field (not sent)
+     uint16_t reg;    // BP/CP register, XF address
+@@ -415,6 +417,7 @@
+     SbEntry* e;
+     uint16_t id, nSend;  // as one command (sbSendOp): its id, its BP, CP and XF entries
+     bool defined;        // its kStreamOpBlockDef sent
++    SbCompiled* compiled;  // sbSendCompiled's form of it (made at its first use)
+ };
+ const uint32_t kSbVerify = 256;
+ const uint32_t kSbMaxTouch = 1024;
+@@ -613,6 +616,28 @@
+         }
+         j++;
+     }
++}
++
++// Draw zones (profile runs, platform/3ds/prof_3ds.cpp): 26 the state blocks in all, then the
++// parts of either command, 27 working the values out, 28 the API's copy and the filter, 29 the
++// command itself.
++extern "C" int SMS3DS_ProfOn;
++extern "C" int SMS3DS_ZoneBegin(int zone);
++extern "C" void SMS3DS_ZoneEnd(int zone, int token);
++namespace {
++struct SbZoneHook {
++    int zone, token;
++    explicit SbZoneHook(int z) : zone(z), token(SMS3DS_ProfOn ? SMS3DS_ZoneBegin(z) : -1) {}
++    void end() {
++        if (token >= 0) SMS3DS_ZoneEnd(zone, token);
++        token = -1;
++    }
++    ~SbZoneHook() { end(); }
++};
++}  // namespace
++static void sbFinalsZoned(const SbBlock* b, uint32_t* fin) {
++    SbZoneHook z(27);
++    sbFinals(b, fin);
+ }
+ 
+ // 3DS port: a block as one stream command (GXPC_SetStateBlockOps; settings.txt gx_state_block_ops).
+@@ -645,9 +670,10 @@
+         b->defined = true;
+     }
+     uint32_t fin[kSbMaxTouch + 64];
+-    sbFinals(b, fin);
++    sbFinalsZoned(b, fin);
+     a[0] = uint8_t(b->id >> 8), a[1] = uint8_t(b->id), a[2] = uint8_t(b->nSend >> 8), a[3] = uint8_t(b->nSend);
+     uint8_t* v = a + 4;
++    SbZoneHook z28(28);
+     for (uint32_t j = 0; j < b->n; j++) {
+         const SbEntry& x = b->e[j];
+         const uint32_t f = fin[j];
+@@ -681,7 +707,11 @@
+         default: *sbWordPtr(x.word) = f; break;
+         }
+     }
+-    GXPC_StreamOp(kStreamOpBlock, a, uint32_t(v - a));
++    z28.end();
++    {
++        SbZoneHook z29(29);
++        GXPC_StreamOp(kStreamOpBlock, a, uint32_t(v - a));
++    }
+     if (s_sbOps == 2) {  // check: each register as the GX thread now holds it
+         for (uint32_t j = 0; j < b->n; j++) {
+             const SbEntry& x = b->e[j];
+@@ -699,11 +729,159 @@
+     return true;
+ }
+ 
++// 3DS port: a block's command, compiled once (GXPC_SetStateBlockCompiled; settings.txt
++// gx_state_block_compiled). sbSendOp still works every entry out from the API's copy and records
++// each register in the write filter: 0.2 us an entry, ~70 us a block of 344 on Delfino Plaza, most
++// of it misses on the API's copy (XF memory alone is 16 KB) and the filter's arrays (17 KB each
++// for XF), as the entries come in the order fn first wrote them. Compiled, the entries are sorted
++// by their word in the API's copy, those sent first; an entry fn sets in full (its mask every bit,
++// as for nearly all) has its value worked out once, so only the others read the API's copy; the
++// copy is then written in runs of consecutive words; and the filter forgets the kinds of register
++// the block writes (one step each, as a display-list call makes it forget everything) instead of
++// recording each. The command carries the values in that order, under an id of the compiled form's
++// own (its register list given in that order too). The registers, the API's copy and the GX thread
++// end as with sbSendOp; the filter only knows less, so a later write it would have left out is
++// sent (and changes nothing on the GX thread).
++// Draw zones 26-29 (profile runs, platform/3ds/prof_3ds.cpp) time the blocks in all and the parts
++// of either command: working the values out, the API's copy and the filter, the command.
++namespace {
++struct SbVar {
++    uint32_t pos, word, mask, value;  // vals[pos] = (API word & ~mask) | value
++};
++struct SbRun {
++    uint32_t word, count, pos;  // the API's words [word, word + count) take vals[pos..]
++};
++struct SbCompiled {
++    uint32_t n = 0, nSend = 0;
++    std::vector<uint8_t> kind;
++    std::vector<uint16_t> reg;
++    std::vector<uint16_t> entry;                        // each sorted position's entry (check mode)
++    std::vector<uint32_t> vals;                         // constants filled in once
++    std::vector<SbVar> var;                             // the entries that keep bits of the state before
++    std::vector<std::pair<uint32_t, uint32_t>> links;   // (pos, target pos): takes the target's value, worked out after
++    std::vector<SbRun> runs;
++    uint8_t forget = 0;  // apiForget kinds
++    uint16_t id = 0;
++    bool defined = false;
++};
++}  // namespace
++static int s_sbCompiled = 1;
++extern "C" uint32_t GXPC_BlockCompiledBad;  // check mode: compiled values or API words unlike sbFinals'
++uint32_t GXPC_BlockCompiledBad;
++static SbCompiled* sbCompile(const SbBlock* b) {
++    SbCompiled* c = new SbCompiled;
++    c->id = s_sbNextId++;
++    std::vector<uint32_t> order(b->n);  // sorted position -> entry
++    for (uint32_t j = 0; j < b->n; j++) order[j] = j;
++    std::sort(order.begin(), order.end(), [b](uint32_t x, uint32_t y) {
++        const bool sx = b->e[x].kind != 3, sy = b->e[y].kind != 3;
++        if (sx != sy) return sx;
++        return b->e[x].word < b->e[y].word;
++    });
++    std::vector<uint32_t> posOf(b->n);
++    for (uint32_t p = 0; p < b->n; p++) posOf[order[p]] = p;
++    c->n = b->n;
++    c->kind.resize(b->n);
++    c->reg.resize(b->n);
++    c->entry.resize(b->n);
++    c->vals.assign(b->n, 0);
++    std::vector<uint8_t> isConst(b->n, 0);
++    for (uint32_t p = 0; p < b->n; p++) {
++        const SbEntry& x = b->e[order[p]];
++        c->kind[p] = x.kind;
++        c->reg[p] = x.reg;
++        c->entry[p] = uint16_t(order[p]);
++        if (x.kind != 3) c->nSend = p + 1;
++        if (x.kind == 0) c->forget |= 1;
++        else if (x.kind == 1) c->forget |= 2;
++        else if (x.kind == 2) c->forget |= 4;
++        if (x.link >= 0) continue;
++        if (x.mask == 0xFFFFFFFFu) {
++            c->vals[p] = x.value;
++            isConst[p] = 1;
++        } else {
++            c->var.push_back(SbVar{p, x.word, x.mask, x.value});
++        }
++    }
++    for (uint32_t p = 0; p < b->n; p++) {
++        const SbEntry& x = b->e[order[p]];
++        if (x.link < 0) continue;
++        const uint32_t t = posOf[uint32_t(x.link)];  // (a link never points at a linked entry: sbDerive)
++        if (isConst[t]) c->vals[p] = c->vals[t];
++        else c->links.push_back({p, t});
++    }
++    for (uint32_t p = 0; p < b->n;) {  // runs of consecutive words, not across the TLUT memory left out
++        const uint32_t w = b->e[order[p]].word;
++        uint32_t k = 1;
++        while (p + k < b->n && b->e[order[p + k]].word == w + k && !(w < kSbTlutLo && w + k >= kSbTlutLo)) k++;
++        c->runs.push_back(SbRun{w, k, p});
++        p += k;
++    }
++    return c;
++}
++static bool sbSendCompiled(SbBlock* b) {
++    if (!s_sbOps || !g_gxStream || s_recording || getPipeRedirect() || s_mute || s_fltMaskNext || !b->nSend) return false;
++    if (!b->compiled) b->compiled = sbCompile(b);
++    SbCompiled* c = b->compiled;
++    const uint16_t id = c->id;
++    static uint8_t a[4 + 3 * (kSbMaxTouch + 64)];
++    if (!c->defined) {
++        uint32_t k = 4;
++        a[0] = uint8_t(id >> 8), a[1] = uint8_t(id), a[2] = uint8_t(c->nSend >> 8), a[3] = uint8_t(c->nSend);
++        for (uint32_t p = 0; p < c->nSend; p++) {
++            a[k++] = c->kind[p];
++            a[k++] = uint8_t(c->reg[p] >> 8);
++            a[k++] = uint8_t(c->reg[p]);
++        }
++        GXPC_StreamOp(kStreamOpBlockDef, a, k);
++        c->defined = true;
++    }
++    uint32_t* v = c->vals.data();
++    static uint32_t ref[kSbMaxTouch + 64];  // check mode: the values as sbFinals works them out
++    if (s_sbOps == 2) sbFinals(b, ref);
++    {
++        SbZoneHook z(27);
++        for (const SbVar& x : c->var) v[x.pos] = (*sbWordPtr(x.word) & ~x.mask) | x.value;
++        for (const auto& l : c->links) v[l.first] = v[l.second];
++    }
++    {
++        SbZoneHook z(28);
++        for (const SbRun& r : c->runs) memcpy(sbWordPtr(r.word), v + r.pos, size_t(r.count) * 4);
++        apiForget(c->forget);
++    }
++    {
++        SbZoneHook z(29);
++        const uint8_t h[4] = {uint8_t(id >> 8), uint8_t(id), uint8_t(c->nSend >> 8), uint8_t(c->nSend)};
++        GXPC_StreamOp(kStreamOpBlock, h, 4);
++        GXPC_StreamBytes(v, c->nSend * 4);
++    }
++    if (s_sbOps == 2) {  // check: the values and the API's copy as sbFinals has them; each register as the GX thread now holds it
++        for (uint32_t p = 0; p < c->n; p++) {
++            const uint32_t j = c->entry[p];
++            if (v[p] != ref[j] || *sbWordPtr(b->e[j].word) != ref[j]) GXPC_BlockCompiledBad++;
++        }
++        for (uint32_t p = 0; p < c->nSend; p++) {
++            uint32_t f = v[p];
++            if (c->kind[p] == 0) {
++                f &= 0xFFFFFF;
++                const uint32_t r = c->reg[p];
++                const uint32_t i = (r >= BP_TEV_REG && r < BP_TEV_REG + 8 && (f & 0x800000)) ? 256 + (r & 7) : r;
++                fltCheckOp(0, i, &f, 1);
++            } else {
++                fltCheckOp(c->kind[p], c->reg[p], &f, 1);
++            }
++        }
++    }
++    return true;
++}
++
+ extern "C" {
+ uint32_t GXPC_StateBlockCalls[3];  // fast, checked against fn, fn only
+ void GXPC_SetStateBlocks(int on) { s_sbOn = on != 0; }
+ void GXPC_SetStateBlockOps(int mode) { s_sbOps = mode; }
+ int GXPC_StateBlockOps(void) { return s_sbOps; }
++void GXPC_SetStateBlockCompiled(int on) { s_sbCompiled = on != 0; }
++int GXPC_StateBlockCompiled(void) { return s_sbCompiled; }
+ void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name) {
+     SbBlock* b = static_cast<SbBlock*>(*slot);
+     const bool usable = s_sbOn && g_gxStream && !s_recording && !getPipeRedirect();
+@@ -724,7 +902,8 @@
+     }
+     if (b->state == 2) {
+         GXPC_StateBlockCalls[0]++;
+-        if (!sbSendOp(b)) sbApply(b);
++        SbZoneHook z(26);
++        if (!(s_sbCompiled ? sbSendCompiled(b) : sbSendOp(b))) sbApply(b);
+         return;
+     }
+     // Checking: fn runs as before; the state it leaves must be the prediction, and nothing else changed.

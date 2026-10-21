@@ -305,6 +305,10 @@ static const char kDefaultSettings[] =
     "# its separate register writes (off). The same registers either way.\n"
     "gx_state_block_ops = on\n"
     "\n"
+    "# That command compiled once per block, its values in the order the API keeps them (on), or\n"
+    "# worked out entry by entry each time (off). The same registers either way.\n"
+    "gx_state_block_compiled = on\n"
+    "\n"
     "# The reset the lights call loads its 8 null textures once (on), or twice as the original (off):\n"
     "# the second set rewrites every register the first set wrote, with the same values.\n"
     "reset_textures_once = on\n"
@@ -363,6 +367,7 @@ extern "C" int GXPC_J3DPackages;  // patch 0037: native shapes from compiled blo
 extern "C" int SMS3DS_WaveMode;    // decomp patch 3ds-0022: the sea precomputed (settings.txt sea_precomputed)
 extern "C" void GXPC_SetStateBlockOps(int mode);  // patch 0038: state resets as one command (gx_state_block_ops)
 extern "C" int SMS3DS_ResetTexOnce;  // decomp patch 3ds-0024: the lights' reset loads its textures once
+extern "C" void GXPC_SetStateBlockCompiled(int on);  // patch 0039 (gx_state_block_compiled)
 extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt profile_low_touch)
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
@@ -488,6 +493,7 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "sea_precomputed", v, sizeof v)) SMS3DS_WaveMode = strcmp(v, "off") != 0;
 		if (setting_value(kSettingsPath, "gx_state_block_ops", v, sizeof v)) GXPC_SetStateBlockOps(strcmp(v, "off") != 0);
 		if (setting_value(kSettingsPath, "reset_textures_once", v, sizeof v)) SMS3DS_ResetTexOnce = strcmp(v, "off") != 0;
+		if (setting_value(kSettingsPath, "gx_state_block_compiled", v, sizeof v)) GXPC_SetStateBlockCompiled(strcmp(v, "off") != 0);
 		fprintf(stderr, "[3ds] the sea: %s (sea_precomputed)\n", SMS3DS_WaveMode ? "worked out once per column and row" : "vertex by vertex");
 		if (setting_value(kSettingsPath, "profile_low_touch", v, sizeof v))
 			SMS3DS_ProfSetLowTouch(strcmp(v, "objects") == 0 ? 5 : 4);

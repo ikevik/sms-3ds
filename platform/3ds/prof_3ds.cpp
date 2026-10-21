@@ -23,11 +23,13 @@
 // each big drawing object's drawing left out in turn (below, kSkipTargets).
 // Part 4, the game thread (kGameSteps, after part 3): its time by phase for kFrames frames in each step, with only the phases timed (object
 // timing costs the game thread some 10 ms a frame, far more than its estimate). The steps (a table,
-// kGameSteps): the reset the lights call (SMS3DS_ReInitAndDrawInit) loading its textures twice, as
-// before, and once (decomp patch 3ds-0024, SMS3DS_ResetTexOnce), alternately (A B A B A: the view
-// drifts). Each reports the game thread's work by phase, that reset and its parts (draw zones 8 and
-// 22-25, also timed with phases only), the GX and render threads' busy time; the drawing routines'
-// table follows. Earlier runs' steps, kept as settings in the table: the GX state resets as one
+// kGameSteps): the state blocks' command worked out entry by entry (sms-port patch 0038) and
+// compiled (patch 0039, GXPC_SetStateBlockCompiled), alternately (A B A B A: the view drifts), then
+// compiled with every register checked on the GX thread afterwards. Each reports the game thread's
+// work by phase, the state blocks and their parts (draw zones 26-29, also timed with phases only),
+// the GX and render threads' busy time; the drawing routines' table follows. Earlier runs' steps,
+// kept as settings in the table: the lights' reset loading its textures once (decomp patch
+// 3ds-0024) saved it 0.26 ms; the GX state resets as one
 // command each (sms-port patch 0038) saved 1.1 ms of resets, 0 registers differing; the sea
 // precomputed (decomp patch 3ds-0022) saved its draw 1.3 ms; compact stream buffers
 // and render queue (GX3DS_SetCompactRings) changed nothing beyond drift; native J3D off, on through stage 1's path,
@@ -76,8 +78,11 @@ void GX3DS_SetCompactRings(int mask);  // ... the stream's buffers (1) and the r
 void GX3DS_RingStats(uint32_t out[2]);  // ... since the last call: stream buffers taken, queue bytes reached
 void GXPC_SetStateBlockOps(int mode);  // gx_api.cpp: GX state resets as one command (0 writes, 1, 2 checked)
 int GXPC_StateBlockOps(void);
+void GXPC_SetStateBlockCompiled(int on);  // ... that command compiled (patch 0039)
+int GXPC_StateBlockCompiled(void);
 extern uint32_t GXPC_FltChecks[3], GXPC_FltWrong[3];  // gx_fifo.cpp: registers checked on the GX thread, differing
 extern uint32_t GXPC_BlockOps[2];                     // ... state blocks written as one command, with a mask pending
+extern uint32_t GXPC_BlockCompiledBad;                // gx_api.cpp: compiled blocks unlike the entry-by-entry values
 uint32_t GX3DS_J3DSigBad(void);    // ... native J3D's verify mode: differences found so far
 extern uint32_t GXPC_J3DStats[16], GXPC_J3DPkgStats[4];  // gx_fifo.cpp: native J3D's counters
 int SMS3DS_ProfOn;
@@ -183,9 +188,10 @@ int s_phase;
 uint64_t s_calls;
 
 // Drawing routines timed in profile runs (decomp patches 3ds-0016; from 9 on 3ds-0023, the HUD
-// and the shadows; from 22 on 3ds-0024, the parts of the reset the lights call), nested ones included: calls, ticks, GX stream bytes. The open ones are a
+// and the shadows; from 22 on 3ds-0024, the parts of the reset the lights call; from 26 on
+// sms-port patch 0039, the state blocks and their commands' parts), nested ones included: calls, ticks, GX stream bytes. The open ones are a
 // stack (they nest, on the game thread).
-enum { kZones = 26 };
+enum { kZones = 30 };
 const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
                                        "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
                                        "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit",
@@ -195,7 +201,8 @@ const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys
                                        "shadows: drawShadowVolume", "shadows: calcVtx", "SMS_DrawShape", "SMS_DrawCube",
                                        "SMS_SettingDrawShape", "reset: ReInitializeGX's texture loads",
                                        "reset: J3DSys::reinitTexture", "reset: its state block",
-                                       "reset: texture cache regions"};
+                                       "reset: texture cache regions", "state blocks (all)", "block: values worked out",
+                                       "block: API copy and filter", "block: the command"};
 uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
 uint32_t s_zoneCalls[kZones];
 struct ZoneOpen {
@@ -593,24 +600,27 @@ double hogRate() {
 // hog's buffer (0: none), native J3D (-1 as the settings set it, 0 off, 1 on, 3 verify), compiled
 // shapes (-1 as set), compact rings (GX3DS_SetCompactRings), the sea's draw (SMS3DS_WaveMode; -1 as
 // set), the state blocks (GXPC_SetStateBlockOps; -1 as set), the lights' reset loading its textures
-// once (SMS3DS_ResetTexOnce; -1 as set).
+// once (SMS3DS_ResetTexOnce; -1 as set), the state blocks' command compiled
+// (GXPC_SetStateBlockCompiled; -1 as set).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages, rings, wave, blockOps, texOnce;
+	int native, packages, rings, wave, blockOps, texOnce, compiled;
 };
-enum { kGsTwice1, kGsOnce1, kGsTwice2, kGsOnce2, kGsTwice3, kGameStepN };
+enum { kGsEntry1, kGsComp1, kGsEntry2, kGsComp2, kGsEntry3, kGsCompChecked, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"the lights' reset loading its textures twice", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, 0},
-    {"the lights' reset loading its textures once", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, 1},
-    {"the lights' reset loading its textures twice", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, 0},
-    {"the lights' reset loading its textures once", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, 1},
-    {"the lights' reset loading its textures twice", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, 0},
+    {"state blocks entry by entry", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 0},
+    {"state blocks compiled", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 1},
+    {"state blocks entry by entry", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 0},
+    {"state blocks compiled", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 1},
+    {"state blocks entry by entry", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 1, -1, 0},
+    {"state blocks compiled, every register checked (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, 2, -1, 1},
 };
+int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
 int s_texOnceSaved = 1;        // SMS3DS_ResetTexOnce before part 4 (put back after it)
 int s_blockOpsSaved = 1;  // GXPC_StateBlockOps before part 4 (put back after it)
-uint32_t s_check0[3];     // the checked step's counters at its start: checks, differing, blocks as commands
+uint32_t s_check0[4];     // the checked step's counters at its start: checks, differing, blocks as commands, compiled differing
 // Each window's drawing routines (draw zones): calls and ms per frame, the timer's own cost taken
 // out.
 double s_gameZoneMs[kGameStepN][kZones], s_gameZoneCalls[kGameStepN][kZones];
@@ -644,6 +654,7 @@ void setGameStep(int k) {
 	SMS3DS_WaveMode = g && g->wave >= 0 ? g->wave : s_waveSaved;
 	GXPC_SetStateBlockOps(g && g->blockOps >= 0 ? g->blockOps : s_blockOpsSaved);
 	SMS3DS_ResetTexOnce = g && g->texOnce >= 0 ? g->texOnce : s_texOnceSaved;
+	GXPC_SetStateBlockCompiled(g && g->compiled >= 0 ? g->compiled : s_compiledSaved);
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -667,8 +678,8 @@ void reportGameStep(int k) {
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
 	char hog[96] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
-	else snprintf(hog, sizeof hog, "; the lights' reset %.2f ms (textures %.2f + %.2f, block %.2f, cache regions %.2f)",
-	              s_gameZoneMs[k][8], s_gameZoneMs[k][22], s_gameZoneMs[k][23], s_gameZoneMs[k][24], s_gameZoneMs[k][25]);
+	else snprintf(hog, sizeof hog, "; state blocks %.2f ms (values %.2f, API copy %.2f, command %.2f)", s_gameZoneMs[k][26],
+	              s_gameZoneMs[k][27], s_gameZoneMs[k][28], s_gameZoneMs[k][29]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -685,27 +696,27 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	// Twice: steps 0, 2, 4; once: 1, 3.
+	// Entry by entry: steps 0, 2, 4; compiled: 1, 3 (the checked step is not timed).
 	auto ab = [](const double* v, double& w, double& o) {
-		w = (v[kGsTwice1] + v[kGsTwice2] + v[kGsTwice3]) / 3;
-		o = (v[kGsOnce1] + v[kGsOnce2]) / 2;
+		w = (v[kGsEntry1] + v[kGsEntry2] + v[kGsEntry3]) / 3;
+		o = (v[kGsComp1] + v[kGsComp2]) / 2;
 	};
-	double works[kGameStepN], resets[kGameStepN], loads[kGameStepN];
+	double works[kGameStepN], blocks[kGameStepN], resets[kGameStepN];
 	for (int k = 0; k < kGameStepN; k++) {
 		works[k] = gameWork(k);
-		resets[k] = s_gameZoneMs[k][8];
-		loads[k] = s_gameZoneMs[k][22] + s_gameZoneMs[k][23];
+		blocks[k] = s_gameZoneMs[k][26];
+		resets[k] = s_gameZoneMs[k][0] + s_gameZoneMs[k][1] + s_gameZoneMs[k][8];
 	}
-	double rw, ro, lw, lo, ww, wo, gw, go, fw, fo;
+	double bw, bo, rw, ro, ww, wo, gw, go, fw, fo;
+	ab(blocks, bw, bo);
 	ab(resets, rw, ro);
-	ab(loads, lw, lo);
 	ab(works, ww, wo);
 	ab(s_gameGx, gw, go);
 	ab(s_gameFrame, fw, fo);
 	fprintf(stderr,
-	        "[prof] the lights' reset, textures loaded twice (3 windows) -> once (2), ms/frame: the reset %.2f -> %.2f | its "
-	        "texture loads %.2f -> %.2f | game thread's work %.1f -> %.1f | GX thread %.1f -> %.1f | frame %.1f -> %.1f\n",
-	        rw, ro, lw, lo, ww, wo, gw, go, fw, fo);
+	        "[prof] state blocks, entry by entry (3 windows) -> compiled (2), ms/frame: the blocks %.2f -> %.2f | the resets "
+	        "in all %.2f -> %.2f | game thread's work %.1f -> %.1f | GX thread %.1f -> %.1f | frame %.1f -> %.1f\n",
+	        bw, bo, rw, ro, ww, wo, gw, go, fw, fo);
 	// The drawing routines, averaged over the windows (each window's figure in brackets): nested
 	// ones are inside their callers' (the HUD's J2D screen inside the HUD's draw, setup2D, pictures,
 	// text and pane matrices inside both; shadow volumes and SMS_DrawShape inside drawShadow).
@@ -733,6 +744,7 @@ void startGame() {
 	s_waveSaved = SMS3DS_WaveMode;
 	s_blockOpsSaved = GXPC_StateBlockOps();
 	s_texOnceSaved = SMS3DS_ResetTexOnce;
+	s_compiledSaved = GXPC_StateBlockCompiled();
 	s_nativeSaved = GXPC_NativeJ3DMode();
 	s_packagesSaved = GXPC_J3DPackages;
 	s_gameStep = 0;
@@ -1446,6 +1458,7 @@ void SMS3DS_ProfFrame(void) {
 			s_check0[0] = GXPC_FltChecks[0] + GXPC_FltChecks[1] + GXPC_FltChecks[2];
 			s_check0[1] = GXPC_FltWrong[0] + GXPC_FltWrong[1] + GXPC_FltWrong[2];
 			s_check0[2] = GXPC_BlockOps[0];
+			s_check0[3] = GXPC_BlockCompiledBad;
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
 			s_verify0[2] = GX3DS_J3DSigBad();
@@ -1474,12 +1487,13 @@ void SMS3DS_ProfFrame(void) {
 			reportGameStep(k);
 			if (kGameSteps[k].blockOps == 2)
 				fprintf(stderr,
-				        "[prof] state resets as one command, checked: %lu blocks, %lu registers compared on the GX thread "
-				        "afterwards, %lu differing (blocks written with a BP mask pending so far: %lu)\n",
+				        "[prof] state blocks, checked: %lu blocks, %lu registers compared on the GX thread "
+				        "afterwards, %lu differing; values and API words unlike the entry-by-entry ones: %lu (blocks "
+				        "written with a BP mask pending so far: %lu)\n",
 				        (unsigned long)(GXPC_BlockOps[0] - s_check0[2]),
 				        (unsigned long)(GXPC_FltChecks[0] + GXPC_FltChecks[1] + GXPC_FltChecks[2] - s_check0[0]),
 				        (unsigned long)(GXPC_FltWrong[0] + GXPC_FltWrong[1] + GXPC_FltWrong[2] - s_check0[1]),
-				        (unsigned long)GXPC_BlockOps[1]);
+				        (unsigned long)(GXPC_BlockCompiledBad - s_check0[3]), (unsigned long)GXPC_BlockOps[1]);
 			if (kGameSteps[k].wave == 2)
 				fprintf(stderr, "[prof] the sea precomputed, checked: %lu vertices compared with the original's, %lu differing\n",
 				        (unsigned long)(uint32_t(SMS3DS_WaveChecked) - s_wave0[0]),
