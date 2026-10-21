@@ -331,6 +331,7 @@ static uint64_t s_perfEnd0[PICA_END_COUNT];
 static bool streamOn();
 static void streamPerf(uint64_t& gameWait, double perMs, bool print);
 
+static void texInventory(double frames);  // [perf]: textures drawn from outside VRAM (below)
 static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
 	if (!s_perfWindowStart) {
@@ -591,6 +592,7 @@ static void perfFrameEnd() {
 			        unsigned(vN), unsigned(vKB), unsigned(lN), unsigned(lKB), unsigned(vFree), (unsigned long)pica_vram_copies(),
 			        (unsigned long)pica_vram_evicted(), (unsigned long)pica_vram_animated(), unsigned(aUsed), unsigned(aSize),
 			        unsigned(aPeak));
+			texInventory(frames);
 		}
 		renderThreadPerf(frames);
 		static uint64_t sb0, sd0, sc0;
@@ -865,6 +867,7 @@ struct TexEntry {
 	uint32_t checkedFrame = ~0u, usedFrame = 0;
 	uint32_t hashedFrame = 0, hashedClock = 0;  // when the data was last hashed (write-stamp clock)
 	int levels = 1;                              // mip levels uploaded
+	uint32_t draws = 0, draws0 = 0;              // draws that sampled it, so far and at the last report
 };
 static std::unordered_map<TexKey, TexEntry, TexKeyHash> s_texCache;
 static uint32_t s_texBytes;
@@ -993,6 +996,53 @@ static int smallTexFormat(const uint8_t* px, size_t n, uint32_t fmt, uint32_t tl
 	return PICA_TF_RGBA8;
 }
 
+// [perf]: the textures drawn in the window that are not in VRAM, by texel format and mip levels,
+// and the ones drawn most (draws a frame, with their size): which ones a VRAM copy would help.
+// Render thread (perfFrameEnd).
+static void texInventory(double frames) {
+	static const char* const kFmt[] = {"RGBA8", "RGB565", "RGBA5551", "RGBA4", "LA8", "L8"};
+	struct Row {
+		uint32_t w, h, kb, gxFmt;
+		int fmt, levels, where;
+		double draws;
+	};
+	std::vector<Row> rows;
+	double kb[6][2] = {}, n[6][2] = {}, kept = 0, keptKB = 0;
+	for (auto& kv : s_texCache) {
+		TexEntry& e = kv.second;
+		const uint32_t d = e.draws - e.draws0;
+		e.draws0 = e.draws;
+		if (!e.tex || !d) continue;
+		const int where = pica_tex_where(e.tex);
+		if (where == 1) continue;
+		const int f = pica_tex_format(e.tex);
+		const uint32_t k = pica_tex_bytes(e.tex) >> 10;
+		if (where == 2) {
+			kept++;
+			keptKB += k;
+		}
+		kb[f][e.levels > 1] += k;
+		n[f][e.levels > 1]++;
+		rows.push_back(Row{kv.first.w, kv.first.h, k, kv.first.fmt, f, e.levels, where, d / frames});
+	}
+	char line[600];
+	int at = 0;
+	for (int f = 0; f < 6; f++)
+		for (int m = 0; m < 2; m++)
+			if (n[f][m])
+				at += snprintf(line + at, sizeof line - at, "%s %s%s %.0f (%.0f KB)", at ? "," : "", kFmt[f],
+				               m ? " mipmapped" : "", n[f][m], kb[f][m]);
+	fprintf(stderr, "[perf]   textures drawn from outside VRAM:%s | %.0f of them (%.0f KB) kept out (rewritten often)\n",
+	        at ? line : " none", kept, keptKB);
+	std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.draws * a.kb > b.draws * b.kb; });
+	at = 0;
+	for (size_t i = 0; i < rows.size() && i < 14; i++)
+		at += snprintf(line + at, sizeof line - at, "%s %ux%u GX%u->%s%s %u KB %.1f/frame%s", i ? " |" : "", unsigned(rows[i].w),
+		               unsigned(rows[i].h), unsigned(rows[i].gxFmt), kFmt[rows[i].fmt],
+		               rows[i].levels > 1 ? " mip" : "", unsigned(rows[i].kb), rows[i].draws, rows[i].where == 2 ? " kept" : "");
+	if (at) fprintf(stderr, "[perf]   outside VRAM, most drawn (draws a frame x size):%s\n", line);
+}
+
 // The PICA texture for GX texture map `map`, or null (no data, out of memory). *copy is set
 // when the map is an EFB copy.
 static PicaTex* textureForMap(int map, const EfbCopy** copy) {
@@ -1038,6 +1088,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 
 	TexEntry& e = s_texCache[key];
 	e.usedFrame = s_rFrames;
+	e.draws++;
 	if (e.tex && e.checkedFrame == s_rFrames) return e.tex;
 	const uint32_t bytes = texLevelBytes(fmt, w, h);
 	// As sms-pc-port's cache: when no write stamp (GXPC_InvalidateRange below) touched the data
@@ -1076,25 +1127,37 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		for (uint32_t i = 0; i < bytes && blank; i++) blank = ptr[i] == 0;
 		if (blank || (s_mipsOn && mipLevels >= 3 && w * h <= 128u * 256u)) levels = mipLevels;
 	}
-	// Single-level textures are decoded first, to pick the texel format from what they hold.
+	// Decoded first (every level of a mipmapped one, one after another in s_decodeBuf), to pick the
+	// texel format from what they hold: the smallest that holds every texel as the RGBA8 decode
+	// (smallTexFormat), for the mip levels as for a single one.
 	const uint8_t* src = nullptr;
 	int tf = PICA_TF_RGBA8;
+	size_t levelOff[16] = {0};
 	if (!la8) {
-		s_decodeBuf.resize(size_t(w) * h * 4);
-		decodeTexture(ptr, fmt, w, h, tlut, key.tlutFmt, s_decodeBuf.data());
+		size_t total = 0;
+		for (int l = 0; l < levels; l++) {
+			levelOff[l] = total;
+			total += size_t(w >> l) * (h >> l) * 4;
+		}
+		s_decodeBuf.resize(total);
+		const uint8_t* lp = ptr;
+		for (int l = 0; l < levels; l++) {
+			if (l) lp += texLevelBytes(fmt, w >> (l - 1), h >> (l - 1));
+			decodeTexture(lp, fmt, w >> l, h >> l, tlut, key.tlutFmt, s_decodeBuf.data() + levelOff[l]);
+		}
 		src = s_decodeBuf.data();
-		if (levels == 1) tf = smallTexFormat(src, size_t(w) * h, fmt, key.tlutFmt);
+		tf = smallTexFormat(src, total / 4, fmt, key.tlutFmt);
 	} else {
 		tf = PICA_TF_LA8;
 	}
-	if (e.tex && (e.levels != levels || (levels == 1 && pica_tex_format(e.tex) != tf))) {
+	if (e.tex && (e.levels != levels || pica_tex_format(e.tex) != tf)) {
 		s_texBytes -= pica_tex_bytes(e.tex);
 		pica_tex_free(e.tex);
 		e.tex = nullptr;
 	}
 	if (!e.tex) {
 		e.levels = levels;
-		e.tex = levels > 1 ? pica_tex_create_mip(pw, ph, levels, 0.f)
+		e.tex = levels > 1 ? pica_tex_create_mip(pw, ph, levels, 0.f, tf)
 		        : la8      ? pica_tex_create_la8(pw, ph)
 		                   : pica_tex_create_fmt(pw, ph, tf);
 		if (!e.tex) {
@@ -1130,13 +1193,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	}
 	if (levels > 1) {
 		pica_tex_upload_level(e.tex, 0, src);
-		const uint8_t* lp = ptr;
-		for (int l = 1; l < levels; l++) {
-			lp += texLevelBytes(fmt, w >> (l - 1), h >> (l - 1));
-			s_decodeBuf.resize(size_t(w >> l) * (h >> l) * 4);
-			decodeTexture(lp, fmt, w >> l, h >> l, tlut, key.tlutFmt, s_decodeBuf.data());
-			pica_tex_upload_level(e.tex, l, s_decodeBuf.data());
-		}
+		for (int l = 1; l < levels; l++) pica_tex_upload_level(e.tex, l, s_decodeBuf.data() + levelOff[l]);
 	} else {
 		pica_tex_upload(e.tex, src);
 	}

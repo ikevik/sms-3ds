@@ -112,7 +112,9 @@ static LightLock s_linLock = 1; /* 1: unlocked */
  * Made from VRAM at large, a copy texture could find it free but split into smaller pieces by
  * texture copies (vram_try), and one that gets no VRAM leaves the game sampling raw memory at
  * its address (noise on screen). */
-#define COPY_ARENA_BYTES (2u << 20)
+/* 1.25 MB: Delfino Plaza's copies peak at 772 KB; a copy that finds no room in the arena gets
+ * VRAM of its own, made by evicting texture copies if needed (pica_copy_tex_create). */
+#define COPY_ARENA_BYTES (1280u << 10)
 #define COPY_UNIT 4096u
 #define COPY_UNITS (COPY_ARENA_BYTES / COPY_UNIT)
 static uint8_t* s_copyArena;
@@ -589,16 +591,19 @@ void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
 	tex_flush(t);
 }
 
-PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias)
+PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias, int fmt)
 {
+	static const GPU_TEXCOLOR kGpu[] = {GPU_RGBA8, GPU_RGB565, GPU_RGBA5551, GPU_RGBA4, GPU_LA8, GPU_L8};
 	if (!pica_init() || levels < 1) return NULL;
+	if (fmt < 0 || fmt > PICA_TF_L8) fmt = PICA_TF_RGBA8;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
 	if (!t) return NULL;
-	const bool ok = tex_init(&t->tex, w, h, levels - 1, GPU_RGBA8);
+	const bool ok = tex_init(&t->tex, w, h, levels - 1, kGpu[fmt]);
 	if (!ok) {
 		free(t);
 		return NULL;
 	}
+	t->fmt = fmt;
 	C3D_TexSetFilterMipmap(&t->tex, GPU_LINEAR);
 	C3D_TexSetLodBias(&t->tex, lodBias);
 	t->bytes = C3D_TexCalcTotalSize(t->tex.size, levels - 1);
@@ -609,8 +614,11 @@ PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias)
 void pica_tex_upload_level(PicaTex* t, int level, const uint8_t* rgba)
 {
 	if (!t || level > t->tex.maxLevel) return;
-	tex_swizzle((uint32_t*)C3D_Tex2DGetImagePtr(&t->tex, level, NULL), t->tex.width >> level, t->tex.height >> level,
-	            rgba);
+	void* dst = C3D_Tex2DGetImagePtr(&t->tex, level, NULL);
+	if (t->fmt == PICA_TF_RGBA8)
+		tex_swizzle((uint32_t*)dst, t->tex.width >> level, t->tex.height >> level, rgba);
+	else
+		tex_swizzle_small(dst, t->tex.width >> level, t->tex.height >> level, rgba, t->fmt);
 	if (level == t->tex.maxLevel) tex_flush(t);
 }
 
@@ -626,6 +634,13 @@ void pica_tex_free(PicaTex* t)
 }
 
 uint32_t pica_tex_bytes(const PicaTex* t) { return t ? t->bytes : 0; }
+/* 1: draws bind its VRAM copy; 2: it is kept in FCRAM for good (rewritten often); 0: in FCRAM. */
+int pica_tex_where(const PicaTex* t)
+{
+	if (!t) return 0;
+	if (t->noVram) return 2;
+	return t->vram && t->vready ? 1 : 0;
+}
 
 /* ---- vertex modes ---------------------------------------------------------------------- */
 static void set_cpu_proj(const C3D_Mtx* m)

@@ -89,11 +89,13 @@ enum { PICA_TF_RGBA8, PICA_TF_RGB565, PICA_TF_RGBA5551, PICA_TF_RGBA4, PICA_TF_L
 PicaTex* pica_tex_create_fmt(uint32_t w, uint32_t h, int fmt);
 int pica_tex_format(const PicaTex* t);
 void pica_tex_free(PicaTex* t);
-/* An RGBA8 texture with levels mip levels (each half the last, down to 8x8 at most), sampled with
- * linear mipmapping and the given LOD bias. Levels are uploaded one by one, the largest first;
- * the last one makes them visible to the GPU. */
-PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias);
+/* A texture in format fmt (PICA_TF_*) with levels mip levels (each half the last, down to 8x8 at
+ * most), sampled with linear mipmapping and the given LOD bias. Levels are uploaded one by one
+ * (RGBA8, packed as pica_tex_upload packs), the largest first; the last one makes them visible to
+ * the GPU. */
+PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias, int fmt);  /* fmt: PICA_TF_* */
 void pica_tex_upload_level(PicaTex* t, int level, const uint8_t* rgba);
+int pica_tex_where(const PicaTex* t);  /* 1 its VRAM copy is drawn, 2 kept in FCRAM (rewritten often), 0 FCRAM */
 /* LA8 textures (16 bits per texel), written directly: pica_tex_data is the texture's memory in the
  * PICA's tiled layout (8x8 tiles, Morton order, rows from the image's bottom); pica_tex_written
  * makes the writes visible to the GPU. */
