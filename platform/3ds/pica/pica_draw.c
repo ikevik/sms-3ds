@@ -709,8 +709,15 @@ int pica_cycle_gpu_test(void)
 	return s_gpuTest;
 }
 int pica_gpu_test(void) { return s_gpuTest; }
+/* Set from the moment a test starts until the render thread ends a frame with none on (frame_end):
+ * the frames that may hold test draws. Their copies of maps the game draws back (the goop) are
+ * left out (gx3ds_backend.cpp), so the map in VRAM is as before the test: the goop map is drawn
+ * from it each frame, and a copy of a frame whose goop draws were cut would empty it. */
+static volatile int s_testSeen;
+int pica_gpu_test_seen(void) { return s_testSeen; }
 void pica_set_gpu_test(int mode)
 {
+	if (mode) s_testSeen = 1;
 	s_gpuTest = mode;
 	s_last_valid = 0;    /* the scissor, the textures: set again */
 	s_gxLayoutValid = 0; /* test 6 changes the attributes */
@@ -771,6 +778,13 @@ static volatile u64 s_ovRunT0, s_ovDoneT; /* when the last queue started and fin
 static u32* s_c3dCmdBuf;                  /* citro3d's command buffer (seen at its frame starts) */
 static u32 s_c3dCmdWords;
 void pica_set_overlap(int on) { s_ovlWanted = on; }
+/* The whole linear heap written back at each frame's end, as C3D_FrameEnd does (pica_set_heap_flush;
+ * the profiler's game-thread steps turn it off). Everything the GPU reads that the CPU writes is
+ * also flushed by its own range: the vertex and index rings, resident vertices, textures, command
+ * lists. The whole heap takes the kernel's whole-cache maintenance (some 1.3-1.7 ms even on an
+ * empty frame), which may empty the L2 cache the cores share. */
+static int s_heapFlush = 1;
+void pica_set_heap_flush(int on) { s_heapFlush = on; }
 int pica_overlap(void) { return s_ovl; }
 
 static void ovl_done(gxCmdQueue_s* q)
@@ -859,7 +873,7 @@ static void ovl_frame_end(void)
 	if (C3Di_SplitFrame(&buf, &size)) GX_ProcessCommandList(buf, size * 4, GX_CMDLIST_FLUSH);
 	GPUCMD_SetBuffer(NULL, 0, 0);
 	end_mark(PICA_END_SUBMIT);
-	{
+	if (s_heapFlush) {
 		/* As C3D_FrameEnd(0): write back the whole linear heap. */
 		extern u32 __ctru_linear_heap, __ctru_linear_heap_size;
 		GSPGPU_FlushDataCache((void*)__ctru_linear_heap, __ctru_linear_heap_size);
@@ -926,6 +940,7 @@ static void frame_end(void)
 {
 	if (s_ovl) ovl_frame_end();
 	else C3D_FrameEnd(0);
+	s_testSeen = s_gpuTest != 0;
 }
 
 /* flags: C3D_FRAME_NONBLOCK returns 0 instead of waiting while the GPU is busy. */
@@ -1971,7 +1986,8 @@ void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, 
 static void readback_queue(void)
 {
 	/* A GPU test (pixels cut to 8x8, the GX writes muted, ...): the copies hold nothing real, so
-	 * they must not reach the game's memory (the goop map would lose its goop). */
+	 * they must not reach the game's memory (the goop map would lose its goop; its copies are left
+	 * out too: pica_gpu_test_seen). */
 	if (s_gpuTest) {
 		s_nrbCur = s_nrbRun = 0;
 		return;
@@ -1983,6 +1999,9 @@ static void readback_queue(void)
 		r->buf = (uint8_t*)linearAlloc(size);
 		LIN_UNLOCK();
 		if (!r->buf) continue;
+		/* Without the whole-heap flush, lines the CPU left dirty here could be written back over
+		 * what the GPU copies in. */
+		if (!s_heapFlush) GSPGPU_InvalidateDataCache(r->buf, size);
 		GX_TextureCopy((u32*)r->tex->tex.data, 0, (u32*)r->buf, 0, size, 8);
 	}
 	memcpy(s_rbRun, s_rbCur, sizeof(Readback) * (size_t)s_nrbCur);

@@ -3885,6 +3885,9 @@ static void enqueueDraw() {
 	rcCommit(uint32_t(size));
 }
 
+// Profile runs (prof_3ds.cpp, part 4; GX3DS_SetDropDraws): the render thread applies every record
+// but draws nothing, so its draw work and the GPU's are gone while the GX thread works as ever.
+static std::atomic<bool> s_dropDraws{false};
 static void renderDraw(const RecHdr* h) {
 	const DrawRec* d = reinterpret_cast<const DrawRec*>(h + 1);
 	if (d->stateOff) renderState(reinterpret_cast<const uint8_t*>(h) + d->stateOff);
@@ -3908,7 +3911,7 @@ static void renderDraw(const RecHdr* h) {
 	r_nspans = d->nspans;
 	r_bmin = d->bmin;
 	r_idx = d->nspans ? nullptr : reinterpret_cast<const uint16_t*>(data + vbytes);
-	if (!d->cut) drawBatch();  // (part 3 of a profile run: the target object's draws left out)
+	if (!d->cut && !s_dropDraws.load(std::memory_order_relaxed)) drawBatch();  // (part 3 of a profile run: the target object's draws left out)
 	free(d->ext);
 }
 
@@ -5113,7 +5116,10 @@ static void renderCopy(const CopyRec* cr) {
 			// copy) or the copy's texture format has none (RGB565: a GX texture of it decodes alpha 1).
 			const uint32_t pix = rs.bp[BP_PE_CONTROL] & 7;
 			c->fmt = cfmt;
-			{
+			// A frame a GPU test may have touched (profile runs): a map's copy is left out, so the
+			// map stays as before the test (the goop map is drawn from its last copy, then copied).
+			const bool keep = exact && pica_gpu_test_seen();
+			if (!keep) {
 				PerfScope ps(PERF_COPY);
 				// One-channel formats read back with that channel in all four (R8 and I8 as I8),
 				// RA4 / RA8 with red as the intensity.
@@ -5123,7 +5129,7 @@ static void renderCopy(const CopyRec* cr) {
 			}
 			// One-byte formats (I8, A8, R8, G8, B8) go back to memory too: the CPU may read them
 			// (the goop map, TPollutionLayer::isPolluted).
-			if (cfmt == 1 || (cfmt >= 7 && cfmt <= 10)) {
+			if (!keep && (cfmt == 1 || (cfmt >= 7 && cfmt <= 10))) {
 				const bool intensity = ((ctrl >> 15) & 3) == 3;
 				const int dw = half ? int(c->w) / 2 : int(c->w), dh = half ? int(c->h) / 2 : int(c->h);
 				const int chan = cfmt == 7 ? 3 : cfmt == 9 ? 1 : cfmt == 10 ? 2 : cfmt == 1 && intensity ? 4 : 0;
@@ -5248,6 +5254,7 @@ void GX3DS_TraceState(int out[2]) {
 void GX3DS_SetGpuTransform(int on) { gx::s_gpuTransform = on != 0; }
 // Off before the first frame: the renderer draws on the game thread (no render thread).
 void GX3DS_SetRenderThread(int on) { gx::s_rtWanted = on != 0; }
+void GX3DS_SetDropDraws(int on) { gx::s_dropDraws.store(on != 0); }
 void GX3DS_SetVerboseLog(int on) { gx::s_verbose = on != 0; }
 int GX3DS_GetGpuTransform(void) { return gx::s_gpuTransform ? 1 : 0; }
 // Batches drawn on the GPU and the CPU path so far.

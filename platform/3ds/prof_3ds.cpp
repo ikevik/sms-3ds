@@ -21,15 +21,18 @@
 // SMS3DS_GxOrigin, kStreamOpOrigin: native J3D stage 0, docs/native-j3d.md).
 // Part 4, the game thread (kGameSteps; also on its own: the bottom right of the bottom screen, low
 // down): its time by phase for kFrames frames in each step, with only the phases timed (object
-// timing costs the game thread some 10 ms a frame, far more than its estimate; one step measures
-// it): drawing normally; with inexact maths (sms_math_fast: plain single-precision matrix routines
-// and the C library's sinf, cosf, expf and powf in place of the exact Gekko arithmetic); with the
-// GPU drawing nothing (GPU test 3); with its GX writes made but dropped at the pipe (GXPC_SetMute
-// level 2: the GX thread, the render thread and the GPU idle); with them muted at the API (level 1:
-// the drawing code runs, the GX calls do next to nothing). The steps between them are what the
-// maths, the other threads' and the GPU's use of the memory system, and the GX calls themselves
-// cost it. The EFB copies' readbacks are left out from the GPU test on until kSettle frames after
-// the last step: those copies hold nothing real.
+// timing costs the game thread some 10 ms a frame, far more than its estimate). The steps: drawing
+// normally, with and without the whole-linear-heap flush at each frame's end (pica_set_heap_flush:
+// the kernel's whole-cache maintenance); the GX writes made but dropped at the pipe (GXPC_SetMute
+// level 2: the GX thread, the render thread and the GPU idle), with and without the flush; without
+// it, a thread on core 2 rewriting a buffer over and over (kHogTiny: L2 traffic in little of its
+// space; kHogSmall: half of the 2 MB L2 the cores share); and the GX writes muted at the API (level
+// 1: the drawing code runs, the GX calls do next to nothing). The EFB copies' readbacks are left
+// out from the third step on until kSettle frames after the last: those copies hold nothing real.
+// Earlier runs (the steps are a table: kGameSteps): objects timed too cost 10.1 ms a frame;
+// inexact maths (sms_math_fast) saved nothing; of the game thread's 41.8 ms, the GPU's drawing
+// slowed it by 3.2, the render thread's by 1.2, the GX thread's work and the stream's buffers by 5.0,
+// its GX calls cost 3.3; core 2 rewriting 1 MB slowed it alone by 19.4 ms, 8 MB by 23.0.
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
 // Sampling, in builds made with SAMPLE=1 (scripts/build_game_lib.sh, build_platform_lib.sh,
 // build_gx_lib.sh): the game's, the platform layer's and the GX API's functions are compiled with
@@ -38,6 +41,7 @@
 // kSampleNs: the function the game thread is in, by phase, without timing each call. Other builds
 // never call the hooks and leave it out.
 #include <3ds.h>
+#include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +59,8 @@ double pica_gpu_ms_sum(void);
 void pica_set_gpu_test(int mode);
 extern int sms_math_fast;          // mtx.cpp: inexact maths (part 4)
 void GXPC_SetMute(int on);         // gx_api.cpp: the GX writes dropped (part 4)
+void GX3DS_SetDropDraws(int on);   // gx3ds_backend.cpp: the render thread draws nothing (part 4)
+void pica_set_heap_flush(int on);  // pica_draw.c: the whole-linear-heap flush at frame end (part 4)
 int SMS3DS_ProfOn;
 void SMS3DS_ProfPhase(int phase);
 void SMS3DS_ProfObjBegin(const void* vtable, const char* name);
@@ -492,23 +498,80 @@ Entry* s_cutEntry;
 bool s_cutOutside;
 double s_base, s_cutFrameMs;
 
+// Part 4's memory hog: a thread on core 2 (idle in the steps that use it) that writes one word of
+// every 32-byte cache line of its buffer, over and over, until stopped.
+const uint32_t kHogTiny = 64u << 10, kHogSmall = 1u << 20;
+struct {
+	Thread th;
+	uint32_t* buf;
+	uint32_t words;
+	volatile bool run;
+	volatile uint32_t passes;
+	uint64_t t0;
+} s_hog;
+void hogMain(void*) {
+	uint32_t* const b = s_hog.buf;
+	const uint32_t n = s_hog.words;
+	while (s_hog.run) {
+		for (uint32_t i = 0; i < n; i += 8) b[i]++;
+		s_hog.passes++;
+	}
+}
+void hogStop() {
+	if (!s_hog.th) return;
+	s_hog.run = false;
+	threadJoin(s_hog.th, U64_MAX);
+	threadFree(s_hog.th);
+	s_hog.th = nullptr;
+	free(s_hog.buf);
+	s_hog.buf = nullptr;
+}
+// Starts the hog on bytes of memory; false when there is no memory or no thread for it.
+bool hogStart(uint32_t bytes) {
+	hogStop();
+	s_hog.buf = static_cast<uint32_t*>(memalign(32, bytes));
+	if (!s_hog.buf) return false;
+	memset(s_hog.buf, 0, bytes);
+	s_hog.words = bytes / 4;
+	s_hog.run = true;
+	s_hog.passes = 0;
+	s_hog.t0 = svcGetSystemTick();
+	s_hog.th = threadCreate(hogMain, nullptr, 4u << 10, 0x3F, 2, false);
+	if (!s_hog.th) {
+		free(s_hog.buf);
+		s_hog.buf = nullptr;
+		return false;
+	}
+	return true;
+}
+// MB/s of its buffer the hog has gone through since it started (each pass reads and writes every line).
+double hogRate() {
+	if (!s_hog.th) return 0;
+	const double ms = double(svcGetSystemTick() - s_hog.t0) / kTicksPerMs;
+	return ms > 0 ? double(s_hog.passes) * (s_hog.words * 4.0) / (1 << 20) / (ms / 1000.0) : 0;
+}
+
 // Part 4's steps: SMS3DS_ProfOn (1 objects timed too, 2 phases only), sms_math_fast, the GPU test,
-// the GX mute level (GXPC_SetMute).
+// the GX mute level (GXPC_SetMute), the render thread's draws dropped, the whole-heap flush, the
+// hog's buffer (0: none).
 struct GameStep {
 	const char* name;
-	int profOn, math, gpuTest, mute;
+	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
+	uint32_t hog;
 };
-const GameStep kGameSteps[] = {
-    {"drawing normally", 2, 0, 0, 0},
-    {"objects timed too", 1, 0, 0, 0},
-    {"inexact maths", 2, 1, 0, 0},
-    {"the GPU drawing nothing", 2, 0, 3, 0},
-    {"its GX writes dropped at the pipe", 2, 0, 9, 2},
-    {"its GX writes muted at the API", 2, 0, 9, 1},
+enum { kGsNormal, kGsNoFlush, kGsAlone, kGsAloneNoFlush, kGsHogTiny, kGsHogSmall, kGsApi, kGameStepN };
+const GameStep kGameSteps[kGameStepN] = {
+    {"drawing normally", 2, 0, 0, 0, 0, 1, 0},
+    {"drawing normally without the whole-heap flush", 2, 0, 0, 0, 0, 0, 0},
+    {"alone (its GX writes dropped at the pipe)", 2, 0, 9, 2, 0, 1, 0},
+    {"alone without the flush", 2, 0, 9, 2, 0, 0, 0},
+    {"that, with core 2 rewriting 64 KB (L2 traffic, little of its space)", 2, 0, 9, 2, 0, 0, kHogTiny},
+    {"that, with core 2 rewriting 1 MB (half the L2)", 2, 0, 9, 2, 0, 0, kHogSmall},
+    {"its GX writes muted at the API, without the flush", 2, 0, 9, 1, 0, 0, 0},
 };
-enum { kGameStepN = sizeof kGameSteps / sizeof kGameSteps[0] };
-// Each step's phases (ms/frame), frame and GPU time; the step being measured.
-double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN];
+// Each step's phases (ms/frame), frame and GPU time, and the hog's rate (MB/s, 0: none or not
+// started); the step being measured.
+double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN], s_gameHog[kGameStepN];
 int s_gameStep;
 // Puts step k's settings in place; past the last, normal play's (the GPU test stays until the
 // tail of part 4 ends).
@@ -516,7 +579,14 @@ void setGameStep(int k) {
 	const GameStep* g = k < kGameStepN ? &kGameSteps[k] : nullptr;
 	sms_math_fast = g ? g->math : 0;
 	GXPC_SetMute(g ? g->mute : 0);
+	GX3DS_SetDropDraws(g ? g->dropDraws : 0);
+	pica_set_heap_flush(g ? g->heapFlush : 1);
 	if (g) pica_set_gpu_test(g->gpuTest);
+	if (g && g->hog) {
+		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
+	} else {
+		hogStop();
+	}
 }
 // Part 4: a step's phases (end rendering apart: it holds the frame's waits for the GX thread and
 // the screen), and at the end what each step saved, by phase.
@@ -532,8 +602,11 @@ void reportGameStep(int k) {
 	for (int i = 0; i < PHASES; i++)
 		if (i != 15 && s_gamePh[k][i] >= 0.05)
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
-	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f; its work %.1f ms/frame (end rendering, waits "
-	        "included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k], gameWork(k), s_gamePh[k][15], line);
+	char hog[48] = "";
+	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
+	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f%s; its work %.1f ms/frame (end rendering, waits "
+	        "included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k], hog, gameWork(k), s_gamePh[k][15],
+	        line);
 }
 void reportGameSaved() {
 	for (int k = 1; k < kGameStepN; k++) {
@@ -547,13 +620,17 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	// The steps as layers: each of the last three takes away one more thing the game thread pays for.
-	const double w0 = gameWork(0), wGpu = gameWork(3), wPipe = gameWork(4), wApi = gameWork(5);
+	const double w0 = gameWork(kGsNormal), wAlone = gameWork(kGsAlone), wAloneNF = gameWork(kGsAloneNoFlush);
 	fprintf(stderr,
-	        "[prof] game thread's work, ms/frame: %.1f drawing normally (timing objects adds %.1f, inexact maths saves "
-	        "%.1f) = slowed by the GPU's drawing %.1f + slowed by the GX and render threads' work and the stream's "
-	        "buffers %.1f + the GX calls themselves %.1f + the rest %.1f\n",
-	        w0, gameWork(1) - w0, w0 - gameWork(2), w0 - wGpu, wGpu - wPipe, wPipe - wApi, wApi);
+	        "[prof] the whole-heap flush at each frame's end costs the game thread %.1f ms/frame drawing normally "
+	        "(frame %.1f -> %.1f ms without it), %.1f alone\n",
+	        w0 - gameWork(kGsNoFlush), s_gameFrame[kGsNormal], s_gameFrame[kGsNoFlush], wAlone - wAloneNF);
+	fprintf(stderr,
+	        "[prof] game thread alone without the flush (%.1f ms) with core 2 rewriting 64 KB (L2 traffic, little of "
+	        "its space): %.1f ms more at %.0f MB/s | 1 MB (half its space): %.1f ms more at %.0f MB/s | the GX calls "
+	        "themselves %.1f, the rest %.1f\n",
+	        wAloneNF, gameWork(kGsHogTiny) - wAloneNF, s_gameHog[kGsHogTiny], gameWork(kGsHogSmall) - wAloneNF,
+	        s_gameHog[kGsHogSmall], wAloneNF - gameWork(kGsApi), gameWork(kGsApi));
 }
 void startGame() {
 	GXPC_Detail = 0;  // as in normal play
@@ -972,7 +1049,7 @@ void SMS3DS_ProfFrame(void) {
 			s_request = 0;
 			fprintf(stderr, "[prof] game-thread run: %d frames each ", kFrames);
 			for (int k = 0; k < kGameStepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", kGameSteps[k].name);
-			fprintf(stderr, " (nothing drawn for about 6 s at the end; stand still until \"[prof] done\")\n");
+			fprintf(stderr, " (nothing drawn for about 13 s from the third step on; stand still until \"[prof] done\")\n");
 			startGame();
 			return;
 		}
@@ -1119,8 +1196,8 @@ void SMS3DS_ProfFrame(void) {
 				SMS3DS_ProfOn = 0;
 				reportCut();
 				GXPC_Detail = 0;  // part 4 as in normal play
-				fprintf(stderr, "[prof] game thread: %d frames each step (nothing drawn for about 6 s at the end; keep "
-				        "standing still until \"[prof] done\")\n", kFrames);
+				fprintf(stderr, "[prof] game thread: %d frames each step (nothing drawn for about 13 s from the third "
+				        "step on; keep standing still until \"[prof] done\")\n", kFrames);
 				startGame();
 				return;
 			}
@@ -1143,6 +1220,7 @@ void SMS3DS_ProfFrame(void) {
 			for (int i = 0; i < PHASES; i++) s_gamePh[k][i] = s_phaseTicks[i] / double(kFrames) / kTicksPerMs;
 			s_gameFrame[k] = double(now - s_winStart) / kFrames / kTicksPerMs;
 			s_gameGpu[k] = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
+			s_gameHog[k] = hogRate();
 			reportGameStep(k);
 			setGameStep(++s_gameStep);
 			if (s_gameStep == kGameStepN) s_state = 14;
