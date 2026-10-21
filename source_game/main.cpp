@@ -301,6 +301,10 @@ static const char kDefaultSettings[] =
     "# own calls (off), which cost several ms a frame. Off is for comparing the two.\n"
     "gx_state_blocks = on\n"
     "\n"
+    "# Each GX state reset sent to the GX thread as one command with its final values (on), or as\n"
+    "# its separate register writes (off). The same registers either way.\n"
+    "gx_state_block_ops = on\n"
+    "\n"
     "# The state-only display lists the GX thread has cached (materials, vertex formats) replayed as\n"
     "# register words, skipping writes that change nothing (on), or command by command (off). The\n"
     "# same result either way; off is for comparing the two.\n"
@@ -353,6 +357,7 @@ extern "C" void GXPC_SetFastStateLists(int on);
 extern "C" void GXPC_SetNativeJ3D(int mode, const char* buffers);
 extern "C" int GXPC_J3DPackages;  // patch 0037: native shapes from compiled blocks (settings.txt native_j3d_packages)
 extern "C" int SMS3DS_WaveMode;    // decomp patch 3ds-0022: the sea precomputed (settings.txt sea_precomputed)
+extern "C" void GXPC_SetStateBlockOps(int mode);  // patch 0038: state resets as one command (gx_state_block_ops)
 extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt profile_low_touch)
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
@@ -476,6 +481,7 @@ static void* game_thread(void*)
 		GXPC_SetNativeJ3D(nativeJ3D, bufs);
 		if (setting_value(kSettingsPath, "native_j3d_packages", v, sizeof v)) GXPC_J3DPackages = strcmp(v, "off") != 0;
 		if (setting_value(kSettingsPath, "sea_precomputed", v, sizeof v)) SMS3DS_WaveMode = strcmp(v, "off") != 0;
+		if (setting_value(kSettingsPath, "gx_state_block_ops", v, sizeof v)) GXPC_SetStateBlockOps(strcmp(v, "off") != 0);
 		fprintf(stderr, "[3ds] the sea: %s (sea_precomputed)\n", SMS3DS_WaveMode ? "worked out once per column and row" : "vertex by vertex");
 		if (setting_value(kSettingsPath, "profile_low_touch", v, sizeof v))
 			SMS3DS_ProfSetLowTouch(strcmp(v, "objects") == 0 ? 5 : 4);

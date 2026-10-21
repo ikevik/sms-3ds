@@ -1,0 +1,222 @@
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -353,6 +353,10 @@
+     kStreamOpJ3DShape = 0xCE,    // u8 check, u8 groups, u8 0, then the SMS3DSJ3DShapeOp's fields up
+                                  // to its groups, then the groups: a J3D shape's draw (native J3D)
+     kStreamOpJ3DEnd = 0xCF,      // check mode: the calls of the last J3D op end here
++    kStreamOpBlockDef = 0xD0,    // u16 id, u16 n, then n x (u8 kind: 0 BP, 1 CP, 2 XF; u16 register):
++                                 // a state block's registers, in order (gx_api.cpp, GXPC_StateBlock)
++    kStreamOpBlock = 0xD1,       // u16 id, u16 n, then n host-order u32 values: the block's registers
++                                 // written with them, as its separate writes would have been
+ };
+ // The bytes of a kStreamOpJ3DShape before its groups, its op byte included (sms3ds_j3d.h).
+ enum { kJ3DShapeHead = 4 + offsetof(SMS3DSJ3DShapeOp, group) };
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -413,6 +413,8 @@
+     int state;       // 1 checking against fn, 2 fast, -1 fn always
+     uint32_t checks, n;
+     SbEntry* e;
++    uint16_t id, nSend;  // as one command (sbSendOp): its id, its BP, CP and XF entries
++    bool defined;        // its kStreamOpBlockDef sent
+ };
+ const uint32_t kSbVerify = 256;
+ const uint32_t kSbMaxTouch = 1024;
+@@ -610,12 +612,98 @@
+             continue;
+         }
+         j++;
++    }
++}
++
++// 3DS port: a block as one stream command (GXPC_SetStateBlockOps; settings.txt gx_state_block_ops).
++// sbApply sends each register through the API (its filter check, the encoding, the inline writes):
++// some 0.6 us a register, 90-130 us a block, ~42 blocks a frame on Delfino Plaza. Instead the
++// block's final values go in one kStreamOpBlock after its register list (kStreamOpBlockDef, once),
++// and the GX thread writes them in order (gx_fifo.cpp, blockWrite: a value it already holds changes
++// nothing, as the filter would have left that write out). The API's copy and the filter's record
++// end as sbApply's writes leave them: each register is recorded as sent with its value, which the
++// GX thread then holds. Not while the filter has a BP mask pending (which of the writes it would
++// leave out decides which one takes the mask), nor muted, recorded or redirected: sbApply then.
++// Mode 2 checks: after each op, every register is compared with its value on the GX thread
++// (kStreamOpFilterCheck: GXPC_FltChecks, GXPC_FltWrong).
++static int s_sbOps = 1;
++static uint16_t s_sbNextId;
++static bool sbSendOp(SbBlock* b) {
++    if (!s_sbOps || !g_gxStream || s_recording || getPipeRedirect() || s_mute || s_fltMaskNext || !b->nSend) return false;
++    static uint8_t a[4 + 4 * (kSbMaxTouch + 64)];
++    if (!b->defined) {
++        uint32_t k = 4;
++        a[0] = uint8_t(b->id >> 8), a[1] = uint8_t(b->id), a[2] = uint8_t(b->nSend >> 8), a[3] = uint8_t(b->nSend);
++        for (uint32_t j = 0; j < b->n; j++) {
++            const SbEntry& x = b->e[j];
++            if (x.kind == 3) continue;
++            a[k++] = x.kind;
++            a[k++] = uint8_t(x.reg >> 8);
++            a[k++] = uint8_t(x.reg);
++        }
++        GXPC_StreamOp(kStreamOpBlockDef, a, k);
++        b->defined = true;
++    }
++    uint32_t fin[kSbMaxTouch + 64];
++    sbFinals(b, fin);
++    a[0] = uint8_t(b->id >> 8), a[1] = uint8_t(b->id), a[2] = uint8_t(b->nSend >> 8), a[3] = uint8_t(b->nSend);
++    uint8_t* v = a + 4;
++    for (uint32_t j = 0; j < b->n; j++) {
++        const SbEntry& x = b->e[j];
++        const uint32_t f = fin[j];
++        switch (x.kind) {
++        case 0: {
++            const uint32_t data = f & 0xFFFFFF;
++            const uint32_t i = (x.reg >= BP_TEV_REG && x.reg < BP_TEV_REG + 8 && (data & 0x800000)) ? 256 + (x.reg & 7) : x.reg;
++            s_fltBP[i] = data;
++            s_genOfBP[i] = s_genBP;
++            apiKeepBP(x.reg, data);
++            memcpy(v, &data, 4);
++            v += 4;
++            break;
++        }
++        case 1:
++            s_fltCP[x.reg & 0xFF] = f;
++            s_genOfCP[x.reg & 0xFF] = s_genCP;
++            apiKeepCP(uint8_t(x.reg), f);
++            memcpy(v, &f, 4);
++            v += 4;
++            break;
++        case 2:
++            if (x.reg < kFltXF) {
++                s_fltXF[x.reg] = f;
++                s_genOfXF[x.reg] = s_genXF;
++            }
++            apiKeepXF(x.reg, 1, &f);
++            memcpy(v, &f, 4);
++            v += 4;
++            break;
++        default: *sbWordPtr(x.word) = f; break;
++        }
+     }
++    GXPC_StreamOp(kStreamOpBlock, a, uint32_t(v - a));
++    if (s_sbOps == 2) {  // check: each register as the GX thread now holds it
++        for (uint32_t j = 0; j < b->n; j++) {
++            const SbEntry& x = b->e[j];
++            if (x.kind == 3) continue;
++            uint32_t f = fin[j];
++            if (x.kind == 0) {
++                f &= 0xFFFFFF;
++                const uint32_t i = (x.reg >= BP_TEV_REG && x.reg < BP_TEV_REG + 8 && (f & 0x800000)) ? 256 + (x.reg & 7) : x.reg;
++                fltCheckOp(0, i, &f, 1);
++            } else {
++                fltCheckOp(uint8_t(x.kind), x.reg, &f, 1);
++            }
++        }
++    }
++    return true;
+ }
+ 
+ extern "C" {
+ uint32_t GXPC_StateBlockCalls[3];  // fast, checked against fn, fn only
+ void GXPC_SetStateBlocks(int on) { s_sbOn = on != 0; }
++void GXPC_SetStateBlockOps(int mode) { s_sbOps = mode; }
++int GXPC_StateBlockOps(void) { return s_sbOps; }
+ void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name) {
+     SbBlock* b = static_cast<SbBlock*>(*slot);
+     const bool usable = s_sbOn && g_gxStream && !s_recording && !getPipeRedirect();
+@@ -624,6 +712,8 @@
+         if (b) {
+             b->name = name;
+             b->state = sbDerive(b, fn) ? 1 : -1;
++            b->id = s_sbNextId++;
++            for (uint32_t j = 0; j < b->n; j++) b->nSend += b->e[j].kind != 3;
+             *slot = b;
+         }
+     }
+@@ -634,7 +724,7 @@
+     }
+     if (b->state == 2) {
+         GXPC_StateBlockCalls[0]++;
+-        sbApply(b);
++        if (!sbSendOp(b)) sbApply(b);
+         return;
+     }
+     // Checking: fn runs as before; the state it leaves must be the prediction, and nothing else changed.
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1184,6 +1184,8 @@
+     case kStreamOpOrigin: return 2;
+     case kStreamOpJ3DMat: return 10;
+     case kStreamOpJ3DShape: return avail < 4 ? 4 : kJ3DShapeHead + uint32_t(p[2] <= 8 ? p[2] : 8) * sizeof(SMS3DSJ3DShapeOp::Group);
++    case kStreamOpBlockDef: return avail < 5 ? 5 : 5 + 3 * (uint32_t(p[3]) << 8 | p[4]);
++    case kStreamOpBlock: return avail < 5 ? 5 : 5 + 4 * (uint32_t(p[3]) << 8 | p[4]);
+     default: return 1;  // kStreamOpFlush, kStreamOpTexInval, kStreamOpJ3DEnd
+     }
+ }
+@@ -1246,7 +1248,60 @@
+     if (o) s_j3dExit = false;
+     else if (s_origin) s_j3dExit = true;
+     s_origin = o;
++}
++// State blocks as one command (gx_api.cpp, GXPC_StateBlock): each block's registers, by id, as its
++// kStreamOpBlockDef gave them; a kStreamOpBlock writes them in that order with its values through
++// writeBP/writeCP/writeXF, leaving out a BP value already held (writeCP and writeXF change nothing
++// for one): the registers end as the block's separate (filtered) writes would have left them. GXPC_BlockOps: blocks written, and
++// written with a BP mask pending (its first BP write takes the mask, as a separate write would).
++extern "C" uint32_t GXPC_BlockOps[2];
++uint32_t GXPC_BlockOps[2];
++namespace {
++struct BlockDef {
++    std::vector<uint8_t> kind;
++    std::vector<uint16_t> reg;
++};
++std::vector<BlockDef> s_blockDefs;
++}  // namespace
++static void blockDef(const uint8_t* p) {
++    const uint32_t id = uint32_t(p[1]) << 8 | p[2], n = uint32_t(p[3]) << 8 | p[4];
++    if (id >= s_blockDefs.size()) s_blockDefs.resize(id + 1);
++    BlockDef& d = s_blockDefs[id];
++    d.kind.resize(n);
++    d.reg.resize(n);
++    for (uint32_t i = 0; i < n; i++) {
++        d.kind[i] = p[5 + 3 * i];
++        d.reg[i] = uint16_t(uint32_t(p[6 + 3 * i]) << 8 | p[7 + 3 * i]);
++    }
+ }
++static void blockWrite(const uint8_t* p) {
++    const uint32_t id = uint32_t(p[1]) << 8 | p[2], n = uint32_t(p[3]) << 8 | p[4];
++    if (id >= s_blockDefs.size() || s_blockDefs[id].kind.size() != n) {
++        logmsg("state block %u written before its registers were given", unsigned(id));
++        return;
++    }
++    const BlockDef& d = s_blockDefs[id];
++    GXPC_BlockOps[0]++;
++    if (g.bpMask != 0xFFFFFF) GXPC_BlockOps[1]++;
++    const uint8_t* v = p + 5;
++    for (uint32_t i = 0; i < n; i++, v += 4) {
++        uint32_t w;
++        memcpy(&w, v, 4);
++        switch (d.kind[i]) {
++        case 0: {  // a value held already is left out, as the filter leaves it out (a texture image
++                   // register written again would lose the host pointer kStreamOpTexImage gave it)
++            const uint32_t reg = d.reg[i], data = w & 0xFFFFFF;
++            const bool konst = reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000);
++            if ((konst ? g.kreg[reg & 7] : g.bp[reg & 0xFF]) == data && g.bpMask == 0xFFFFFF) break;
++            writeBP((reg << 24) | data);
++            break;
++        }
++        case 1: writeCP(uint8_t(d.reg[i]), w); break;
++        default: writeXF(d.reg[i], 1, &w); break;
++        }
++    }
++}
++
+ static void filterCheck(const uint8_t* p) {
+     static const char* const kKind[3] = {"BP", "CP", "XF"};
+     static uint32_t s_logged;
+@@ -1400,6 +1455,8 @@
+     }
+     case kStreamOpCopyDest: g.copyDest = reinterpret_cast<void*>(uintptr_t(be32(p + 1))); break;
+     case kStreamOpFilterCheck: filterCheck(p); break;
++    case kStreamOpBlockDef: blockDef(p); break;
++    case kStreamOpBlock: blockWrite(p); break;
+     case kStreamOpProfObj:
+         creditGxTime();
+         GXPC_ProfObj = be32(p + 1);
