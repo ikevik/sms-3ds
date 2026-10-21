@@ -1,0 +1,475 @@
+--- a/platform/misc/msl_math.c
++++ b/platform/misc/msl_math.c
+@@ -206,8 +206,11 @@
+ float sms_msl_sinf(float x) { return msl_have_fma() ? sms_msl_sinf_hw(x) : sms_msl_sinf_soft(x); }
+ #endif
+ #if defined(__3DS__)
+-float sms_msl_cosf(float x) { MSL_COUNT(MSL_COSF); return sms_msl_cosf_3ds(x); }
+-float sms_msl_sinf(float x) { MSL_COUNT(MSL_SINF); return sms_msl_sinf_3ds(x); }
++/* 3DS port, the profile run's ceiling step (mtx.cpp, sms_math_fast): newlib's own instead of MSL's
++ * exact results. */
++extern int sms_math_fast;
++float sms_msl_cosf(float x) { MSL_COUNT(MSL_COSF); return sms_math_fast ? cosf(x) : sms_msl_cosf_3ds(x); }
++float sms_msl_sinf(float x) { MSL_COUNT(MSL_SINF); return sms_math_fast ? sinf(x) : sms_msl_sinf_3ds(x); }
+ #endif
+ 
+ /* tanf calls cos(float), then sin(float), and divides. */
+@@ -616,8 +619,8 @@
+ float sms_msl_powf(float x, float y) { return msl_have_fma() ? sms_msl_powf_hw(x, y) : sms_msl_powf_soft(x, y); }
+ #endif
+ #if defined(__3DS__)
+-float sms_msl_expf(float x) { MSL_COUNT(MSL_EXPF); return sms_msl_expf_3ds(x); }
+-float sms_msl_powf(float x, float y) { MSL_COUNT(MSL_POWF); return sms_msl_powf_3ds(x, y); }
++float sms_msl_expf(float x) { MSL_COUNT(MSL_EXPF); return sms_math_fast ? expf(x) : sms_msl_expf_3ds(x); }
++float sms_msl_powf(float x, float y) { MSL_COUNT(MSL_POWF); return sms_math_fast ? powf(x, y) : sms_msl_powf_3ds(x, y); }
+ 
+ /* Runs function k n times on sample arguments. */
+ static volatile float s_mslSink;
+--- a/platform/mtx/mtx.cpp
++++ b/platform/mtx/mtx.cpp
+@@ -157,6 +157,102 @@
+ #endif
+ 
+ #if defined(__3DS__)
++// 3DS port, the profile run's ceiling step (platform/3ds/prof_3ds.cpp): while sms_math_fast is set,
++// the routines that cost the game thread most compute the same maths in plain single precision,
++// the compiler's way, not the Gekko's rounding: what giving up the exact arithmetic would save at
++// most. Never set outside that step. The others (fastm:: finds them through the using-directive)
++// stay exact.
++extern "C" {
++int sms_math_fast;
++}
++namespace fastm {
++using namespace mtx_host;
++static inline void concat34(const f32 (*a)[4], const f32 (*b)[4], f32 (*ab)[4])
++{
++	f32 t[3][4];
++	for (int r = 0; r < 3; r++)
++		for (int c = 0; c < 4; c++)
++			t[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + (c == 3 ? a[r][3] : 0.0f);
++	memcpy(ab, t, sizeof t);
++}
++static void gMTXConcat(Mtx a, Mtx b, Mtx ab) { concat34(a, b, ab); }
++static void gMTXMultVec(Mtx m, Vec* src, Vec* dst)
++{
++	const f32 x = src->x, y = src->y, z = src->z;
++	dst->x = m[0][0] * x + m[0][1] * y + m[0][2] * z + m[0][3];
++	dst->y = m[1][0] * x + m[1][1] * y + m[1][2] * z + m[1][3];
++	dst->z = m[2][0] * x + m[2][1] * y + m[2][2] * z + m[2][3];
++}
++static void gMTXMultVecSR(Mtx m, Vec* src, Vec* dst)
++{
++	const f32 x = src->x, y = src->y, z = src->z;
++	dst->x = m[0][0] * x + m[0][1] * y + m[0][2] * z;
++	dst->y = m[1][0] * x + m[1][1] * y + m[1][2] * z;
++	dst->z = m[2][0] * x + m[2][1] * y + m[2][2] * z;
++}
++static void gMTXMultVecArray(Mtx m, Vec* srcBase, Vec* dstBase, u32 count)
++{
++	for (u32 i = 0; i < count; i++) gMTXMultVec(m, &srcBase[i], &dstBase[i]);
++}
++static void gVECNormalize(Vec* src, Vec* unit)
++{
++	const f32 k = 1.0f / sqrtf(src->x * src->x + src->y * src->y + src->z * src->z);
++	unit->x = src->x * k;
++	unit->y = src->y * k;
++	unit->z = src->z * k;
++}
++static f32 gVECMag(Vec* v) { return sqrtf(v->x * v->x + v->y * v->y + v->z * v->z); }
++static f32 gVECDistance(Vec* a, Vec* b)
++{
++	const f32 x = a->x - b->x, y = a->y - b->y, z = a->z - b->z;
++	return sqrtf(x * x + y * y + z * z);
++}
++static u32 gJ3DPSCalcInverseTranspose(const f32 (*src)[4], f32 (*dst)[3])
++{
++	const f32 a = src[0][0], b = src[0][1], c = src[0][2], d = src[1][0], e = src[1][1], f = src[1][2], g = src[2][0],
++	          h = src[2][1], i = src[2][2];
++	const f32 A = e * i - f * h, B = f * g - d * i, C = d * h - e * g;
++	const f32 det = a * A + b * B + c * C;
++	if (det == 0.0f) return 0;
++	const f32 k = 1.0f / det;
++	dst[0][0] = A * k, dst[0][1] = B * k, dst[0][2] = C * k;
++	dst[1][0] = (c * h - b * i) * k, dst[1][1] = (a * i - c * g) * k, dst[1][2] = (b * g - a * h) * k;
++	dst[2][0] = (b * f - c * e) * k, dst[2][1] = (c * d - a * f) * k, dst[2][2] = (a * e - b * d) * k;
++	return 1;
++}
++static void gJ3DMTXConcatArrayIndexedSrc(const f32 (*a)[4], const f32 (*b)[3][4], const u16* idx, f32 (*dst)[3][4],
++                                         u32 n)
++{
++	if (n == 0) n = 1;
++	for (u32 k = 0; k < n; k++) concat34(a, b[idx[k]], dst[k]);
++}
++static void gJ3DPSMtxArrayConcat(const f32 (*a)[4], const f32 (*b)[4], f32 (*dst)[4], u32 n)
++{
++	if (n == 0) n = 1;
++	for (u32 k = 0; k < n; k++) concat34(a, b + 3 * k, dst + 3 * k);
++}
++static void gJ3DWeightEnvelopeMix(f32 (*acc)[4], const f32 (*world)[4], const f32 (*inv)[4], f32 weight)
++{
++	f32 m[3][4];
++	concat34(world, inv, m);
++	for (int r = 0; r < 3; r++)
++		for (int c = 0; c < 4; c++) acc[r][c] += m[r][c] * weight;
++}
++static f32 gJ3DHermiteInterpolationS(f32 t, f32 time0, f32 value0, f32 tangent0, f32 time1, f32 value1, f32 tangent1)
++{
++	const f32 dt = time1 - time0, u = (t - time0) / dt, u2 = u * u, u3 = u2 * u;
++	return value0 * (2.0f * u3 - 3.0f * u2 + 1.0f) + value1 * (3.0f * u2 - 2.0f * u3) +
++	       (tangent0 * (u3 - 2.0f * u2 + u) + tangent1 * (u3 - u2)) * dt;
++}
++static f32 gMsVECMag2(const f32* v) { return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
++static void gMsVECNormalize(const f32* v1, f32* v2)
++{
++	const f32 k = 1.0f / sqrtf(v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2]);
++	v2[0] = v1[0] * k, v2[1] = v1[1] * k, v2[2] = v1[2] * k;
++}
++}  // namespace fastm
++#define CALLX(fn, args) (sms_math_fast ? fastm::fn args : CALL(fn, args))
++
+ // 3DS port: calls per routine (a PS routine and its C_ name share a count), which
+ // platform/3ds/prof_3ds.cpp reports with each routine's cost on sample data
+ // (sms_mtx_bench), to show what this exact arithmetic costs a frame.
+@@ -227,12 +323,12 @@
+ 	extern "C" ret ps params                                                     \
+ 	{                                                                            \
+ 		sms_mtx_calls[i]++;                                                      \
+-		return (ret)CALL(fn, args);                                              \
++		return (ret)CALLX(fn, args);                                             \
+ 	}                                                                            \
+ 	extern "C" ret c params                                                      \
+ 	{                                                                            \
+ 		sms_mtx_calls[i]++;                                                      \
+-		return (ret)CALL(fn, args);                                              \
++		return (ret)CALLX(fn, args);                                             \
+ 	}                                                                            \
+ 	static void bench_##fn() { mtx_benchCall(&ps); }                             \
+ 	static const int reg_##fn = mtx_reg(i, #ps, bench_##fn);
+@@ -241,7 +337,7 @@
+ 	extern "C" ret name params                                                   \
+ 	{                                                                            \
+ 		sms_mtx_calls[i]++;                                                      \
+-		return (ret)CALL(fn, args);                                              \
++		return (ret)CALLX(fn, args);                                             \
+ 	}                                                                            \
+ 	static void bench_##fn() { mtx_benchCall(&name); }                           \
+ 	static const int reg_##fn = mtx_reg(i, #name, bench_##fn);
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -227,6 +227,49 @@
+ #endif
+ 
+ #if defined(__3DS__)
++// Profile runs (prof_3ds.cpp's game-thread steps, GXPC_SetMute): while muted the game thread's GX
++// writes go nowhere, so its time shows what writing them costs. Level 1, muted at the API: a
++// register write keeps only the API's copy, a display-list call returns, and the pipe's bytes are
++// dropped (gx_fifo.cpp, pipeMute). Level 2, at the pipe: the API runs in full (filter, encoding,
++// the writes) and only the bytes are dropped, so the GX thread, the render thread and the GPU are
++// idle while the game thread still pays for its calls. Copies, tokens, draw-done, flushes and
++// texture invalidation still go (MUTE_HOLE): the frame still ends, with nothing drawn but the
++// clear. Nothing is dropped while a display list is recorded or the pipe redirected: those bytes
++// are the game's. At level 2 the write filter records as sent what never reached the GX thread,
++// so it forgets everything as each write that still goes and each level change begins; the game
++// sets its state again every frame (ReInitializeGX).
++static int s_mute;
++static bool s_wgRedirect;
++static inline bool apiMuted() { return s_mute == 1 && !s_recording && !s_wgRedirect; }
++struct MuteHole {
++    const int was = s_mute;
++    MuteHole() {
++        if (was) {
++            if (was == 2) apiForget(7);
++            s_mute = 0;
++            pipeMute(false);
++        }
++    }
++    ~MuteHole() {
++        if (was) {
++            pipeMute(true);
++            s_mute = was;
++        }
++    }
++};
++#define MUTE_HOLE MuteHole muteHole_
++extern "C" void GXPC_SetMute(int level) {
++    if (!g_gxStream || level == s_mute) return;
++    pipeMute(level != 0);
++    s_mute = level;
++    apiForget(7);
++}
++#else
++static inline bool apiMuted() { return false; }
++#define MUTE_HOLE
++#endif
++
++#if defined(__3DS__)
+ static void sbTouch(int kind, uint32_t key, uint32_t reg);  // state blocks (below): a write while one is worked out
+ static bool s_sbVirtual;
+ #endif
+@@ -240,6 +283,12 @@
+     }
+ #endif
+     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
++#if defined(__3DS__)
++    if (apiMuted()) {
++        apiKeepBP(reg, data & 0xFFFFFF);
++        return;
++    }
++#endif
+     if (fltBP(reg, data & 0xFFFFFF)) {
+ #if defined(__3DS__)
+         apiKeepBP(reg, data & 0xFFFFFF);  // left out, still what the API set (the SDK's copy always is)
+@@ -266,6 +315,12 @@
+         return;
+     }
+ #endif
++#if defined(__3DS__)
++    if (apiMuted()) {
++        apiKeepCP(reg, v);
++        return;
++    }
++#endif
+     if (fltCP(reg, v)) {
+ #if defined(__3DS__)
+         apiKeepCP(reg, v);  // (J3D's writes go around the API's copy: it can differ from what was sent)
+@@ -288,6 +343,12 @@
+ #if defined(__3DS__)
+     if (s_sbVirtual) {
+         for (uint32_t i = 0; i < n; i++) sbTouch(2, uint32_t(addr + i), uint32_t(addr + i));
++        apiKeepXF(addr, n, w);
++        return;
++    }
++#endif
++#if defined(__3DS__)
++    if (apiMuted()) {
+         apiKeepXF(addr, n, w);
+         return;
+     }
+@@ -760,6 +821,7 @@
+ void GXSetMisc(GXMiscToken, u32) {}
+ void GXFlush(void) {
+ #if defined(__3DS__)
++    MUTE_HOLE;
+     if (g_gxStream) {
+         GXPC_StreamOp(kStreamOpFlush, nullptr, 0);
+         GXPC_StreamFlush();
+@@ -773,11 +835,13 @@
+ BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
+ 
+ void GXSetDrawSync(u16 token) {
++    MUTE_HOLE;
+     apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
+     apiBP(BP_PE_TOKEN, token);
+ }
+ u16 GXReadDrawSync(void) { return g.drawSyncToken; }  // the renderer's: the last token it passed
+ void GXSetDrawDone(void) {
++    MUTE_HOLE;
+     apiBP(BP_DRAWDONE, 2);
+     if (s_drawDoneCb) s_drawDoneCb();
+ }
+@@ -786,6 +850,7 @@
+ // GXDrawDone (THPPlayerDrawDone), and waiting cost the overlap with the GX thread.
+ static void drawDoneWait() {
+ #if defined(__3DS__)
++    MUTE_HOLE;
+     if (g_gxStream) {
+         GXPC_StreamOp(kStreamOpFlush, nullptr, 0);
+         GXPC_StreamFlush();
+@@ -875,10 +940,18 @@
+ u32 GXGetOverflowCount(void) { return 0; }
+ u32 GXResetOverflowCount(void) { return 0; }
+ volatile void* GXRedirectWriteGatherPipe(void* ptr) {
++#if defined(__3DS__)
++    s_wgRedirect = true;
++#endif
+     setPipeRedirect(static_cast<uint8_t*>(ptr));
+     return reinterpret_cast<volatile void*>(static_cast<uintptr_t>(0xCC008000u));
+ }
+-void GXRestoreWriteGatherPipe(void) { setPipeRedirect(nullptr); }
++void GXRestoreWriteGatherPipe(void) {
++#if defined(__3DS__)
++    s_wgRedirect = false;
++#endif
++    setPipeRedirect(nullptr);
++}
+ 
+ // ================================================================== display lists
+ void GXBeginDisplayList(void* list, u32 size) {
+@@ -952,7 +1025,7 @@
+         if (strcmp(name, s_j3dBuf[i]) == 0) return s_j3dMode;
+     return 0;
+ }
+-static bool j3dCanSend() { return g_gxStream && !s_recording && !getPipeRedirect(); }
++static bool j3dCanSend() { return g_gxStream && !s_recording && !getPipeRedirect() && !s_mute; }
+ int SMS3DS_J3DMat(const void* list, uint32_t size) {
+     if (!SMS3DS_J3DNative || !j3dCanSend() || !list || !size || GXPC_StreamCopyDL(list, size)) return 0;
+     apiForget(7);
+@@ -997,6 +1070,7 @@
+         return;
+     }
+ #if defined(__3DS__)
++    if (apiMuted()) return;
+     apiForget(7);  // the list may set any register
+ #endif
+ #if defined(__3DS__)
+@@ -1004,6 +1078,10 @@
+         uint8_t a[8];
+         streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(list)));
+         streamU32(a + 4, uint32_t(nbytes));
++        if (s_mute && !getPipeRedirect()) {  // dropped at the pipe (level 2): the GX thread never reads it
++            GXPC_StreamOp(kStreamOpCallDL, a, 8);
++            return;
++        }
+         if (GXPC_StreamCopyDL(list, uint32_t(nbytes))) {  // the game may rewrite it before it is read
+             GXPC_StreamOp(kStreamOpCallDLCopy, a, 8);
+             GXPC_StreamBytes(list, uint32_t(nbytes));
+@@ -1838,6 +1916,7 @@
+ void GXSetDispCopyGamma(GXGamma gamma) { s_dispCtrl = setField(s_dispCtrl, 2, 7, gamma); }
+ 
+ static void doCopy(void* dest, GXBool clear, bool disp) {
++    MUTE_HOLE;
+     apiBP(BP_COPY_SRC_TL, disp ? s_dispSrc : s_texSrc);
+     apiBP(BP_COPY_SRC_WH, disp ? s_dispSize : s_texSize);
+     apiBP(BP_COPY_STRIDE, disp ? s_dispStride : s_texStride);
+@@ -2082,6 +2161,7 @@
+ }
+ void GXInvalidateTexRegion(GXTexRegion*) {
+ #if defined(__3DS__)
++    MUTE_HOLE;
+     if (g_gxStream) {
+         GXPC_StreamOp(kStreamOpTexInval, nullptr, 0);
+         return;
+@@ -2091,6 +2171,7 @@
+ }
+ void GXInvalidateTexAll(void) {
+ #if defined(__3DS__)
++    MUTE_HOLE;
+     if (g_gxStream) {
+         GXPC_StreamOp(kStreamOpTexInval, nullptr, 0);
+         return;
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -3067,6 +3067,9 @@
+ static uint32_t s_pipeCap = 0;
+ static uint32_t s_pipeNeed = 1;
+ static uint8_t* s_redirect = nullptr;
++#if defined(__3DS__)
++static bool s_mute;  // a profile run's game-thread step: the bytes go nowhere (pipeMute)
++#endif
+ }  // namespace gx
+ // the buffer, its length and how far the inline writers may fill it (gx_pc.h)
+ extern "C" {
+@@ -3149,6 +3152,10 @@
+         return;
+     }
+ #if defined(__3DS__)
++    if (s_mute) {  // (the inline writers fill the scratch buffer; dropped when it is full)
++        s_pipeLen = 0;
++        return;
++    }
+     if (g_gxStream) {
+         streamPut(bytes, n);
+         return;
+@@ -3163,6 +3170,31 @@
+ void pipeWrite(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
+ 
+ #if defined(__3DS__)
++// Profile runs (GXPC_SetMute, gx_api.cpp): while muted, what is written goes to a scratch buffer
++// and is dropped, unless the pipe is redirected. What the stream held is sent first, so nothing
++// waits on a part-filled buffer meanwhile.
++static uint8_t s_muteBuf[4096];
++static uint8_t* s_muteSaved;
++static uint32_t s_muteSavedCap;
++void pipeMute(bool on) {
++    if (!g_gxStream || on == s_mute) return;
++    if (on) {
++        if (s_pipeLen) streamSwap();
++        s_muteSaved = s_pipeBuf;
++        s_muteSavedCap = s_pipeCap;
++        s_pipeBuf = s_muteBuf;
++        s_pipeCap = sizeof s_muteBuf;
++    } else {
++        s_pipeBuf = s_muteSaved;
++        s_pipeCap = s_muteSavedCap;
++    }
++    s_pipeLen = 0;
++    s_mute = on;
++    pipeFastUpdate();
++}
++#endif
++
++#if defined(__3DS__)
+ // Streamed GX: settings the GX thread reads go through the stream, in order with the draws.
+ static void streamOp(uint8_t op, const uint8_t* args, uint32_t n) {
+     pipePut(&op, 1);
+@@ -3174,6 +3206,13 @@
+     p[2] = uint8_t(v >> 8);
+     p[3] = uint8_t(v);
+ }
++// ... the vertex arrays' byte order: sent even while muted (the GX thread needs it afterwards).
++static void streamOpKept(uint8_t op, const uint8_t* args, uint32_t n) {
++    const bool m = s_mute;
++    if (m) pipeMute(false);
++    streamOp(op, args, n);
++    if (m) pipeMute(true);
++}
+ #endif
+ 
+ }  // namespace gx
+@@ -3201,7 +3240,7 @@
+         uint8_t a[8];
+         streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(p)));
+         streamU32(a + 4, size);
+-        streamOp(kStreamOpBERange, a, 8);
++        streamOpKept(kStreamOpBERange, a, 8);
+         return;
+     }
+ #endif
+@@ -3214,7 +3253,7 @@
+         uint8_t a[8];
+         streamU32(a, uint32_t(reinterpret_cast<uintptr_t>(p)));
+         streamU32(a + 4, 0);
+-        streamOp(kStreamOpBERange, a, 8);
++        streamOpKept(kStreamOpBERange, a, 8);
+         return;
+     }
+ #endif
+@@ -3232,7 +3271,7 @@
+     if (g_gxStream) {
+         GXPC_FilterForget(2);
+         const uint8_t a[2] = {uint8_t(slot), uint8_t(bigEndian != 0)};
+-        streamOp(kStreamOpArrayBE, a, 2);
++        streamOpKept(kStreamOpArrayBE, a, 2);
+         return;
+     }
+ #endif
+@@ -3243,7 +3282,7 @@
+     if (g_gxStream) {
+         GXPC_FilterForget(2);
+         const uint8_t a = uint8_t(bigEndian != 0);
+-        streamOp(kStreamOpDefaultBE, &a, 1);
++        streamOpKept(kStreamOpDefaultBE, &a, 1);
+         return;
+     }
+ #endif
+@@ -3267,7 +3306,7 @@
+ }
+ // Hands the bytes collected so far to the GX thread.
+ void GXPC_StreamFlush(void) {
+-    if (g_gxStream && s_pipeLen) streamSwap();
++    if (g_gxStream && s_pipeLen && !s_mute) streamSwap();
+ }
+ // Writes a command of the stream's own (gx_api.cpp).
+ void GXPC_StreamOp(uint8_t op, const void* args, uint32_t n) { streamOp(op, static_cast<const uint8_t*>(args), n); }
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -141,6 +141,9 @@
+ bool pipeIdle();
+ void setPipeRedirect(uint8_t* dest);
+ uint8_t* getPipeRedirect();
++#if defined(__3DS__)
++void pipeMute(bool on);  // profile runs: written bytes dropped (gx_fifo.cpp; GXPC_SetMute)
++#endif
+ 
+ // ---------------------------------------------------------------- vertices
+ struct HostVertex {

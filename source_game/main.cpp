@@ -42,6 +42,7 @@ void pica_set_readback_dumps(int on);
 void pica_set_overlap(int on);
 void pica_set_big_ring(int on);
 extern "C" void SMS3DS_ProfRequest(void);
+extern "C" void SMS3DS_ProfRequestGame(void);  // part 4 alone: the game thread's steps
 extern "C" int SMS3DS_ProfState(void);
 extern "C" void SMS3DS_SampReport(const char* why);  // prof_3ds.cpp, SAMPLE=1 builds
 extern "C" int port_os_stack_report(char* out, int n);  // patch 0029
@@ -518,7 +519,7 @@ static void draw_status(const uint32_t* s) {
 		int tst[2];
 		GX3DS_TraceState(tst);
 		printf("\x1b[23;0Htrace: %-8s %d written (sms/trace-N.txt)  ", tst[0] ? "ARMED" : "idle", tst[1]);
-		static const char* const profState[] = {"idle (touch bottom right)", "timing the CPU...", "GPU, pixels cut...", "GPU, object by object..."};
+		static const char* const profState[] = {"idle: bottom right, low=game", "timing the CPU...", "GPU, pixels cut...", "GPU, object by object...", "game thread steps..."};
 		printf("\x1b[24;0Hprofile: %-28s", profState[SMS3DS_ProfState()]);
 	}
 	printf("\x1b[22;0Htop shows: %s %d of %d  (touch top: next)\n", pica_view() ? "EFB copy" : "frame",
@@ -785,15 +786,18 @@ int main()
 			hidTouchRead(&tp);
 			fprintf(stderr, "[touch] %d,%d: %s\n", tp.px, tp.py,
 			        tp.py < 120 ? "top half (view)" : tp.px < 107 ? "bottom left (trace)" :
-			        tp.px < 213 ? "bottom middle (GPU transform)" : "bottom right (profile run)");
+			        tp.px < 213 ? "bottom middle (GPU transform)" :
+			        tp.py < 180 ? "bottom right (profile run)" : "bottom right, low (game-thread run)");
 			if (tp.py < 120)
 				pica_cycle_view();
 			else if (tp.px < 107)
 				GX3DS_TraceNextFrame();
 			else if (tp.px < 213)
 				GX3DS_SetGpuTransform(!GX3DS_GetGpuTransform());
-			else
+			else if (tp.py < 180)
 				SMS3DS_ProfRequest();  // [prof] lines: CPU by phase and class, then GPU pixels vs vertices
+			else
+				SMS3DS_ProfRequestGame();  // [prof] lines: the game thread's steps alone (prof_3ds.cpp, part 4)
 		}
 		uint32_t s[7];
 		GX3DS_GetStats(s);

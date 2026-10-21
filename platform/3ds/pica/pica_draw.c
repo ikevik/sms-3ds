@@ -696,7 +696,9 @@ void pica_end_ticks(uint64_t out[PICA_END_COUNT]) { memcpy(out, s_endTicks, size
  * 5 is 1 with the GX-mode shader's work beyond the position left out (no lighting, no texture
  * coordinates), 6 is 5 with only the position (and matrix index) fetched: what lighter shaders and
  * fewer attributes would save. 7 binds one small texture in place of every texture without a VRAM
- * copy, 8 in place of every texture: what textures in main memory, and textures at all, cost. */
+ * copy, 8 in place of every texture: what textures in main memory, and textures at all, cost.
+ * 9 changes nothing drawn: like every test it only leaves out the copies' readbacks (the
+ * profiler's game-thread step, while the GX writes are muted and the copies hold nothing real). */
 static int s_gpuTest;
 static C3D_Tex s_smallTex; /* tests 7 and 8: 8x8 white */
 static int s_smallTexReady;
@@ -1968,8 +1970,8 @@ void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, 
 
 static void readback_queue(void)
 {
-	/* Pixels cut to 8x8 (GPU test): the copies hold nothing real, so they must not reach the
-	 * game's memory (the goop map would lose its goop). */
+	/* A GPU test (pixels cut to 8x8, the GX writes muted, ...): the copies hold nothing real, so
+	 * they must not reach the game's memory (the goop map would lose its goop). */
 	if (s_gpuTest) {
 		s_nrbCur = s_nrbRun = 0;
 		return;

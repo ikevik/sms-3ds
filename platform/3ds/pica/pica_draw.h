@@ -251,7 +251,7 @@ void pica_end_ticks(uint64_t out[PICA_END_COUNT]);
 /* Cycles the GPU test mode (0 normal, 1 game draws scissored to 8x8 pixels); returns the new mode. */
 int pica_cycle_gpu_test(void);
 int pica_gpu_test(void);
-void pica_set_gpu_test(int mode);  /* 0 normal, else a test (pica_draw.c, s_gpuTest: 1-8) */
+void pica_set_gpu_test(int mode);  /* 0 normal, else a test (pica_draw.c, s_gpuTest: 1-9) */
 /* Non-zero: the draws that follow are scissored to 8x8 pixels (per-object GPU cost). */
 void pica_set_draw_cut(int cut);
 /* Textures in VRAM while space allows (on by default). */

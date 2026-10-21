@@ -19,6 +19,17 @@
 // The GX thread's own time is credited there too (SMS3DS_ProfGxTicks), by object and by where the
 // commands came from: the J3D draw code says which of its parts is sending (decomp patch 3ds-0019,
 // SMS3DS_GxOrigin, kStreamOpOrigin: native J3D stage 0, docs/native-j3d.md).
+// Part 4, the game thread (kGameSteps; also on its own: the bottom right of the bottom screen, low
+// down): its time by phase for kFrames frames in each step, with only the phases timed (object
+// timing costs the game thread some 10 ms a frame, far more than its estimate; one step measures
+// it): drawing normally; with inexact maths (sms_math_fast: plain single-precision matrix routines
+// and the C library's sinf, cosf, expf and powf in place of the exact Gekko arithmetic); with the
+// GPU drawing nothing (GPU test 3); with its GX writes made but dropped at the pipe (GXPC_SetMute
+// level 2: the GX thread, the render thread and the GPU idle); with them muted at the API (level 1:
+// the drawing code runs, the GX calls do next to nothing). The steps between them are what the
+// maths, the other threads' and the GPU's use of the memory system, and the GX calls themselves
+// cost it. The EFB copies' readbacks are left out from the GPU test on until kSettle frames after
+// the last step: those copies hold nothing real.
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
 // Sampling, in builds made with SAMPLE=1 (scripts/build_game_lib.sh, build_platform_lib.sh,
 // build_gx_lib.sh): the game's, the platform layer's and the GX API's functions are compiled with
@@ -42,12 +53,15 @@ void GXPC_Write8(uint8_t v);
 void GXPC_Write32(uint32_t v);
 double pica_gpu_ms_sum(void);
 void pica_set_gpu_test(int mode);
+extern int sms_math_fast;          // mtx.cpp: inexact maths (part 4)
+void GXPC_SetMute(int on);         // gx_api.cpp: the GX writes dropped (part 4)
 int SMS3DS_ProfOn;
 void SMS3DS_ProfPhase(int phase);
 void SMS3DS_ProfObjBegin(const void* vtable, const char* name);
 void SMS3DS_ProfObjEnd(void);
 void SMS3DS_ProfFrame(void);
 void SMS3DS_ProfRequest(void);
+void SMS3DS_ProfRequestGame(void);
 int SMS3DS_ProfState(void);
 volatile int SMS3DS_ProfCutActive;
 int SMS3DS_ProfCutNow(void);
@@ -174,8 +188,9 @@ double s_hookUs;          // what a pair costs (calibrate)
 // state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 7 GPU
 // part (pixels cut, the picture shrunk 8x: nothing clipped at the screen's sides), 5 GPU part
 // (positions collapsed), 6 GPU part (no draws), 8-12 GPU part (GPU tests 5, 6, 0, 7, 8: see
-// s_gpuMinShaderMs), 4 GPU by object
-volatile int s_request;
+// s_gpuMinShaderMs), 4 GPU by object, 13 the game thread (kGameSteps), 14 the last muted frames'
+// copies passing through the GPU
+volatile int s_request;  // 1 the whole run, 2 part 4 alone
 int s_state, s_frame;
 uint64_t s_winStart;
 double s_gpu0, s_cpuFrameMs, s_cpuGpuMs, s_gpuCutMs, s_gpuCollapsedMs, s_cutFrame, s_collapsedFrame, s_gpuShrunkMs,
@@ -477,6 +492,77 @@ Entry* s_cutEntry;
 bool s_cutOutside;
 double s_base, s_cutFrameMs;
 
+// Part 4's steps: SMS3DS_ProfOn (1 objects timed too, 2 phases only), sms_math_fast, the GPU test,
+// the GX mute level (GXPC_SetMute).
+struct GameStep {
+	const char* name;
+	int profOn, math, gpuTest, mute;
+};
+const GameStep kGameSteps[] = {
+    {"drawing normally", 2, 0, 0, 0},
+    {"objects timed too", 1, 0, 0, 0},
+    {"inexact maths", 2, 1, 0, 0},
+    {"the GPU drawing nothing", 2, 0, 3, 0},
+    {"its GX writes dropped at the pipe", 2, 0, 9, 2},
+    {"its GX writes muted at the API", 2, 0, 9, 1},
+};
+enum { kGameStepN = sizeof kGameSteps / sizeof kGameSteps[0] };
+// Each step's phases (ms/frame), frame and GPU time; the step being measured.
+double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN];
+int s_gameStep;
+// Puts step k's settings in place; past the last, normal play's (the GPU test stays until the
+// tail of part 4 ends).
+void setGameStep(int k) {
+	const GameStep* g = k < kGameStepN ? &kGameSteps[k] : nullptr;
+	sms_math_fast = g ? g->math : 0;
+	GXPC_SetMute(g ? g->mute : 0);
+	if (g) pica_set_gpu_test(g->gpuTest);
+}
+// Part 4: a step's phases (end rendering apart: it holds the frame's waits for the GX thread and
+// the screen), and at the end what each step saved, by phase.
+double gameWork(int k) {
+	double sum = 0;
+	for (int i = 0; i < PHASES; i++)
+		if (i != 15) sum += s_gamePh[k][i];
+	return sum;
+}
+void reportGameStep(int k) {
+	char line[768];
+	int at = 0;
+	for (int i = 0; i < PHASES; i++)
+		if (i != 15 && s_gamePh[k][i] >= 0.05)
+			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
+	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f; its work %.1f ms/frame (end rendering, waits "
+	        "included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k], gameWork(k), s_gamePh[k][15], line);
+}
+void reportGameSaved() {
+	for (int k = 1; k < kGameStepN; k++) {
+		char line[768];
+		int at = 0;
+		for (int i = 0; i < PHASES; i++) {
+			const double d = s_gamePh[0][i] - s_gamePh[k][i];
+			if (i != 15 && (d >= 0.1 || d <= -0.1))
+				at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], d);
+		}
+		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
+		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
+	}
+	// The steps as layers: each of the last three takes away one more thing the game thread pays for.
+	const double w0 = gameWork(0), wGpu = gameWork(3), wPipe = gameWork(4), wApi = gameWork(5);
+	fprintf(stderr,
+	        "[prof] game thread's work, ms/frame: %.1f drawing normally (timing objects adds %.1f, inexact maths saves "
+	        "%.1f) = slowed by the GPU's drawing %.1f + slowed by the GX and render threads' work and the stream's "
+	        "buffers %.1f + the GX calls themselves %.1f + the rest %.1f\n",
+	        w0, gameWork(1) - w0, w0 - gameWork(2), w0 - wGpu, wGpu - wPipe, wPipe - wApi, wApi);
+}
+void startGame() {
+	GXPC_Detail = 0;  // as in normal play
+	s_gameStep = 0;
+	setGameStep(0);
+	s_state = 13;
+	s_frame = 0;
+}
+
 void pickTargets() {
 	static Entry* order[kTable];
 	int n = 0;
@@ -763,7 +849,7 @@ int SMS3DS_ProfCutNow(void) {
 
 // GX thread: n vertices added to a batch, credited to the draws' object while profiling.
 void SMS3DS_ProfGxVerts(uint32_t n) {
-	if (!SMS3DS_ProfOn) return;
+	if (SMS3DS_ProfOn != 1) return;
 	if (Entry* e = reinterpret_cast<Entry*>(uintptr_t(GXPC_ProfObj))) e->verts += n;
 }
 
@@ -788,7 +874,7 @@ int SMS3DS_GxOrigin(int origin) {
 }
 
 int SMS3DS_ZoneBegin(int zone) {
-	if (zone < 0 || zone >= kZones || s_zoneDepth >= int(sizeof s_zoneStack / sizeof s_zoneStack[0])) return -1;
+	if (SMS3DS_ProfOn != 1 || zone < 0 || zone >= kZones || s_zoneDepth >= int(sizeof s_zoneStack / sizeof s_zoneStack[0])) return -1;
 	s_zoneStack[s_zoneDepth] = {svcGetSystemTick(), GX3DS_StreamWritten()};
 	return s_zoneDepth++;
 }
@@ -807,10 +893,13 @@ void SMS3DS_ZoneEnd(int zone, int token) {
 void SMS3DS_ProfRequest(void) {
 	if (s_state == 0) s_request = 1;
 }
+void SMS3DS_ProfRequestGame(void) {
+	if (s_state == 0) s_request = 2;
+}
 
-// 0 idle, 1 CPU part, 2 GPU part (for the status screen)
+// 0 idle, 1 CPU part, 2 GPU part, 3 GPU by object, 4 the game thread's steps (for the status screen)
 int SMS3DS_ProfState(void) {
-	return s_state == 4 ? 3 : (s_state == 3 || (s_state >= 5 && s_state <= 12)) ? 2 : s_state == 2 ? 1 : s_request ? 1 : 0;
+	return s_state >= 13 || s_request == 2 ? 4 : s_state == 4 ? 3 : (s_state == 3 || (s_state >= 5 && s_state <= 12)) ? 2 : s_state == 2 || s_request ? 1 : 0;
 }
 
 void SMS3DS_ProfPhase(int phase) {
@@ -830,6 +919,7 @@ void SMS3DS_ProfPhase(int phase) {
 }
 
 void SMS3DS_ProfObjBegin(const void* vtable, const char* name) {
+	if (SMS3DS_ProfOn != 1) return;  // phases only
 	const uint64_t now = svcGetSystemTick();
 	s_calls++;
 	if (s_depth >= int(sizeof s_stack / sizeof s_stack[0])) {
@@ -843,6 +933,7 @@ void SMS3DS_ProfObjBegin(const void* vtable, const char* name) {
 }
 
 void SMS3DS_ProfObjEnd(void) {
+	if (SMS3DS_ProfOn != 1) return;
 	const uint64_t now = svcGetSystemTick();
 	if (s_depth <= 0) return;
 	if (--s_depth >= int(sizeof s_stack / sizeof s_stack[0])) return;
@@ -877,6 +968,14 @@ void SMS3DS_ProfFrame(void) {
 	switch (s_state) {
 	case 0:
 		if (!s_request) return;
+		if (s_request == 2) {
+			s_request = 0;
+			fprintf(stderr, "[prof] game-thread run: %d frames each ", kFrames);
+			for (int k = 0; k < kGameStepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", kGameSteps[k].name);
+			fprintf(stderr, " (nothing drawn for about 6 s at the end; stand still until \"[prof] done\")\n");
+			startGame();
+			return;
+		}
 		s_request = 0;
 		s_state = 2;
 		s_frame = 0;
@@ -885,7 +984,8 @@ void SMS3DS_ProfFrame(void) {
 		        "[prof] profile run: %d frames timed, then %d each with pixels cut to 8x8, that and the picture shrunk 8x, "
 		        "positions collapsed, no draws, pixels cut with a minimal vertex shader, that with only positions "
 		        "fetched, drawing normally, textures outside VRAM swapped for a small one, every texture swapped, "
-		        "then objects' pixels cut one at a time (stand still)\n",
+		        "then objects' pixels cut one at a time, then the game thread drawing normally, with inexact maths "
+		        "and with its GX writes muted (stand still)\n",
 		        kFrames, kFrames);
 		return;
 	case 2:  // CPU part
@@ -988,7 +1088,7 @@ void SMS3DS_ProfFrame(void) {
 			pickTargets();
 			fprintf(stderr,
 			        "[prof] GPU by object: %d objects' draws left out one at a time (the GPU time each costs in all), each line printed as it is "
-			        "measured (keep standing still until \"done\")\n",
+			        "measured (keep standing still until \"[prof] done\")\n",
 			        s_nTargets);
 			s_depth = 0;
 			SMS3DS_ProfOn = 1;
@@ -1018,14 +1118,43 @@ void SMS3DS_ProfFrame(void) {
 				setCut(-1);
 				SMS3DS_ProfOn = 0;
 				reportCut();
-				s_state = 0;
-				GXPC_Detail = 0;
+				GXPC_Detail = 0;  // part 4 as in normal play
+				fprintf(stderr, "[prof] game thread: %d frames each step (nothing drawn for about 6 s at the end; keep "
+				        "standing still until \"[prof] done\")\n", kFrames);
+				startGame();
 				return;
 			}
 			// After every kPerBase targets, normal drawing again.
 			s_step = (s_step >= 0 && s_next % kPerBase == 0) ? -1 : s_next++;
 			setCut(s_step);
 			s_frame = 0;
+		}
+		return;
+	case 13:  // the game thread, step s_gameStep
+		if (++s_frame == kSettle) {
+			resetCpu();
+			s_winStart = s_phaseLast = now;
+			s_phase = 0;
+			s_gpu0 = pica_gpu_ms_sum();
+			SMS3DS_ProfOn = kGameSteps[s_gameStep].profOn;
+		} else if (s_frame == kSettle + kFrames) {
+			SMS3DS_ProfOn = 0;
+			const int k = s_gameStep;
+			for (int i = 0; i < PHASES; i++) s_gamePh[k][i] = s_phaseTicks[i] / double(kFrames) / kTicksPerMs;
+			s_gameFrame[k] = double(now - s_winStart) / kFrames / kTicksPerMs;
+			s_gameGpu[k] = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
+			reportGameStep(k);
+			setGameStep(++s_gameStep);
+			if (s_gameStep == kGameStepN) s_state = 14;
+			s_frame = 0;
+		}
+		return;
+	case 14:  // the last muted frames reach the GPU behind the game thread
+		if (++s_frame == kSettle) {
+			pica_set_gpu_test(0);
+			reportGameSaved();
+			fprintf(stderr, "[prof] done\n");
+			s_state = 0;
 		}
 		return;
 	}
