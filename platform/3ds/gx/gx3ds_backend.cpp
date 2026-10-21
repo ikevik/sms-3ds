@@ -227,6 +227,7 @@ extern "C" uint64_t GXPC_DlFineTicks[8];  // patch 0032: list calls split finer,
 extern "C" uint32_t GXPC_DlFineCount[8];
 extern "C" uint32_t GXPC_DlCalls, GXPC_DlHits, GXPC_DlVerts, GXPC_DlRecords, GXPC_DlNew, GXPC_DlUncached;
 extern "C" uint32_t GXPC_J3DStats[16];  // native J3D (patch 0035, gx_fifo.cpp)
+extern "C" uint32_t GXPC_J3DPkgStats[4];  // its compiled shapes (patch 0037): drawn from, made, not compilable, kept
 extern "C" uint64_t GXPC_J3DTicks[8], GXPC_J3DHashed;
 static uint32_t s_j3dSigs, s_j3dSigBad;  // verify mode (renderJ3DSig): native draws checked, differences
 extern "C" uint64_t GXPC_DlHashed;
@@ -497,6 +498,17 @@ static void perfFrameEnd() {
 				        "verified %.1f, differences so far %lu\n",
 				        j[0], j[14], j[1], j[2], j[3], j[4], j[5], j[6], j[7], j[8], j[13], j[12], j[9], j[10], j[11], j[15],
 				        (unsigned long)s_j3dSigBad);
+			static uint32_t p0[3];
+			double pk[3];
+			for (int i = 0; i < 3; i++) {
+				pk[i] = (GXPC_J3DPkgStats[i] - p0[i]) / frames;
+				p0[i] = GXPC_J3DPkgStats[i];
+			}
+			if (any > 0)
+				fprintf(stderr,
+				        "[perf]   native J3D compiled shapes per frame: %.1f shapes drawn from them, %.1f made, %.1f not "
+				        "compilable; %lu kept\n",
+				        pk[0], pk[1], pk[2], (unsigned long)GXPC_J3DPkgStats[3]);
 			static uint64_t t0[8], h0;
 			double t[8], tall = 0;
 			for (int i = 0; i < 8; i++) {
@@ -5255,6 +5267,13 @@ void GX3DS_SetGpuTransform(int on) { gx::s_gpuTransform = on != 0; }
 // Off before the first frame: the renderer draws on the game thread (no render thread).
 void GX3DS_SetRenderThread(int on) { gx::s_rtWanted = on != 0; }
 void GX3DS_SetDropDraws(int on) { gx::s_dropDraws.store(on != 0); }
+// Native J3D's verify mode: differences the render thread has found so far.
+uint32_t GX3DS_J3DSigBad(void) { return uint32_t(gx::s_j3dSigBad); }
+// The GX thread's and the render thread's busy time so far, in ticks (profile runs).
+void GX3DS_ThreadTicks(uint64_t out[2]) {
+	out[0] = gx::s_sBusy.load();
+	out[1] = gx::s_rBusy;
+}
 void GX3DS_SetVerboseLog(int on) { gx::s_verbose = on != 0; }
 int GX3DS_GetGpuTransform(void) { return gx::s_gpuTransform ? 1 : 0; }
 // Batches drawn on the GPU and the CPU path so far.

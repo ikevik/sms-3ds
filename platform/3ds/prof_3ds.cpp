@@ -21,18 +21,20 @@
 // SMS3DS_GxOrigin, kStreamOpOrigin: native J3D stage 0, docs/native-j3d.md).
 // Part 4, the game thread (kGameSteps; also on its own: the bottom right of the bottom screen, low
 // down): its time by phase for kFrames frames in each step, with only the phases timed (object
-// timing costs the game thread some 10 ms a frame, far more than its estimate). The steps: drawing
-// normally, with and without the whole-linear-heap flush at each frame's end (pica_set_heap_flush:
-// the kernel's whole-cache maintenance); the GX writes made but dropped at the pipe (GXPC_SetMute
-// level 2: the GX thread, the render thread and the GPU idle), with and without the flush; without
-// it, a thread on core 2 rewriting a buffer over and over (kHogTiny: L2 traffic in little of its
-// space; kHogSmall: half of the 2 MB L2 the cores share); and the GX writes muted at the API (level
-// 1: the drawing code runs, the GX calls do next to nothing). The EFB copies' readbacks are left
-// out from the third step on until kSettle frames after the last: those copies hold nothing real.
-// Earlier runs (the steps are a table: kGameSteps): objects timed too cost 10.1 ms a frame;
-// inexact maths (sms_math_fast) saved nothing; of the game thread's 41.8 ms, the GPU's drawing
-// slowed it by 3.2, the render thread's by 1.2, the GX thread's work and the stream's buffers by 5.0,
-// its GX calls cost 3.3; core 2 rewriting 1 MB slowed it alone by 19.4 ms, 8 MB by 23.0.
+// timing costs the game thread some 10 ms a frame, far more than its estimate). The steps (a table,
+// kGameSteps): native J3D off (decomp patch 3ds-0020: the static draw buffers' J3D draws as one op
+// each), on through stage 1's path only (GXPC_J3DPackages 0), on with compiled shapes (sms-port
+// patch 0037), off again (how far the view drifted), and on with compiled shapes in verify mode
+// (the render thread compares its registers before each native draw with what the old path would
+// have sent it: correctness, not timing). Each reports the game thread's work by phase and the GX
+// and render threads' busy time. Earlier runs' steps, kept as settings in the table:
+// objects timed too cost 10.1 ms a frame; inexact maths (sms_math_fast) saved nothing; of the game
+// thread's 41.8 ms, the GPU's drawing slowed it by 3.2, the render thread's by 1.2, the GX
+// thread's work and the stream's buffers by 5.0, its GX calls cost 3.3; alone, a thread on core 2
+// rewriting 64 KB slowed it by 12.1 ms, 1 MB by 19.1-19.4, 8 MB by 23.0 (kHogTiny, kHogSmall:
+// other cores' L2 traffic and space cost it far more than memory bandwidth); the whole-linear-heap
+// flush at each frame's end (pica_set_heap_flush) 0.6. GPU tests other than 0 leave the EFB
+// copies' readbacks out, and the goop map's copies (pica_gpu_test_seen).
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
 // Sampling, in builds made with SAMPLE=1 (scripts/build_game_lib.sh, build_platform_lib.sh,
 // build_gx_lib.sh): the game's, the platform layer's and the GX API's functions are compiled with
@@ -61,6 +63,12 @@ extern int sms_math_fast;          // mtx.cpp: inexact maths (part 4)
 void GXPC_SetMute(int on);         // gx_api.cpp: the GX writes dropped (part 4)
 void GX3DS_SetDropDraws(int on);   // gx3ds_backend.cpp: the render thread draws nothing (part 4)
 void pica_set_heap_flush(int on);  // pica_draw.c: the whole-linear-heap flush at frame end (part 4)
+void GXPC_SetNativeJ3DMode(int mode);  // gx_api.cpp: native J3D's mode, its buffers kept (part 4)
+int GXPC_NativeJ3DMode(void);
+extern int GXPC_J3DPackages;       // gx_fifo.cpp: native J3D's compiled shapes (part 4)
+void GX3DS_ThreadTicks(uint64_t out[2]);  // gx3ds_backend.cpp: the GX and render threads' busy ticks
+uint32_t GX3DS_J3DSigBad(void);    // ... native J3D's verify mode: differences found so far
+extern uint32_t GXPC_J3DStats[16], GXPC_J3DPkgStats[4];  // gx_fifo.cpp: native J3D's counters
 int SMS3DS_ProfOn;
 void SMS3DS_ProfPhase(int phase);
 void SMS3DS_ProfObjBegin(const void* vtable, const char* name);
@@ -553,25 +561,31 @@ double hogRate() {
 
 // Part 4's steps: SMS3DS_ProfOn (1 objects timed too, 2 phases only), sms_math_fast, the GPU test,
 // the GX mute level (GXPC_SetMute), the render thread's draws dropped, the whole-heap flush, the
-// hog's buffer (0: none).
+// hog's buffer (0: none), native J3D (-1 as the settings set it, 0 off, 1 on), compiled shapes.
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
+	int native, packages;
 };
-enum { kGsNormal, kGsNoFlush, kGsAlone, kGsAloneNoFlush, kGsHogTiny, kGsHogSmall, kGsApi, kGameStepN };
+enum { kGsOff, kGsStage1, kGsCompiled, kGsOffAgain, kGsVerify, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"drawing normally", 2, 0, 0, 0, 0, 1, 0},
-    {"drawing normally without the whole-heap flush", 2, 0, 0, 0, 0, 0, 0},
-    {"alone (its GX writes dropped at the pipe)", 2, 0, 9, 2, 0, 1, 0},
-    {"alone without the flush", 2, 0, 9, 2, 0, 0, 0},
-    {"that, with core 2 rewriting 64 KB (L2 traffic, little of its space)", 2, 0, 9, 2, 0, 0, kHogTiny},
-    {"that, with core 2 rewriting 1 MB (half the L2)", 2, 0, 9, 2, 0, 0, kHogSmall},
-    {"its GX writes muted at the API, without the flush", 2, 0, 9, 1, 0, 0, 0},
+    {"native J3D off", 2, 0, 0, 0, 0, 1, 0, 0, 1},
+    {"native J3D on, stage 1's path", 2, 0, 0, 0, 0, 1, 0, 1, 0},
+    {"native J3D on, compiled shapes", 2, 0, 0, 0, 0, 1, 0, 1, 1},
+    {"native J3D off again", 2, 0, 0, 0, 0, 1, 0, 0, 1},
+    {"native J3D on, compiled shapes, verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1},
 };
+// The verify step's counters at its start: native draws verified, shape ops drawn from compiled
+// shapes, differences.
+uint32_t s_verify0[3];
+// Native J3D's settings before part 4 (put back after it).
+int s_nativeSaved = -1, s_packagesSaved = 1;
 // Each step's phases (ms/frame), frame and GPU time, and the hog's rate (MB/s, 0: none or not
 // started); the step being measured.
 double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN], s_gameHog[kGameStepN];
+double s_gameGx[kGameStepN], s_gameRender[kGameStepN];  // the GX and render threads' busy ms/frame
+uint64_t s_thread0[2];
 int s_gameStep;
 // Puts step k's settings in place; past the last, normal play's (the GPU test stays until the
 // tail of part 4 ends).
@@ -581,6 +595,8 @@ void setGameStep(int k) {
 	GXPC_SetMute(g ? g->mute : 0);
 	GX3DS_SetDropDraws(g ? g->dropDraws : 0);
 	pica_set_heap_flush(g ? g->heapFlush : 1);
+	GXPC_SetNativeJ3DMode(g && g->native >= 0 ? g->native : s_nativeSaved);
+	GXPC_J3DPackages = g ? g->packages : s_packagesSaved;
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -604,9 +620,9 @@ void reportGameStep(int k) {
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
 	char hog[48] = "";
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
-	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f%s; its work %.1f ms/frame (end rendering, waits "
-	        "included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k], hog, gameWork(k), s_gamePh[k][15],
-	        line);
+	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
+	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
+	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
 }
 void reportGameSaved() {
 	for (int k = 1; k < kGameStepN; k++) {
@@ -620,20 +636,20 @@ void reportGameSaved() {
 		fprintf(stderr, "[prof] game thread, %s saves %.1f ms/frame of its work (frame %.1f -> %.1f ms) by phase:%s\n",
 		        kGameSteps[k].name, gameWork(0) - gameWork(k), s_gameFrame[0], s_gameFrame[k], at ? line : " none");
 	}
-	const double w0 = gameWork(kGsNormal), wAlone = gameWork(kGsAlone), wAloneNF = gameWork(kGsAloneNoFlush);
 	fprintf(stderr,
-	        "[prof] the whole-heap flush at each frame's end costs the game thread %.1f ms/frame drawing normally "
-	        "(frame %.1f -> %.1f ms without it), %.1f alone\n",
-	        w0 - gameWork(kGsNoFlush), s_gameFrame[kGsNormal], s_gameFrame[kGsNoFlush], wAlone - wAloneNF);
-	fprintf(stderr,
-	        "[prof] game thread alone without the flush (%.1f ms) with core 2 rewriting 64 KB (L2 traffic, little of "
-	        "its space): %.1f ms more at %.0f MB/s | 1 MB (half its space): %.1f ms more at %.0f MB/s | the GX calls "
-	        "themselves %.1f, the rest %.1f\n",
-	        wAloneNF, gameWork(kGsHogTiny) - wAloneNF, s_gameHog[kGsHogTiny], gameWork(kGsHogSmall) - wAloneNF,
-	        s_gameHog[kGsHogSmall], wAloneNF - gameWork(kGsApi), gameWork(kGsApi));
+	        "[prof] native J3D, ms/frame: game thread's work %.1f off, %.1f stage 1, %.1f compiled shapes (%.1f off "
+	        "again) | GX thread %.1f, %.1f, %.1f (%.1f) | render thread %.1f, %.1f, %.1f (%.1f) | frame %.1f, %.1f, "
+	        "%.1f (%.1f) | GPU %.1f, %.1f, %.1f (%.1f)\n",
+	        gameWork(kGsOff), gameWork(kGsStage1), gameWork(kGsCompiled), gameWork(kGsOffAgain), s_gameGx[kGsOff],
+	        s_gameGx[kGsStage1], s_gameGx[kGsCompiled], s_gameGx[kGsOffAgain], s_gameRender[kGsOff],
+	        s_gameRender[kGsStage1], s_gameRender[kGsCompiled], s_gameRender[kGsOffAgain], s_gameFrame[kGsOff],
+	        s_gameFrame[kGsStage1], s_gameFrame[kGsCompiled], s_gameFrame[kGsOffAgain], s_gameGpu[kGsOff],
+	        s_gameGpu[kGsStage1], s_gameGpu[kGsCompiled], s_gameGpu[kGsOffAgain]);
 }
 void startGame() {
 	GXPC_Detail = 0;  // as in normal play
+	s_nativeSaved = GXPC_NativeJ3DMode();
+	s_packagesSaved = GXPC_J3DPackages;
 	s_gameStep = 0;
 	setGameStep(0);
 	s_state = 13;
@@ -1049,7 +1065,7 @@ void SMS3DS_ProfFrame(void) {
 			s_request = 0;
 			fprintf(stderr, "[prof] game-thread run: %d frames each ", kFrames);
 			for (int k = 0; k < kGameStepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", kGameSteps[k].name);
-			fprintf(stderr, " (nothing drawn for about 13 s from the third step on; stand still until \"[prof] done\")\n");
+			fprintf(stderr, " (stand still until \"[prof] done\")\n");
 			startGame();
 			return;
 		}
@@ -1196,8 +1212,8 @@ void SMS3DS_ProfFrame(void) {
 				SMS3DS_ProfOn = 0;
 				reportCut();
 				GXPC_Detail = 0;  // part 4 as in normal play
-				fprintf(stderr, "[prof] game thread: %d frames each step (nothing drawn for about 13 s from the third "
-				        "step on; keep standing still until \"[prof] done\")\n", kFrames);
+				fprintf(stderr, "[prof] game thread: %d frames each step (keep standing still until \"[prof] done\")\n",
+				        kFrames);
 				startGame();
 				return;
 			}
@@ -1213,6 +1229,10 @@ void SMS3DS_ProfFrame(void) {
 			s_winStart = s_phaseLast = now;
 			s_phase = 0;
 			s_gpu0 = pica_gpu_ms_sum();
+			GX3DS_ThreadTicks(s_thread0);
+			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
+			s_verify0[1] = GXPC_J3DPkgStats[0];
+			s_verify0[2] = GX3DS_J3DSigBad();
 			SMS3DS_ProfOn = kGameSteps[s_gameStep].profOn;
 		} else if (s_frame == kSettle + kFrames) {
 			SMS3DS_ProfOn = 0;
@@ -1221,7 +1241,17 @@ void SMS3DS_ProfFrame(void) {
 			s_gameFrame[k] = double(now - s_winStart) / kFrames / kTicksPerMs;
 			s_gameGpu[k] = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
 			s_gameHog[k] = hogRate();
+			uint64_t th[2];
+			GX3DS_ThreadTicks(th);
+			s_gameGx[k] = double(th[0] - s_thread0[0]) / kFrames / kTicksPerMs;
+			s_gameRender[k] = double(th[1] - s_thread0[1]) / kFrames / kTicksPerMs;
 			reportGameStep(k);
+			if (k == kGsVerify)
+				fprintf(stderr,
+				        "[prof] compiled shapes verified: %lu native draws checked by the render thread, %lu shape ops "
+				        "drawn from compiled shapes, %lu differences (the render thread logs each as [j3d] lines)\n",
+				        (unsigned long)(GXPC_J3DStats[15] - s_verify0[0]), (unsigned long)(GXPC_J3DPkgStats[0] - s_verify0[1]),
+				        (unsigned long)(GX3DS_J3DSigBad() - s_verify0[2]));
 			setGameStep(++s_gameStep);
 			if (s_gameStep == kGameStepN) s_state = 14;
 			s_frame = 0;

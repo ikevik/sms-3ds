@@ -312,7 +312,10 @@ static const char kDefaultSettings[] =
     "# checked before each native draw (verify), in the draw buffers named. Being tested:\n"
     "# each build has its own default, which a line here overrides.\n"
     "# native_j3d = off\n"
-    "# native_j3d_buffers = MapOpa,StaticMapObj_SunOpa\n";
+    "# native_j3d_buffers = MapOpa,StaticMapObj_SunOpa\n"
+    "# Native shapes drawn from compiled blocks once they have drawn natively (on), or found and\n"
+    "# checked in the display-list cache on every draw (off). The same draws either way.\n"
+    "# native_j3d_packages = on\n";
 
 // Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
 #ifndef SMS3DS_MIPS_DEFAULT
@@ -340,6 +343,7 @@ extern "C" void GXPC_SetFastStateLists(int on);
 	"MapOpa,MapXlu,StaticMapObj_SunOpa,StaticMapObj_ShadowOpa,StaticMapObj_SunXlu,StaticMapObj_ShadowXlu," \
 	"Mirror_Opa,Mirror_Xlu,Sky_Opa,Sky_Xlu,AfterIndirect_Xlu,ChrOpa,ChrXlu"
 extern "C" void GXPC_SetNativeJ3D(int mode, const char* buffers);
+extern "C" int GXPC_J3DPackages;  // patch 0037: native shapes from compiled blocks (settings.txt native_j3d_packages)
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -460,8 +464,10 @@ static void* game_thread(void*)
 		char bufs[256] = SMS3DS_NATIVE_J3D_BUFFERS;
 		setting_value(kSettingsPath, "native_j3d_buffers", bufs, sizeof bufs);
 		GXPC_SetNativeJ3D(nativeJ3D, bufs);
-		fprintf(stderr, "[3ds] J3D drawn natively: %s, in %s (native_j3d, native_j3d_buffers)\n",
-		        nativeJ3D == 1 ? "on" : nativeJ3D == 2 ? "check" : nativeJ3D == 3 ? "verify" : "off", bufs);
+		if (setting_value(kSettingsPath, "native_j3d_packages", v, sizeof v)) GXPC_J3DPackages = strcmp(v, "off") != 0;
+		fprintf(stderr, "[3ds] J3D drawn natively: %s, in %s, %s (native_j3d, native_j3d_buffers, native_j3d_packages)\n",
+		        nativeJ3D == 1 ? "on" : nativeJ3D == 2 ? "check" : nativeJ3D == 3 ? "verify" : "off", bufs,
+		        GXPC_J3DPackages ? "compiled shapes" : "no compiled shapes");
 	}
 	g_phase = 1;
 	port_init(2, argv);

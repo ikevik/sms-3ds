@@ -1,0 +1,390 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -1018,7 +1018,13 @@
+         }
+         b = e;
+     }
++}
++// The mode alone, the buffers kept (profile runs: prof_3ds.cpp's game-thread steps).
++void GXPC_SetNativeJ3DMode(int mode) {
++    GXPC_J3DVerify = mode == 3;
++    s_j3dMode = mode == 3 ? 1 : mode;
+ }
++int GXPC_NativeJ3DMode(void) { return GXPC_J3DVerify ? 3 : s_j3dMode; }
+ int SMS3DS_J3DBufferMode(const char* name) {
+     if (!s_j3dMode || !name) return 0;
+     for (int i = 0; i < s_j3dBufs; i++)
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <deque>
++#include <new>
+ #include <map>
+ #include <unordered_map>
+ 
+@@ -1743,6 +1744,9 @@
+     uint32_t skip = 0;    // calls left to run without the cache
+     uint32_t checkedClock = 0, checkedFrame = 0;  // when its source bytes were last compared
+     bool hashAlways = false;  // its bytes once changed with no write reported: compared on every call
++#if defined(__3DS__)
++    bool pinned = false;  // a compiled shape draws its runs (native J3D): recording it again bumps s_dlEpoch
++#endif
+ };
+ // The entries (stable addresses) and an open-addressing index of them by
+ // list address (a thousand lookups a frame).
+@@ -1788,7 +1792,15 @@
+     }
+ }
+ #endif
++#if defined(__3DS__)
++// Bumped when an entry a compiled shape draws from is recorded again, and when the cache is
++// cleared: compiled shapes made before then are not used (native J3D, natPkgDraw).
++static uint32_t s_dlEpoch = 1;
++#endif
+ static void dlClear() {
++#if defined(__3DS__)
++    s_dlEpoch++;
++#endif
+     s_dlEntries.clear();
+     s_dlIndex.clear();
+     s_dlCacheBytes = 0;
+@@ -2293,6 +2305,9 @@
+     s_dlCacheBytes -= e.bytes;
+     uint32_t misses = e.misses;
+     bool hashAlways = e.hashAlways;
++#if defined(__3DS__)
++    if (e.pinned) s_dlEpoch++;  // its runs are about to go
++#endif
+     e = DlEntry();
+     e.misses = misses;
+     e.hashAlways = hashAlways;
+@@ -2634,6 +2649,8 @@
+     uint32_t key = 0, vcdvat = 0;
+     NatListCheck check;
+     bool ok = false;
++    uint32_t pkgMade = 0, pkgSkipUntil = 0;  // its compiled shape: when last made; not made again before
++    uint8_t pkgRecent = 0;                   // made again soon after the last time, in a row
+     std::vector<std::pair<uint8_t, uint32_t>> cp;
+     std::vector<J3DImage::Xf> xf;
+ };
+@@ -2792,7 +2809,7 @@
+ 
+ // The XF words a shape group sets: its matrix indices and its vertex-format list's (first group),
+ // its matrices. Sent to the render thread (the open batch drawn first) when one differs.
+-static void natGroupXF(const NatShape& s, const SMS3DSJ3DShapeOp& op, uint32_t gi) {
++static void natGroupXF(const J3DImage::Xf* xf, uint32_t nxf, const SMS3DSJ3DShapeOp& op, uint32_t gi) {
+     static uint32_t pairs[2 * (64 + 2 + 10 * 21)];
+     uint32_t n = 0;
+     auto add = [&](uint32_t a, uint32_t v) {
+@@ -2801,8 +2818,7 @@
+         n++;
+     };
+     if (gi == 0) {
+-        for (const J3DImage::Xf& x : s.xf)
+-            if (n < 64) add(x.addr, x.v);
++        for (uint32_t i = 0; i < nxf && n < 64; i++) add(xf[i].addr, xf[i].v);
+         add(XF_REG_BASE + XFR_MATIDX_A, op.matA);
+         add(XF_REG_BASE + XFR_MATIDX_B, op.matB);
+     }
+@@ -2857,8 +2873,8 @@
+ }
+ 
+ // dlRunOffscreen for a native draw: the position matrix as the native ops left it.
+-static bool natRunOffscreen(const DlRun& r) {
+-    if (!r.hasBox || GXPC_CullOff || effXF(XF_REG_BASE + 0x05) != 0) return false;
++static bool natBoxOffscreen(bool hasBox, const float* box, uint32_t nverts) {
++    if (!hasBox || GXPC_CullOff || effXF(XF_REG_BASE + 0x05) != 0) return false;
+     const uint32_t pm = effXF(XF_REG_BASE + XFR_MATIDX_A) & 63;
+     if (pm * 4 + 12 > XF_MEM_WORDS) return false;
+     float m[12], P[6];
+@@ -2873,7 +2889,7 @@
+     const bool ortho = effXF(XF_REG_BASE + XFR_PROJ + 6) & 1;
+     int l = 0, rt = 0, b = 0, t = 0, behind = 0;
+     for (int c = 0; c < 8; c++) {
+-        const float x = r.box[(c & 1) ? 3 : 0], y = r.box[(c & 2) ? 4 : 1], z = r.box[(c & 4) ? 5 : 2];
++        const float x = box[(c & 1) ? 3 : 0], y = box[(c & 2) ? 4 : 1], z = box[(c & 4) ? 5 : 2];
+         const float vx = m[0] * x + m[1] * y + m[2] * z + m[3];
+         const float vy = m[4] * x + m[5] * y + m[6] * z + m[7];
+         const float vz = m[8] * x + m[9] * y + m[10] * z + m[11];
+@@ -2896,13 +2912,249 @@
+     }
+     if (l < 8 && rt < 8 && b < 8 && t < 8 && behind < 8) return false;
+     GXPC_CullRuns++;
+-    GXPC_CullVerts += r.nverts;
++    GXPC_CullVerts += nverts;
+     GXPC_J3DStats[NJ_CULLED]++;
+     return true;
+ }
++static bool natRunOffscreen(const DlRun& r) { return natBoxOffscreen(r.hasBox, r.box, r.nverts); }
+ 
++// The CP writes a shape's op makes besides its vertex-format list's (J3DShape::draw's).
++static void natShapeCP(const SMS3DSJ3DShapeOp& op) {
++    npCP(CP_ARRAY_BASE + 0, op.pos);
++    npCP(CP_ARRAY_BASE + 1, op.nrm);
++    npCP(CP_ARRAY_BASE + 2, op.col);
++    npCP(CP_ARRAY_BASE + 12, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.drawMtx))));
++    npCP(CP_ARRAY_STRIDE + 12, 0x30);
++    npCP(CP_ARRAY_BASE + 13, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.nrmMtx))));
++    npCP(CP_ARRAY_STRIDE + 13, 0x24);
++    npCP(CP_MATIDX_A, op.matA);
++    npCP(CP_MATIDX_B, op.matB);
++}
++
++// Compiled shapes (docs/native-j3d.md, stage 1b; settings.txt native_j3d_packages). Once a shape's
++// op has drawn natively, what natShape worked out and checked for it is kept in one block: the op
++// fields it was worked out for, its vertex-format list's CP and XF writes, and every group's runs
++// as appendArena takes them. A later op with the same fields draws from the block after a few
++// checks, instead of finding the display-list cache's entries and comparing the vertex state with
++// them field by field (stage 1: ~32 us a shape on Delfino Plaza, mostly cache misses on entries,
++// their arrays and runs, and hash nodes, scattered over the heap). It draws what stage 1 would:
++// the block is used only while
++// - the vertex state its runs were decoded with follows from the op and its vertex-format list
++//   alone (blocks are made only then: natPkgDetermined), and the arrays' byte order is as it was;
++// - no entry it draws runs from has been recorded again, nor the cache cleared (s_dlEpoch), and
++//   its runs are still stored (the arena's generation);
++// - nothing was written, since it was checked, to the pages its lists and array data span (the
++//   write stamps), and it was checked in full (the stage-1 path, which hashes as the cache does)
++//   within kDlRecheckFrames frames.
++extern "C" {
++int GXPC_J3DPackages = 1;      // 0: every shape op takes the stage-1 path
++uint32_t GXPC_J3DPkgStats[4];  // shape ops drawn from compiled shapes, shapes compiled, not compilable, kept now
++}
++struct NatPkgRun {
++    const uint8_t* verts;  // the run's vertices (matrix-index runs: appendArena reads them once)
++    ArenaRef arena;
++    uint32_t fmt, stride, nverts, nidx;
++    float box[6];
++    PrimClass cls;
++    bool hasBox;
++};
++struct NatPkgRange {
++    const uint8_t* p;
++    uint32_t n;
++};
++struct NatPkg {
++    uint32_t shape, vcdvat, pos, nrm, col, matA, matB, ngroups;  // the op's fields it was made for
++    uint32_t list[8], size[8];
++    uint32_t epoch, agen, beGen, clock, frame;
++    bool beDef;
++    uint16_t ncp, nxf, nranges, run0[9];  // group g's runs: [run0[g], run0[g + 1])
++    uint32_t verts[8];                    // the vertices each group's entry loads ([perf])
++    std::pair<uint8_t, uint32_t>* cp;     // the vertex-format list's CP writes
++    J3DImage::Xf* xf;                     // and XF writes
++    NatPkgRun* runs;
++    NatPkgRange* ranges;  // the lists, and the array data their runs were decoded from
++};
++// By shape, open addressing (a few hundred shapes a scene).
++enum { kPkgSlots = 2048 };
++static uint32_t s_pkgKey[kPkgSlots];
++static NatPkg* s_pkg[kPkgSlots];
++static uint32_t s_pkgUsed;
++static inline uint32_t natPkgHash(uint32_t shape) { return (shape * 2654435761u) >> (32 - 11); }
++static NatPkg* natPkgGet(uint32_t shape) {
++    for (uint32_t i = natPkgHash(shape);; i = (i + 1) & (kPkgSlots - 1)) {
++        if (s_pkgKey[i] == shape) return s_pkg[i];
++        if (!s_pkgKey[i]) return nullptr;
++    }
++}
++static void natPkgPut(uint32_t shape, NatPkg* k) {
++    if (s_pkgUsed >= kPkgSlots * 3 / 4) {  // full: start over
++        for (uint32_t i = 0; i < kPkgSlots; i++) free(s_pkg[i]);
++        memset(s_pkgKey, 0, sizeof s_pkgKey);
++        memset(s_pkg, 0, sizeof s_pkg);
++        s_pkgUsed = 0;
++    }
++    uint32_t i = natPkgHash(shape);
++    while (s_pkgKey[i] && s_pkgKey[i] != shape) i = (i + 1) & (kPkgSlots - 1);
++    if (s_pkgKey[i]) {
++        free(s_pkg[i]);
++    } else {
++        s_pkgKey[i] = shape;
++        s_pkgUsed++;
++    }
++    s_pkg[i] = k;
++    GXPC_J3DPkgStats[3] = s_pkgUsed;
++}
++
++// True when the vertex state the entry was decoded with follows from the shape's vertex-format list
++// and its op alone (no register left by earlier commands decides how its lists decode).
++static bool natPkgDetermined(const NatShape& s, const DlEntry& e) {
++    uint32_t set[8] = {};
++    for (const auto& c : s.cp) set[c.first >> 5] |= 1u << (c.first & 31);
++    auto has = [&](uint32_t r) { return ((set[r >> 5] >> (r & 31)) & 1) != 0; };
++    if (!has(CP_VCD_LO) || !has(CP_VCD_HI)) return false;
++    for (uint32_t i = 0; i < 8; i++)
++        if ((e.vatMask >> i) & 1)
++            if (!has(CP_VAT_A + i) || !has(CP_VAT_B + i) || !has(CP_VAT_C + i)) return false;
++    for (const DlArray& a : e.arrays) {
++        if (a.slot >= 12 || !has(CP_ARRAY_STRIDE + a.slot)) return false;
++        if (a.slot > 2 && !has(CP_ARRAY_BASE + a.slot)) return false;  // (0-2: the op's)
++    }
++    return true;
++}
++
++// After natShape drew op natively from these entries: its compiled shape (clock: writeClock()
++// before its checks).
++static void natPkgMake(NatShape& s, const SMS3DSJ3DShapeOp& op, DlEntry* const* ent, uint32_t clock) {
++    if (!trustWriteStamps() || s.check.hashAlways || !arenaEnabled() || traceFile()) return;
++    // One whose block keeps failing (a page it spans written every frame, say) is left to the
++    // stage-1 path for a while rather than made again on every draw.
++    if (int32_t(g_displayFrames - s.pkgSkipUntil) < 0) return;
++    if (s.pkgMade && g_displayFrames - s.pkgMade < 60) {
++        if (++s.pkgRecent >= 4) {
++            s.pkgRecent = 0;
++            s.pkgSkipUntil = g_displayFrames + 1024;
++            GXPC_J3DPkgStats[2]++;
++            return;
++        }
++    } else {
++        s.pkgRecent = 0;
++    }
++    s.pkgMade = g_displayFrames;
++    const uint8_t* vcd = reinterpret_cast<const uint8_t*>(uintptr_t(op.vcdvat));
++    uint32_t nruns = 0, nranges = 1;
++    for (uint32_t gi = 0; gi < op.ngroups; gi++) {
++        if (!op.group[gi].list) continue;
++        const DlEntry* e = ent[gi];
++        if (!e || e->hashAlways || !natPkgDetermined(s, *e)) {
++            GXPC_J3DPkgStats[2]++;
++            return;
++        }
++        nruns += uint32_t(e->runs.size());
++        nranges += 1 + uint32_t(e->arrays.size());
++    }
++    if (nruns > 0xFFFF || nranges > 0xFFFF) return;
++    auto up8 = [](size_t n) { return (n + 7) & ~size_t(7); };
++    const size_t oCp = up8(sizeof(NatPkg)), oXf = oCp + up8(s.cp.size() * sizeof(s.cp[0])),
++                 oRuns = oXf + up8(s.xf.size() * sizeof(J3DImage::Xf)), oRanges = oRuns + up8(nruns * sizeof(NatPkgRun)),
++                 total = oRanges + nranges * sizeof(NatPkgRange);
++    uint8_t* mem = static_cast<uint8_t*>(malloc(total));
++    if (!mem) return;
++    NatPkg* k = new (mem) NatPkg();
++    k->shape = op.shape;
++    k->vcdvat = op.vcdvat;
++    k->pos = op.pos;
++    k->nrm = op.nrm;
++    k->col = op.col;
++    k->matA = op.matA;
++    k->matB = op.matB;
++    k->ngroups = op.ngroups;
++    k->epoch = s_dlEpoch;
++    k->agen = arenaGeneration();
++    k->beGen = s_beGen;
++    k->beDef = s_defaultArrayBE;
++    k->clock = clock;
++    k->frame = g_displayFrames;
++    k->ncp = uint16_t(s.cp.size());
++    k->nxf = uint16_t(s.xf.size());
++    k->cp = reinterpret_cast<std::pair<uint8_t, uint32_t>*>(mem + oCp);
++    k->xf = reinterpret_cast<J3DImage::Xf*>(mem + oXf);
++    k->runs = reinterpret_cast<NatPkgRun*>(mem + oRuns);
++    k->ranges = reinterpret_cast<NatPkgRange*>(mem + oRanges);
++    for (size_t i = 0; i < s.cp.size(); i++) new (&k->cp[i]) std::pair<uint8_t, uint32_t>(s.cp[i]);
++    for (size_t i = 0; i < s.xf.size(); i++) new (&k->xf[i]) J3DImage::Xf(s.xf[i]);
++    uint32_t nr = 0, ng = 0;
++    k->ranges[ng++] = NatPkgRange{vcd, 0xC0};
++    for (uint32_t gi = 0; gi < op.ngroups; gi++) {
++        k->list[gi] = op.group[gi].list;
++        k->size[gi] = op.group[gi].size;
++        k->run0[gi] = uint16_t(nr);
++        k->verts[gi] = 0;
++        DlEntry* e = op.group[gi].list ? ent[gi] : nullptr;
++        if (!e) continue;
++        e->pinned = true;
++        k->verts[gi] = e->verts;
++        k->ranges[ng++] = NatPkgRange{reinterpret_cast<const uint8_t*>(uintptr_t(op.group[gi].list)), op.group[gi].size};
++        for (const DlArray& a : e->arrays) k->ranges[ng++] = NatPkgRange{a.base + a.lo, a.hi - a.lo};
++        for (const DlRun& r : e->runs) {
++            NatPkgRun& x = *new (&k->runs[nr++]) NatPkgRun();
++            x.verts = r.verts.data();
++            x.arena = r.arena;
++            x.fmt = r.fmt;
++            x.stride = r.stride;
++            x.nverts = r.nverts;
++            x.nidx = uint32_t(r.idx.size());
++            memcpy(x.box, r.box, sizeof x.box);
++            x.cls = r.cls;
++            x.hasBox = r.hasBox;
++        }
++    }
++    k->run0[op.ngroups] = uint16_t(nr);
++    k->nranges = uint16_t(ng);
++    natPkgPut(op.shape, k);
++    GXPC_J3DPkgStats[1]++;
++}
++
++// Draws op from its compiled shape; false when there is none that holds (natShape then takes the
++// stage-1 path, which compiles the shape again when it draws natively).
++static bool natPkgDraw(const SMS3DSJ3DShapeOp& op, uint64_t& t) {
++    NatPkg* k = natPkgGet(op.shape);
++    if (!k || k->vcdvat != op.vcdvat || k->pos != op.pos || k->nrm != op.nrm || k->col != op.col || k->matA != op.matA ||
++        k->matB != op.matB || k->ngroups != op.ngroups || !op.ngroups)
++        return false;
++    for (uint32_t gi = 0; gi < op.ngroups; gi++)
++        if (k->list[gi] != op.group[gi].list || k->size[gi] != op.group[gi].size) return false;
++    if (k->epoch != s_dlEpoch || k->agen != arenaGeneration() || k->beGen != s_beGen || k->beDef != s_defaultArrayBE ||
++        g_displayFrames - k->frame >= kDlRecheckFrames || g.bpMask != 0xFFFFFF || !arenaEnabled() || traceFile())
++        return false;
++    for (uint32_t i = 0; i < k->nranges; i++)
++        if (!unwrittenSince(k->ranges[i].p, k->ranges[i].n, k->clock)) return false;
++    njAdd(2, t);
++    GXPC_J3DStats[NJ_SHAPE]++;
++    GXPC_J3DPkgStats[0]++;
++    j3dBatchNative(true);
++    j3dStateOut();
++    for (uint32_t i = 0; i < k->ncp; i++) npCP(k->cp[i].first, k->cp[i].second);
++    natShapeCP(op);
++    njAdd(3, t);
++    for (uint32_t gi = 0; gi < op.ngroups; gi++) {
++        natGroupXF(k->xf, k->nxf, op, gi);
++        if (GXPC_J3DVerify) natVerifySig();
++        njAdd(5, t);
++        for (uint32_t r = k->run0[gi]; r < k->run0[gi + 1]; r++) {
++            const NatPkgRun& x = k->runs[r];
++            if (natBoxOffscreen(x.hasBox, x.box, x.nverts)) continue;
++            appendArena(x.cls, x.fmt, x.stride, x.arena, x.nverts, x.nidx, x.verts);
++        }
++        s_vertsLoaded += k->verts[gi];
++        njAdd(6, t);
++    }
++    return true;
++}
++
+ static void natShape(const SMS3DSJ3DShapeOp& op, bool check) {
+     uint64_t t = njNow();
++    if (!check && GXPC_J3DPackages && natPkgDraw(op, t)) return;
++    const uint32_t clock = writeClock();  // (before the checks: a write during them is seen next time)
+     NatShape& s = s_natShapes[op.shape];
+     const uint8_t* vcd = reinterpret_cast<const uint8_t*>(uintptr_t(op.vcdvat));
+     if (s.key != op.shape || s.vcdvat != op.vcdvat || !natListSame(vcd, 0xC0, s.check)) {
+@@ -2967,18 +3219,10 @@
+     j3dBatchNative(true);
+     j3dStateOut();
+     for (const auto& c : s.cp) npCP(c.first, c.second);
+-    npCP(CP_ARRAY_BASE + 0, op.pos);
+-    npCP(CP_ARRAY_BASE + 1, op.nrm);
+-    npCP(CP_ARRAY_BASE + 2, op.col);
+-    npCP(CP_ARRAY_BASE + 12, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.drawMtx))));
+-    npCP(CP_ARRAY_STRIDE + 12, 0x30);
+-    npCP(CP_ARRAY_BASE + 13, ptrToPhys(reinterpret_cast<const void*>(uintptr_t(op.nrmMtx))));
+-    npCP(CP_ARRAY_STRIDE + 13, 0x24);
+-    npCP(CP_MATIDX_A, op.matA);
+-    npCP(CP_MATIDX_B, op.matB);
++    natShapeCP(op);
+     njAdd(3, t);
+     for (uint32_t gi = 0; gi < op.ngroups; gi++) {
+-        natGroupXF(s, op, gi);
++        natGroupXF(s.xf.data(), uint32_t(s.xf.size()), op, gi);
+         if (GXPC_J3DVerify) natVerifySig();
+         njAdd(5, t);
+         DlEntry* e = ent[gi];
+@@ -2991,6 +3235,7 @@
+         e->misses = 0;
+         njAdd(6, t);
+     }
++    if (GXPC_J3DPackages) natPkgMake(s, op, ent, clock);
+ }
+ 
+ // kStreamOpJ3DEnd (check mode): what the calls left against what the op said they would.
