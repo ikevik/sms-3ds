@@ -1,0 +1,33 @@
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DDrawBuffer.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DDrawBuffer.cpp
+@@ -1,5 +1,13 @@
+ #include <JSystem/J3D/J3DGraphBase/J3DDrawBuffer.hpp>
+ #include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0016
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0027, platform/3ds/prof_3ds.cpp): in a profile run's J3D ceiling step
++// (SMS3DS_J3DCeiling), each draw buffer is either left undrawn (SMS3DS_J3DCeilingBegin non-zero)
++// or drawn with its GX writes muted until SMS3DS_J3DCeilingEnd.
++extern "C" int SMS3DS_J3DCeiling;
++extern "C" int SMS3DS_J3DCeilingBegin(void);
++extern "C" void SMS3DS_J3DCeilingEnd(void);
++#endif
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DTexture.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DMaterial.hpp>
+@@ -201,6 +209,16 @@
+ void J3DDrawBuffer::draw() const
+ {
+ 	SMS3DS_ZONE(5);
++#if defined(__3DS__)
++	if (SMS3DS_J3DCeiling) {
++		if (SMS3DS_J3DCeilingBegin())
++			return;
++		drawFunc func = drawFuncTable[mDrawType];
++		(this->*func)();
++		SMS3DS_J3DCeilingEnd();
++		return;
++	}
++#endif
+ 	drawFunc func = drawFuncTable[mDrawType];
+ 	(this->*func)();
+ }
