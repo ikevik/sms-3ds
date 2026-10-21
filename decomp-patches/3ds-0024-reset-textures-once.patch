@@ -1,0 +1,46 @@
+--- a/src/MarioUtil/DrawUtil.cpp
++++ b/src/MarioUtil/DrawUtil.cpp
+@@ -886,6 +886,13 @@
+ extern "C" void SMS3DS_ReInitTexture();
+ extern "C" void SMS3DS_DrawInitState();
+ extern "C" void GXPC_StateBlock(void** slot, void (*fn)(void), const char* name);
++// 3DS port (decomp patch 3ds-0024): ReInitializeGX's texture loads (the 4x4 null texture into maps
++// 0-7) are followed at once by J3DSys::reinitTexture's, the same texture into the same maps: they
++// are left out while SMS3DS_ResetTexOnce is set (settings.txt reset_textures_once). The second loads
++// write every register the first did, with the same values; the texture-region callback (its only
++// other effect, a cursor the port never reads, gx_api.cpp) is left as it would be modulo its 8
++// regions. Draw zones 22-25 time the parts.
++extern "C" int SMS3DS_ResetTexOnce;
+ static void ReInitAndDrawInitState()
+ {
+ 	SMS3DS_ReInitState();
+@@ -895,12 +902,24 @@
+ {
+ 	SMS3DS_ZONE(8);
+ 	static void* block;
+-	SMS3DS_ReInitTexture();
+-	j3dSys.reinitTexture();
+-	GXPC_StateBlock(&block, ReInitAndDrawInitState, "ReInitializeGX + SMS_DrawInit");
++	if (!SMS3DS_ResetTexOnce) {
++		SMS3DS_ZONE(22);
++		SMS3DS_ReInitTexture();
++	}
++	{
++		SMS3DS_ZONE(23);
++		j3dSys.reinitTexture();
++	}
++	{
++		SMS3DS_ZONE(24);
++		GXPC_StateBlock(&block, ReInitAndDrawInitState, "ReInitializeGX + SMS_DrawInit");
++	}
+ 	OSInitFastCast();
+-	j3dSys.setTexCacheRegion(GX_TEXCACHE_32K);
+-	SMS_ResetTexCacheRegion();
++	{
++		SMS3DS_ZONE(25);
++		j3dSys.setTexCacheRegion(GX_TEXCACHE_32K);
++		SMS_ResetTexCacheRegion();
++	}
+ }
+ #endif
+ 
