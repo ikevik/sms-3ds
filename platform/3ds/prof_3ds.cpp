@@ -675,13 +675,13 @@ void startGame() {
 
 // Part 5, the game thread by object (the bottom right of the bottom screen, low down): one window
 // with objects timed ranks the objects drawing in the GX list, silhouette and GX post phases by
-// their own time; then the top kSkipTargets have their drawing left out one at a time (decomp
-// patch 3ds-0021: the object's perform loses CUE_DRAW, its children's drawing with it), timed by
-// phase only, with every object drawn again before every kSkipPerBase of them and at the end. What
+// their own time; then the top kSkipTargets have their perform left out one at a time in those
+// phases, whatever its cue (decomp patch 3ds-0021; its children's performs with it: the lit models,
+// lights and mirror draw on cues other than CUE_DRAW), timed by phase only, with every object drawn again before every kSkipPerBase of them and at the end. What
 // a target's window saves against the window drawing everything before it is what the object's
 // drawing costs in all: its own work, its GX calls, and what the GX thread, the render thread and
 // the GPU then spend on it and take from the game thread through the memory they share.
-const int kSkipTargets = 14, kSkipPerBase = 4;
+const int kSkipTargets = 18, kSkipPerBase = 4;
 struct SkipTarget {
 	const void* vt;
 	const char* name;
@@ -1112,8 +1112,8 @@ void SMS3DS_ProfRequestGame(void) {
 }
 
 // 0 idle, 1 CPU part, 2 GPU part, 3 GPU by object, 4 the game thread's steps or objects (for the status screen)
-// Part 5 (decomp patch 3ds-0021, JDrama::TViewObj::testPerform with CUE_DRAW): 1 to leave this
-// object's drawing out.
+// Part 5 (decomp patch 3ds-0021, JDrama::TViewObj::testPerform): 1 to leave this object's perform
+// out (only the target, only in its phase: one of the drawing phases).
 int SMS3DS_ProfSkip(const void* vtable, const char* name) {
 	const SkipTarget* t = s_skipNow;
 	if (!t || t->vt != vtable || t->phase != s_phase || (t->byName && name != t->name)) return 0;
