@@ -609,6 +609,33 @@ static void status_thread(void*) {
 	}
 }
 
+// Quitting: libctru's last step (__libctru_exit, weak) unmaps the linear heap and the app heap,
+// then ends the process. The port's other threads are still alive then (the GX and render
+// threads, the VI retrace timer, the game thread parked at PADRead), their stacks and data in
+// those heaps, and one that woke in between faulted on its own stack (crash dumps 35 and 36: the
+// render thread, then the retrace timer). When nothing runs in this process afterwards (no loader
+// return address), the heaps are left to svcExitProcess, which stops every thread before it frees
+// the process's memory; a loader that returns into the process gets them back first, as there.
+extern "C" {
+extern u32 __ctru_heap, __ctru_heap_size, __ctru_linear_heap, __ctru_linear_heap_size;
+extern void (*__system_retAddr)(void);
+void envDestroyHandles(void);
+void __sync_fini(void);
+void __libctru_exit(int rc)
+{
+	(void)rc;
+	if (__system_retAddr) {
+		u32 tmp = 0;
+		svcControlMemory(&tmp, __ctru_linear_heap, 0, __ctru_linear_heap_size, MEMOP_FREE, (MemPerm)0);
+		svcControlMemory(&tmp, __ctru_heap, 0, __ctru_heap_size, MEMOP_FREE, (MemPerm)0);
+	}
+	envDestroyHandles();
+	__sync_fini();
+	if (__system_retAddr) __system_retAddr();
+	svcExitProcess();
+}
+}
+
 int main()
 {
 	osSetSpeedupEnable(true);
@@ -637,6 +664,9 @@ int main()
 	printf("app mem free %lu MB\n", (unsigned long)(osGetMemRegionFree(MEMREGION_APPLICATION) >> 20));
 	fprintf(stderr, "[3ds] %s 3DS, heap %lu MB, linear free %lu MB\n", isNew ? "New" : "Old",
 	        (unsigned long)(envGetHeapSize() >> 20), (unsigned long)(linearSpaceFree() >> 20));
+	fprintf(stderr, "[3ds] at quit: %s\n",
+	        __system_retAddr ? "the loader returns into this process (the heaps handed back first)"
+	                         : "the process ends (its heaps left to svcExitProcess)");
 	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\ntouch: top=view  bottom: L=trace M=GPU R=pixel test\n", LOG_PATH);
 
 	// Holding B at launch starts on the CPU vertex path (as the BR touch toggle), to tell a GPU
