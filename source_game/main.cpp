@@ -145,6 +145,18 @@ static void read_thp_frames(int32_t* video, int32_t* audio)
 	memcpy(audio, ActivePlayer + 0xF4, sizeof *audio);
 }
 
+// The probe reads the game's objects from the main thread while the game changes them (a stage
+// load frees and builds its directors), so it follows a pointer only into mapped memory: the
+// regular heap (MEM1 and the game's heaps) or the program image. A stale TCardLoad pointer
+// (0x7a060) followed while Pianta Village loaded faulted the main thread (crash dump 37).
+extern "C" u32 __ctru_heap, __ctru_heap_size;
+extern "C" char __start__[], __end__[];
+static bool probe_readable(uintptr_t p, size_t n)
+{
+	const uintptr_t heap = __ctru_heap, image = (uintptr_t)__start__;
+	return p + n >= p && ((p >= heap && p + n <= heap + __ctru_heap_size) || (p >= image && p + n <= (uintptr_t)__end__));
+}
+
 static SceneState read_scene()
 {
 	const unsigned char* a = gpApplication;
@@ -152,7 +164,7 @@ static SceneState read_scene()
 	uintptr_t dir;
 	memcpy(&dir, a + 0x04, sizeof dir);
 	s.director      = dir;
-	s.director_vtbl = dir ? *(const uintptr_t*)dir : 0;  // resolve with nm to get the class
+	s.director_vtbl = dir && probe_readable(dir, 4) ? *(const uintptr_t*)dir : 0;  // resolve with nm to get the class
 	s.state         = a[0x08];
 	s.curr_stage    = a[0x0E];
 	s.curr_scen     = a[0x0F];
@@ -165,11 +177,11 @@ static SceneState read_scene()
 	s.mar_state = -1;
 	s.cardload = 0;
 	s.cl10 = s.cl14 = s.cl18 = 0;
-	if (dir && s.director_vtbl == (uintptr_t)(_ZTV12TMarDirector + 8)) {
+	if (dir && s.director_vtbl == (uintptr_t)(_ZTV12TMarDirector + 8) && probe_readable(dir, 0x74)) {
 		const unsigned char* d = (const unsigned char*)dir;
 		s.mar_state = d[0x64];
 		memcpy(&s.cardload, d + 0x70, sizeof s.cardload);
-		if (s.cardload) {
+		if (s.cardload && probe_readable(s.cardload, 0x1C)) {
 			memcpy(&s.cl10, (const unsigned char*)s.cardload + 0x10, 4);
 			memcpy(&s.cl14, (const unsigned char*)s.cardload + 0x14, 4);
 			memcpy(&s.cl18, (const unsigned char*)s.cardload + 0x18, 4);
