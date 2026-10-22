@@ -326,9 +326,9 @@ static const char kDefaultSettings[] =
     "# J3D models drawn natively (docs/native-j3d.md): their GX calls sent as one op per material and\n"
     "# shape, drawn from what the GX thread compiled (on), the calls as before (off), or both, the\n"
     "# ops checked against what the calls leave (check), or on with the render thread's registers\n"
-    "# checked before each native draw (verify), in the draw buffers named. Being tested:\n"
-    "# each build has its own default, which a line here overrides.\n"
-    "# native_j3d = off\n"
+    "# checked before each native draw (verify), in the draw buffers named. On saves Delfino Plaza's\n"
+    "# frame about 2 ms, with the same pixels (verify mode: 0 differences).\n"
+    "# native_j3d = on\n"
     "# native_j3d_buffers = MapOpa,StaticMapObj_SunOpa\n"
     "# Native shapes drawn from compiled blocks once they have drawn natively (on), or found and\n"
     "# checked in the display-list cache on every draw (off). The same draws either way.\n"
@@ -366,7 +366,7 @@ extern "C" void GXPC_SetFastStateLists(int on);
 // J3D drawn natively (decomp patch 3ds-0020, sms-pc-port patch 0035; settings.txt native_j3d,
 // native_j3d_buffers): 0 off, 1 on, 2 check, 3 verify (on, the render side's registers checked).
 #ifndef SMS3DS_NATIVE_J3D_DEFAULT
-#define SMS3DS_NATIVE_J3D_DEFAULT 0
+#define SMS3DS_NATIVE_J3D_DEFAULT 1
 #endif
 // The draw buffers (less "DrawBuf ", '_' for a space): the static ones TDrawBufObj draws.
 #define SMS3DS_NATIVE_J3D_BUFFERS \
