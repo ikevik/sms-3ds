@@ -55,13 +55,16 @@ void GX3DS_SetMergeDuplicates(int on);
 void GX3DS_SetReorder(int on);
 void GXPC_SetWriteFilter(int on);
 extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
-// Demo builds (make DEMO=slide): the stage the game boots into and returns to (decomp patch
-// 0008); -1 in the normal build.
+// Demo builds (make DEMO=slide, DEMO=test11): the stage and scenario the game boots into and
+// returns to (decomp patch 0008); stage -1 in the normal build.
 #ifndef SMS_DEMO_STAGE
 #define SMS_DEMO_STAGE -1
 #endif
-extern "C" int SMS3DS_DemoStage;
-int SMS3DS_DemoStage = SMS_DEMO_STAGE;
+#ifndef SMS_DEMO_SCENARIO
+#define SMS_DEMO_SCENARIO 0
+#endif
+extern "C" int SMS3DS_DemoStage, SMS3DS_DemoScenario;
+int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
 extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
