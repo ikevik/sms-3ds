@@ -29,9 +29,13 @@
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
 // (draw zones, also timed with phases only). A run that sets a direction instead has ceilings, each
 // compared with the normal windows either side (kRoleCeiling). This one has no batch: this
-// build's own windows (an -O3 build of the game against the -O2 one is two apps, each with this
-// run), then one with objects timed that ranks the game-logic objects (kRoleRank), then the checks
-// (native J3D, now on by default, verified). Earlier runs' steps, kept as settings in the table:
+// build's own windows, with draw zones 37-48 inside the game logic's biggest callers (decomp patch
+// 3ds-0028: SDLModel::entry, the sky, the event watcher's name lookups, the hit checks, the
+// actors' clipping, the water manager's draws), GPU test windows each leaving one of the water
+// manager's draws or the sky's sphere out (SMS3DS_ProfDrawSkip), then the checks. Earlier runs'
+// steps, kept as settings in the table: the game-logic objects ranked with objects timed
+// (kRoleRank) put Mario's movement first (2.5 ms), then the NPCs (2.3), the particle manager (1.7);
+// the -O3 build against the -O2 one (two apps) took the frame 43.3 -> 41.8 ms;
 // static J3D native through stage 1b took the GX thread 41.6 -> 39.8 ms and the frame 46.8 -> 44.9;
 // the bypass of the GX thread's registers (gone) did no better, 8-10 ms of GX time for ~347 ops
 // either way (the op timers: GXPC_J3DSampleOn); its first form (a draw record per run, every
@@ -121,6 +125,10 @@ int SMS3DS_TelopClip = 1;
 // A J3D ceiling step's (kJ3d*: 0 none), applied to each draw buffer (decomp patch 3ds-0027,
 // SMS3DS_J3DCeilingBegin).
 int SMS3DS_J3DCeiling;
+// A GPU test window's draws left out (decomp patch 3ds-0028): 1 the Shine's shadow volume
+// (TModelWaterManager), 2 the water's refraction and specular, 4 the water volume and its
+// silhouette, 8 the sky's sphere. 0 in normal play.
+int SMS3DS_ProfDrawSkip;
 int SMS3DS_PrintClip;
 float SMS3DS_PrintClipX0, SMS3DS_PrintClipX1;
 unsigned long SMS3DS_PrintGlyphs[2];
@@ -226,7 +234,7 @@ uint64_t s_calls;
 // sms-port patch 0039, the state blocks and their commands' parts; from 30 on 3ds-0025, the HUD's
 // and the particles' parts and the shadows' GX setup), nested ones included: calls, ticks, GX stream bytes. The open ones are a
 // stack (they nest, on the game thread).
-enum { kZones = 37 };
+enum { kZones = 49 };
 const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
                                        "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
                                        "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit",
@@ -240,7 +248,12 @@ const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys
                                        "block: API copy and filter", "block: the command", "HUD: the balloon",
                                        "HUD: scissor, setup and gauge", "JPADraw::draw (an emitter)",
                                        "JPADraw::drawParticle", "JPADraw::drawChild", "JPA: TEV and emitter setup",
-                                       "shadows: GX setup (initShadowGX)"};
+                                       "shadows: GX setup (initShadowGX)", "SDLModel::entry",
+                                       "SDLModel::entry: J3DModel::entry", "TSky::perform", "TSky: its model's perform",
+                                       "TSky: the sphere", "event watcher: name lookups", "TEventWatcher::perform",
+                                       "hit checks: checkActorsHit", "clipping: TLiveManager::clipActorsAux",
+                                       "clipping: TMapObjBaseManager::clipActors", "water: draw cue",
+                                       "water: refraction and specular"};
 uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
 uint32_t s_zoneCalls[kZones];
 struct ZoneOpen {
@@ -641,12 +654,12 @@ double hogRate() {
 // once (SMS3DS_ResetTexOnce; -1 as set), the state blocks' command compiled
 // (GXPC_SetStateBlockCompiled; -1 as set), the news ticker's glyphs outside its window left out
 // (SMS3DS_TelopClip; -1 as set), the window's role (kRole*), J3D's ceiling (kJ3d*), compiled shapes
-// drawn unchecked (GXPC_J3DNoCheck: a ceiling).
+// drawn unchecked (GXPC_J3DNoCheck: a ceiling), the draws left out (SMS3DS_ProfDrawSkip).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck;
+	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck, drawSkip;
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
@@ -656,19 +669,25 @@ enum { kRoleNormal, kRoleOn, kRoleCeiling, kRoleWarm, kRoleChecks, kRoleRank };
 // thread nothing), at the pipe (the game thread makes them; the GX thread, the render thread and the
 // GPU never see them), or not drawn at all.
 enum { kJ3dNormal, kJ3dMuteApi, kJ3dMutePipe, kJ3dNoDraw };
-// No batch now: this build's own figures (an -O3 build of the game against an -O2 one is two apps,
-// each with this run), its game-logic objects ranked, then every check.
-enum { kGsWarm, kGsN1, kGsN2, kGsN3, kGsN4, kGsRank, kGsChecks, kGameStepN };
+// No batch now: this build's own windows, with draw zones inside the game logic's biggest callers
+// (decomp patch 3ds-0028), and GPU test windows leaving out the water manager's draws and the sky's
+// sphere one part at a time, each compared with the normal windows either side, then the checks.
+enum { kGsWarm, kGsN1, kGsShine, kGsN2, kGsRefrac, kGsN3, kGsVolume, kGsN4, kGsSky, kGsN5, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"the game-logic objects ranked (objects timed: not for timing)", 1, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1,
-     kRoleRank, 0, 0},
+    {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0, 0},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
+    {"the Shine's shadow volume left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0, 1},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
+    {"the water's refraction and specular left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0,
+     2},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
+    {"the water volume and its silhouette left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0,
+     4},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
+    {"the sky's sphere left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0, 8},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
     {"this build, every check run, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1, 0, 2, 2, -1, -1, -1,
-     kRoleChecks, 0, 0},
+     kRoleChecks, 0, 0, 0},
 };
 int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
@@ -713,6 +732,7 @@ void setGameStep(int k) {
 	GXPC_SetNativeJ3DMode(g && g->native >= 0 ? g->native : s_nativeSaved);
 	GXPC_J3DPackages = g && g->packages >= 0 ? g->packages : s_packagesSaved;
 	GXPC_J3DNoCheck = g ? g->noCheck : 0;
+	SMS3DS_ProfDrawSkip = g ? g->drawSkip : 0;
 	GXPC_J3DSampleOn = g != nullptr;
 	GX3DS_SetCompactRings(g ? g->rings : 0);
 	SMS3DS_WaveMode = g && g->wave >= 0 ? g->wave : s_waveSaved;
