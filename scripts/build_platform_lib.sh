@@ -53,7 +53,7 @@ export CXXF="$COMMON -std=gnu++11"
 export CF="$COMMON -std=gnu99 -fcommon"
 
 # 3DS-side units (shims + pad) live in platform/3ds and need libctru headers.
-for f in posix_shims.cpp pad_sdk.cpp stubs_3ds.cpp game_new_3ds.cpp pad_3ds.c prof_3ds.cpp thp_3ds.cpp; do echo "@3ds/$f" >> "$ROOT/build/platform_units.txt"; done
+for f in posix_shims.cpp pad_sdk.cpp stubs_3ds.cpp game_new_3ds.cpp pad_3ds.c prof_3ds.cpp thp_3ds.cpp audio_3ds.cpp; do echo "@3ds/$f" >> "$ROOT/build/platform_units.txt"; done
 CTRU="-I$DEVKITPRO/libctru/include"
 export CTRU
 

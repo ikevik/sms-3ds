@@ -301,6 +301,19 @@ static const char kDefaultSettings[] =
     "# Skip the game's movies: on or off.\n"
     "skip_movies = off\n"
     "\n"
+    "# Game audio (docs/audio-3ds.md): on (music and sound effects, mixed by the 3DS's DSP), off (no\n"
+    "# sound: a little faster), software (sms-pc-port's software mixer instead, to compare) or silent\n"
+    "# (the game's sound driver runs and nothing plays, to measure). on and software need\n"
+    "# sdmc:/3ds/dspfirm.cdc (made once by the DSP1 homebrew); without it the game runs without sound.\n"
+    "audio = on\n"
+    "# JAudio updates each voice every N subframes of 2.5 ms: 2 (the default: about half the work, the\n"
+    "# same sound to the ear, since the 3DS's DSP takes a voice's state every 4.9 ms anyway) or 1 (the\n"
+    "# game's own).\n"
+    "audio_update_interval = 2\n"
+    "# With audio not off: every N seconds turn to the next of on, software and silent, and log what\n"
+    "# each costs ([audio] lines). 0: stay.\n"
+    "# audio_cycle = 10\n"
+    "\n"
     "# Delfino Plaza's Shine shadow: how many of its 5 shells to draw (0: all 5). Each costs\n"
     "# about 1 ms a frame; they only soften the shadow's edge over a pixel or two.\n"
     "shine_shadow_shells = 1\n"
@@ -393,6 +406,19 @@ extern "C" int SMS3DS_TelopClip;     // decomp patch 3ds-0026: the ticker's glyp
 extern "C" void GXPC_SetStateBlockCompiled(int on);  // patch 0039 (gx_state_block_compiled)
 extern "C" void pica_set_heap_flush(int on);  // pica_draw.c (heap_flush)
 extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt profile_low_touch)
+// Sound on the 3DS's DSP (platform/3ds/audio_3ds.cpp; settings.txt audio, audio_cycle): 1 on,
+// 0 off, 2 software mixer, 3 silent.
+#ifndef SMS3DS_AUDIO_DEFAULT
+#define SMS3DS_AUDIO_DEFAULT 1
+#endif
+// Subframes between JAudio's updates of each voice (settings.txt audio_update_interval; the game's own
+// is 1). 2 halves most of that work in Delfino Plaza (0.5-0.6 ms a frame) and sounded the same.
+#ifndef SMS3DS_AUDIO_UPDATE_INTERVAL_DEFAULT
+#define SMS3DS_AUDIO_UPDATE_INTERVAL_DEFAULT 2
+#endif
+extern "C" int SMS3DS_AudioInit(int mode, int cycleSeconds);
+extern "C" void SMS3DS_AudioSetUpdateInterval(int subframes);
+extern "C" void SMS3DS_AudioExit(void);
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
 #ifndef SMS3DS_SHINE_SHELLS_DEFAULT
@@ -459,11 +485,6 @@ static void* game_thread(void*)
 	static char a0[] = "sms3ds";
 	static char a1[] = DISC_PATH;
 	char* argv[] = {a0, a1, NULL};
-	// No audio output on the 3DS yet, and sms-pc-port's software DSP mixer is slower than real
-	// time on the ARM11: the audio thread (highest priority) then never waits for its next DMA
-	// and the game thread is never scheduled again (seen as a freeze on entering the title
-	// stage). Run silently until there is an ndsp backend and a cheaper mixer.
-	setenv("SMS_NO_AUDIO", "1", 0);
 	// Everything the game keeps lives under sdmc:/sms/, next to the disc image: the memory card
 	// (sms-pc-port's card.cpp: SMS_SAVE_DIR), settings.txt (port_runtime.cpp: SMS_SETTINGS), and,
 	// through the working directory, the relative lookups (mods/, mods/languages/,
@@ -489,6 +510,31 @@ static void* game_thread(void*)
 	// No heat-wave shimmer unless settings.txt asks for it: a screen copy and a full-screen
 	// distortion pass every frame in the sunny stages (Delfino Airstrip and Plaza among them).
 	if (!setting_given(kSettingsPath, "heat_haze")) setenv("SMS_HEAT_HAZE", "0", 0);
+	// Sound on the 3DS's DSP unless settings.txt says otherwise (audio = off, software or silent).
+	// With audio = off, or when the DSP cannot be used (no sdmc:/3ds/dspfirm.cdc), MSound gets an
+	// empty sound configuration and the AI DMA stays idle (sms-pc-port's noaudio.cpp,
+	// SMS_NO_AUDIO): the game runs silently, as before there was a 3DS DSP backend. (sms-pc-port
+	// also reads `audio` itself, as SMS_AUDIO: anything but off, or 0 set here for silent, leaves
+	// its output on.)
+	{
+		char v[16];
+		int mode = SMS3DS_AUDIO_DEFAULT, cycle = 0;
+		if (setting_value(kSettingsPath, "audio", v, sizeof v))
+			mode = strcmp(v, "off") == 0 ? 0 : strcmp(v, "on") == 0 ? 1 : strcmp(v, "software") == 0 ? 2
+			     : strcmp(v, "silent") == 0 ? 3 : SMS3DS_AUDIO_DEFAULT;
+		if (setting_value(kSettingsPath, "audio_cycle", v, sizeof v)) cycle = atoi(v);
+		if (!mode || !SMS3DS_AudioInit(mode, cycle)) {
+			mode = 0;
+			setenv("SMS_NO_AUDIO", "1", 0);
+		} else if (mode == 3 && cycle <= 0) {
+			setenv("SMS_AUDIO", "0", 0);  // no output: ai.cpp paces the AI DMA from the host clock
+		}
+		if (mode)
+			SMS3DS_AudioSetUpdateInterval(setting_value(kSettingsPath, "audio_update_interval", v, sizeof v)
+			                                  ? atoi(v) : SMS3DS_AUDIO_UPDATE_INTERVAL_DEFAULT);
+		static const char* const kAudio[] = {"off", "on (the 3DS DSP)", "software mixer", "silent (no voice plays)"};
+		fprintf(stderr, "[3ds] audio: %s (audio%s)\n", kAudio[mode], cycle > 0 && mode ? ", audio_cycle" : "");
+	}
 	{
 		char v[16];
 		if (setting_value(kSettingsPath, "shine_shadow_shells", v, sizeof v)) SMS3DS_ShineShells = atoi(v);
@@ -933,6 +979,7 @@ int main()
 	pad3ds_quit = 1;
 	for (int i = 0; i < 40 && !pad3ds_parked; i++) svcSleepThread(10000000LL);  // at most 400 ms
 	pica_request_stop();
+	SMS3DS_AudioExit();  // the DSP stops playing what it was given
 	svcSleepThread(100000000LL);
 	// _exit, not a return from main: exit's atexit handlers and static destructors can wait on
 	// the game thread (its locks, its emulated OS), and a stuck game thread then kept the

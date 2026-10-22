@@ -67,6 +67,11 @@ SMSLIBS  += -Wl,--wrap=THPVideoDecode
 # Before the game rewrites a display list in place, wait while the GX thread has yet to read it
 # (platform/3ds/gx/gx3ds_backend.cpp).
 SMSLIBS  += -Wl,--wrap=GDInitGDLObj
+# The game thread's sound work each frame, MSound::mainLoop, timed for the [audio] lines
+# (platform/3ds/audio_3ds.cpp).
+SMSLIBS  += -Wl,--wrap=_ZN6MSound8mainLoopEv
+# ... and the audio thread's sequencer and channel updates.
+SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel16subframeCallbackEv -Wl,--wrap=_ZN8JASystem11TDSPChannel9updateAllEv
 # The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
 # and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
 SMSLIBS  += -Wl,--no-enum-size-warning
