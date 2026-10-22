@@ -3552,7 +3552,8 @@ static const uint32_t kXmBlocks = XF_MEM_WORDS / 16, kTlutBlocks = TMEM_TLUT_SIZ
 // numbers as the last copy record brought them.
 static uint64_t s_gWait[3], s_qBytes;
 static uint32_t s_qPeak, s_qExt;
-static uint64_t s_rBusy, s_rIdle, s_perfRBusy0, s_perfRIdle0;
+static std::atomic<uint64_t> s_rBusy{0};  // (read by profile runs on the game thread: GX3DS_ThreadTicks)
+static uint64_t s_rIdle, s_perfRBusy0, s_perfRIdle0;
 static uint64_t s_gWaitSeen[3], s_perfGWait0[3], s_qBytesSeen, s_perfQBytes0;
 static uint32_t s_qPeakWin, s_qExtSeen;
 
@@ -4089,10 +4090,17 @@ static void renderDrain() {
 static void renderMain(void*) {
 	t_render = true;
 	for (;;) {
-		const uint64_t t0 = svcGetSystemTick();
-		while (s_head.load() != s_tail.load(std::memory_order_relaxed)) renderDrain();
-		const uint64_t t1 = svcGetSystemTick();
-		s_rBusy += t1 - t0;
+		// Busy time is credited after each pass over the queue, not only when it empties: a render
+		// thread that stays behind for seconds credited nothing in one profile window and all of it
+		// in the next (0.0 ms, then 112.8).
+		uint64_t t0 = svcGetSystemTick();
+		while (s_head.load() != s_tail.load(std::memory_order_relaxed)) {
+			renderDrain();
+			const uint64_t t = svcGetSystemTick();
+			s_rBusy += t - t0;
+			t0 = t;
+		}
+		const uint64_t t1 = t0;
 		// Alone on its core: poll for a while before sleeping, so the game thread rarely has to
 		// wake it (a kernel call per record otherwise).
 		if (s_rtCore == 2) {

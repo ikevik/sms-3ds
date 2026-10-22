@@ -10,6 +10,10 @@
 #                    fell 40.0 -> 39.0 ms and the frame 43.3 -> 41.8 against -O2, with the code
 #                    11% larger; GCC's loop-UB and array-bounds warnings found nothing at -O3)
 #   SAMPLE=1         instrument every function for profile runs' sampler (platform/3ds/prof_3ds.cpp)
+#   SAMPLE_ONLY="src/"  instrument only the units under these paths (space-separated prefixes) for
+#                    the sampler: time in the units left out (JSystem, the maths, the GX API) is
+#                    charged to the instrumented function that called them, and their many small
+#                    functions add no hook calls (SAMPLE=1's hooks cost ~43 ms a frame)
 #   AUDIO_SAMPLE=1   instrument JAudio's functions only, for the audio thread's sampler
 #                    (platform/3ds/audio_3ds.cpp): their hooks are renamed __audio_prof_enter/_exit
 set -uo pipefail
@@ -81,6 +85,9 @@ compile_one() {
   asample=""
   case "$rel" in libs/JSystem/src/JAudio/*) [ -n "${AUDIO_SAMPLE:-}" ] && asample=1 ;; esac
   [ -n "$asample" ] && extra="$extra -finstrument-functions -finstrument-functions-exclude-file-list=.h"
+  for pre in ${SAMPLE_ONLY:-}; do
+    case "$rel" in "$pre"*) extra="$extra -finstrument-functions -finstrument-functions-exclude-file-list=.h"; break ;; esac
+  done
   if [ "$kind" = "cxx" ]; then
     $CXX $CXXF $CP932 $extra $INCS -c "$DECOMP/$rel" -o "$out" 2>"$out.err" || { echo "FAIL $rel"; return 1; }
   else
@@ -91,7 +98,7 @@ compile_one() {
   rm -f "$out.err"
 }
 export -f compile_one
-export CXX CC CXXF CF CP932 INCS OBJ DECOMP OBJCOPY AUDIO_SAMPLE
+export CXX CC CXXF CF CP932 INCS OBJ DECOMP OBJCOPY AUDIO_SAMPLE SAMPLE_ONLY
 
 rm -f "$OBJ"/*.o "$OBJ"/*.err
 tr '\n' '\0' < "$ROOT/build/units.tsv" | xargs -0 -P "$JOBS" -I{} bash -c 'compile_one "$@"' _ {} | tee "$ROOT/build/compile_failures.txt"

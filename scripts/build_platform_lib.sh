@@ -48,6 +48,9 @@ GC_ABI="-fno-short-enums -fsigned-char"
 # the audio, which runs on its own thread. SMS3DS_SAMPLE doubles the host threads' stacks
 # (os_thread.cpp, patch 0029): every instrumented frame is bigger.
 INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h -DSMS3DS_SAMPLE=1"
+# SAMPLE_ONLY (build_game_lib.sh): the game's units alone are instrumented; their threads still get
+# the bigger stacks.
+[ -z "$INSTR" ] && [ -n "${SAMPLE_ONLY:-}" ] && INSTR="-DSMS3DS_SAMPLE=1"
 export CXX CC INCS OBJ PCPORT P3DS GC_ABI INSTR
 export CXXF="$COMMON -std=gnu++11"
 export CF="$COMMON -std=gnu99 -fcommon"

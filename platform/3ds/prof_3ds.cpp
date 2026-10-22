@@ -59,8 +59,8 @@
 // copies' readbacks out, and the goop map's copies (pica_gpu_test_seen).
 // Each part skips kSettle frames first: the GPU runs up to two frames behind the game thread.
 // Sampling, in builds made with SAMPLE=1 (scripts/build_game_lib.sh, build_platform_lib.sh,
-// build_gx_lib.sh): the game's, the platform layer's and the GX API's functions are compiled with
-// -finstrument-functions, and every call on the game thread pushes the function on a shadow stack
+// build_gx_lib.sh), or SAMPLE_ONLY for the game's own units alone: the game's, the platform
+// layer's and the GX API's functions are compiled with -finstrument-functions, and every call on the game thread pushes the function on a shadow stack
 // (__cyg_profile_func_enter/exit below). Through part 1 a thread on core 2 reads its top every
 // kSampleNs: the function the game thread is in, by phase, without timing each call. Other builds
 // never call the hooks and leave it out.
@@ -1256,6 +1256,25 @@ void reportSamples(double frames) {
 	printAgg(aggFrom(s_fnTab, draw, true, msPer), 40, drawMs);
 	fprintf(stderr, "[prof]   GX list and GX post together, by function and its caller:\n");
 	printAgg(aggFrom(s_pairTab, draw, false, msPer), 40, drawMs);
+	// The game logic's phases (hit check, movement, calc-anim, last-tick): where builds that
+	// instrument only the game's own units (SAMPLE_ONLY) charge the JSystem, maths and GX time to
+	// the game function that called it.
+	const int kLogic[4] = {3, 4, 7, 8};
+	uint32_t logic = 0;
+	double logicMs = 0;
+	for (int k = 0; k < 4; k++) {
+		const int p = kLogic[k];
+		logic |= 1u << p;
+		logicMs += s_sampPhase[p] * msPer[p];
+		fprintf(stderr, "[prof]   %s, %.1f ms/frame (%u samples), outside any instrumented function %.2f ms\n",
+		        kPhaseName[p], s_sampPhase[p] * msPer[p], s_sampPhase[p], s_sampOut[p] * msPer[p]);
+	}
+	fprintf(stderr, "[prof]   game logic, %.1f ms/frame, by function:\n", logicMs);
+	printAgg(aggFrom(s_fnTab, logic, false, msPer), 50, logicMs);
+	fprintf(stderr, "[prof]   game logic, by function and all it calls:\n");
+	printAgg(aggFrom(s_fnTab, logic, true, msPer), 50, logicMs);
+	fprintf(stderr, "[prof]   game logic, by function and its caller:\n");
+	printAgg(aggFrom(s_pairTab, logic, false, msPer), 40, logicMs);
 	fprintf(stderr, "[prof]   all phases, %.1f ms/frame, by function:\n", all);
 	printAgg(aggFrom(s_fnTab, 0xFFFFu, false, msPer), 50, all);
 }
