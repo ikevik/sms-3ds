@@ -8,6 +8,8 @@
 #   LIMIT=N          compile only the first N units (quick test)
 #   OPT=-O2          optimization level
 #   SAMPLE=1         instrument every function for profile runs' sampler (platform/3ds/prof_3ds.cpp)
+#   AUDIO_SAMPLE=1   instrument JAudio's functions only, for the audio thread's sampler
+#                    (platform/3ds/audio_3ds.cpp): their hooks are renamed __audio_prof_enter/_exit
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECOMP="${DECOMP:-$ROOT/build/decomp-patched}"
@@ -74,15 +76,20 @@ compile_one() {
   IFS=$'\t' read -r kind rel pch <<< "$1"
   out="$OBJ/$(echo "$rel" | tr '/' '_').o"
   extra=""; [ "$pch" = "1" ] && extra="-include $DECOMP/include/SMS.pch"
+  asample=""
+  case "$rel" in libs/JSystem/src/JAudio/*) [ -n "${AUDIO_SAMPLE:-}" ] && asample=1 ;; esac
+  [ -n "$asample" ] && extra="$extra -finstrument-functions -finstrument-functions-exclude-file-list=.h"
   if [ "$kind" = "cxx" ]; then
     $CXX $CXXF $CP932 $extra $INCS -c "$DECOMP/$rel" -o "$out" 2>"$out.err" || { echo "FAIL $rel"; return 1; }
   else
-    $CC $CF $INCS -c "$DECOMP/$rel" -o "$out" 2>"$out.err" || { echo "FAIL $rel"; return 1; }
+    $CC $CF $extra $INCS -c "$DECOMP/$rel" -o "$out" 2>"$out.err" || { echo "FAIL $rel"; return 1; }
   fi
+  [ -n "$asample" ] && { "$OBJCOPY" --redefine-sym __cyg_profile_func_enter=__audio_prof_enter \
+    --redefine-sym __cyg_profile_func_exit=__audio_prof_exit "$out" || { echo "FAIL $rel (objcopy)"; return 1; }; }
   rm -f "$out.err"
 }
 export -f compile_one
-export CXX CC CXXF CF CP932 INCS OBJ DECOMP
+export CXX CC CXXF CF CP932 INCS OBJ DECOMP OBJCOPY AUDIO_SAMPLE
 
 rm -f "$OBJ"/*.o "$OBJ"/*.err
 tr '\n' '\0' < "$ROOT/build/units.tsv" | xargs -0 -P "$JOBS" -I{} bash -c 'compile_one "$@"' _ {} | tee "$ROOT/build/compile_failures.txt"

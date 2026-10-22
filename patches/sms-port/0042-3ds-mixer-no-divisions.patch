@@ -1,0 +1,53 @@
+--- a/platform/audio/dsp_mixer.cpp
++++ b/platform/audio/dsp_mixer.cpp
+@@ -400,6 +400,21 @@
+ {
+ 	if (cur == 0 && tgt == 0)
+ 		return;
++	// The same volumes in cheaper ways (a CPU without a divide instruction, as the 3DS's, paid a
++	// library division per sample here): a flat ramp is cur throughout, and SMS's 80-sample
++	// subframes divide by a constant, which compiles to a multiply.
++	if (cur == tgt) {
++		for (int k = 0; k < n; k++)
++			bus[k] += (int32_t)(((int64_t)src[k] * cur) >> shift);
++		return;
++	}
++	if (n == 80) {
++		for (int k = 0; k < 80; k++) {
++			int32_t vol = cur + (tgt - cur) * (k + 1) / 80;
++			bus[k] += (int32_t)(((int64_t)src[k] * vol) >> shift);
++		}
++		return;
++	}
+ 	for (int k = 0; k < n; k++) {
+ 		int32_t vol = cur + (tgt - cur) * (k + 1) / n;
+ 		bus[k] += (int32_t)(((int64_t)src[k] * vol) >> shift);
+@@ -542,8 +557,12 @@
+ 			continue;
+ 		int32_t window[kMaxN + 8];
+ 		memcpy(window, g.fxHist[i], sizeof g.fxHist[i]);
+-		for (int k = 0; k < n; k++)
+-			window[k + 8] = delay[(g.fxPos[i] + k) % len];
++		// (fxPos + k) % len, by subtraction: fxPos < len, so it wraps at most once a subframe.
++		for (int k = 0, p = (int)g.fxPos[i]; k < n; k++, p++) {
++			while (p >= (int)len)
++				p -= (int)len;
++			window[k + 8] = delay[p];
++		}
+ 		memcpy(g.fxHist[i], window + n, sizeof g.fxHist[i]);
+ 		// The history is chronological. Mode bit 0 filters the return; bit
+ 		// 1 filters the feedback after the return has been mixed.
+@@ -582,8 +601,11 @@
+ 		int16_t* delay = fx_memory(f, len);
+ 		if (!delay)
+ 			continue;
+-		for (int k = 0; k < n; k++)
+-			delay[(g.fxPos[i] + k) % len] = (int16_t)sat16(g.bus[3 + i][k]);
++		for (int k = 0, p = (int)g.fxPos[i]; k < n; k++, p++) {
++			while (p >= (int)len)
++				p -= (int)len;
++			delay[p] = (int16_t)sat16(g.bus[3 + i][k]);
++		}
+ 		g.fxPos[i] = (g.fxPos[i] + n) % len;
+ 	}
+ }

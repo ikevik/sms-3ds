@@ -1,0 +1,61 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -2477,8 +2477,17 @@
+ // the batch), 7 hand-overs. GXPC_J3DHashed: bytes hashed checking the entries' data.
+ uint64_t GXPC_J3DTicks[8];
+ uint64_t GXPC_J3DHashed;
++// Profile runs (prof_3ds.cpp, GXPC_J3DSampleOn): the parts above timed for one op in four as well
++// (hand-overs: every one), and each timed op's whole time; ops in all and those timed.
++int GXPC_J3DSampleOn;
++uint64_t GXPC_J3DOpTicks;
++uint32_t GXPC_J3DOps[2];
++// Profile runs: a compiled shape drawn without checking that its lists and arrays are unwritten
++// (a ceiling: not exact if they were written).
++int GXPC_J3DNoCheck;
+ }
+-static inline uint64_t njNow() { return GXPC_Detail ? svcGetSystemTick() : 0; }
++static bool s_njSample;  // the op being worked is timed (GXPC_J3DSampleOn)
++static inline uint64_t njNow() { return GXPC_Detail || s_njSample ? svcGetSystemTick() : 0; }
+ static inline void njAdd(int i, uint64_t& t) {
+     if (!t) return;
+     const uint64_t now = svcGetSystemTick();
+@@ -2498,7 +2507,7 @@
+ // Hands the native ops' registers over to g (see above): just before a command that is not one.
+ static void natHandOver() {
+     if (!s_np.any || s_npCheck) return;
+-    uint64_t t = njNow();
++    uint64_t t = GXPC_Detail || GXPC_J3DSampleOn ? svcGetSystemTick() : 0;
+     flushBatch();  // the open batch's draws are native ones
+     j3dBatchNative(false);
+     GXPC_J3DStats[NJ_HANDOVER]++;
+@@ -3183,8 +3192,9 @@
+     if (k->epoch != s_dlEpoch || k->agen != arenaGeneration() || k->beGen != s_beGen || k->beDef != s_defaultArrayBE ||
+         g_displayFrames - k->frame >= kDlRecheckFrames || g.bpMask != 0xFFFFFF || !arenaEnabled() || traceFile())
+         return false;
+-    for (uint32_t i = 0; i < k->nranges; i++)
+-        if (!unwrittenSince(k->ranges[i].p, k->ranges[i].n, k->clock)) return false;
++    if (!GXPC_J3DNoCheck)
++        for (uint32_t i = 0; i < k->nranges; i++)
++            if (!unwrittenSince(k->ranges[i].p, k->ranges[i].n, k->clock)) return false;
+     njAdd(2, t);
+     GXPC_J3DStats[NJ_SHAPE]++;
+     GXPC_J3DPkgStats[0]++;
+@@ -3349,6 +3359,18 @@
+ 
+ // The stream's native J3D ops (streamOpRun).
+ static void natOp(const uint8_t* p) {
++    static uint32_t s_njCount;
++    s_njSample = GXPC_J3DSampleOn && ((++s_njCount & 3) == 0);
++    GXPC_J3DOps[0]++;
++    const uint64_t t0 = s_njSample ? svcGetSystemTick() : 0;
++    if (s_njSample) GXPC_J3DOps[1]++;
++    struct Done {
++        uint64_t t0;
++        ~Done() {
++            if (t0) GXPC_J3DOpTicks += svcGetSystemTick() - t0;
++            s_njSample = false;
++        }
++    } done{t0};
+     if (p[0] == kStreamOpJ3DMat) {
+         natMaterial(reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 1))), be32(p + 5), p[9] != 0);
+     } else if (p[0] == kStreamOpJ3DShape) {

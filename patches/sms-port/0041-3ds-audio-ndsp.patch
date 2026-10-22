@@ -1,0 +1,187 @@
+--- a/platform/audio/ai.cpp
++++ b/platform/audio/ai.cpp
+@@ -39,6 +39,14 @@
+ extern "C" int port_audio_dsp_frame_pending(void) __attribute__((weak));
+ extern "C" int GXPC_GetSpeed(void) __attribute__((weak));
+ extern "C" void port_dtk_mix(s16* lr, size_t frames, u32 outRate);
++#if defined(__3DS__)
++// 3DS: the blocks play on the 3DS DSP (platform/3ds/audio_3ds.cpp, ndsp), which is also the clock.
++// open is 0 when it cannot; queued counts the blocks written and not yet played; as the DSP plays
++// them it kicks the CPU (port_irq_kick), the same as the SDL callback.
++extern "C" int port_audio_out_open(void) __attribute__((weak));
++extern "C" int port_audio_out_queued(void) __attribute__((weak));
++extern "C" void port_audio_out_write(const s16* lr, u32 frames) __attribute__((weak));
++#endif
+ 
+ namespace {
+ 
+@@ -85,6 +93,7 @@
+ 	std::vector<int16_t> fifo;
+ 	size_t head, count;
+ 	bool sdl;
++	bool out3ds; // 3DS: blocks go to port_audio_out_write
+ 	bool fed; // a block has reached the FIFO
+ 	s16 lastL, lastR;
+ 	// Blocks queued beyond kBaseBlocks, added when the output ran dry and
+@@ -304,8 +313,15 @@
+ 	// VI retraces instead (port_audio_on_retrace), so runs stay repeatable.
+ 	if (port_vi_deterministic()) {
+ 		port_log("[audio] deterministic VI clock: AI DMA paced by retraces, no output device\n");
++		return;
++	}
++#if defined(__3DS__)
++	if (g.output && port_audio_out_open && port_audio_out_open()) {
++		g.out3ds = true;
++		port_log("[audio] output: the 3DS DSP (ndsp), %d blocks queued\n", kBaseBlocks);
+ 		return;
+ 	}
++#endif
+ 	g.sdl          = g.output && wantSdl && open_sdl();
+ 	if (!g.sdl) {
+ 		if (g.output)
+@@ -338,6 +354,10 @@
+ 				fflush(g.wav);
+ 			}
+ 		}
++#if defined(__3DS__)
++		if (g.out3ds)
++			port_audio_out_write(g.mix.data(), (u32)frames);
++#endif
+ 		if (g.sdl) {
+ 			std::lock_guard<std::mutex> lk(g.mu);
+ 			g.fed      = true;
+@@ -381,6 +401,16 @@
+ 	}
+ 	if (dac_thread_busy())
+ 		return; // polled again when it blocks (the scheduler delivers interrupts then)
++#if defined(__3DS__)
++	if (g.out3ds) {
++		if (port_audio_out_queued() < kBaseBlocks) {
++			dma_block(); // one block per delivery: the audio thread must run
++			if (port_audio_out_queued() < kBaseBlocks)
++				port_irq_kick();
++		}
++		return;
++	}
++#endif
+ 	if (g.sdl) {
+ 		if (int blocks = g.grew.exchange(0))
+ 			port_log("[audio] the output ran dry; queueing %u ms from now on\n", blocks * kBlockFrames * 1000 / kRate);
+--- a/platform/audio/dsp_hle.cpp
++++ b/platform/audio/dsp_hle.cpp
+@@ -25,6 +25,13 @@
+ 
+ extern "C" u8* port_aram_ptr(u32 addr);
+ extern "C" void __DSPHandler(int interrupt, void* context); // JSystem/osdsp_task.c
++#if defined(__3DS__)
++// 3DS: each subframe goes to platform/3ds/audio_3ds.cpp first, which plays the voices it can on
++// the 3DS DSP and mixes the rest with port_dspmix_render_voices; 0 leaves it all to the mixer.
++extern "C" void port_audio_hw_setup(void* voices, uint32_t nvoices, const uint32_t* adpcm_filter)
++    __attribute__((weak));
++extern "C" int port_audio_hw_render(int16_t* outA, int16_t* outB, int n, uint16_t master) __attribute__((weak));
++#endif
+ 
+ namespace {
+ 
+@@ -92,7 +99,10 @@
+ {
+ 	maybe_dump_aram();
+ 	u32 n = g.subSamples;
+-	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
++#if defined(__3DS__)
++	if (!port_audio_hw_render || !port_audio_hw_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master))
++#endif
++		port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+ 	g.sub++;
+ 	g.subframesRendered++;
+ 	reply(0xFF00);
+@@ -115,6 +125,10 @@
+ 			port_dspmix_set_aram(aram_lookup);
+ 			port_dspmix_setup(w[0] & 0xFFFF, (void*)(uintptr_t)w[1], (const uint32_t*)(uintptr_t)w[2],
+ 			                  (const uint32_t*)(uintptr_t)w[3], (void*)(uintptr_t)w[4]);
++#if defined(__3DS__)
++			if (port_audio_hw_setup)
++				port_audio_hw_setup((void*)(uintptr_t)w[1], w[0] & 0xFFFF, (const uint32_t*)(uintptr_t)w[3]);
++#endif
+ 			port_log("[audio] DSP setup: %u voices at 0x%08x, FX lines at 0x%08x\n", (unsigned)(w[0] & 0xFFFF),
+ 			         (unsigned)w[1], (unsigned)w[4]);
+ 		}
+--- a/platform/audio/dsp_mixer.cpp
++++ b/platform/audio/dsp_mixer.cpp
+@@ -628,16 +628,27 @@
+ extern "C" void port_dspmix_set_mram(port_dspmix_mram_fn fn) { g.mram = fn; }
+ 
+ extern "C" void port_dspmix_render(int16_t* outA, int16_t* outB, int n, uint16_t master)
++{
++	port_dspmix_render_voices(outA, outB, n, master, ~(uint64_t)0, 1);
++}
++
++extern "C" void port_dspmix_render_voices(int16_t* outA, int16_t* outB, int n, uint16_t master, uint64_t mask,
++                                          int fx)
+ {
+ 	if (n > kMaxN)
+ 		n = kMaxN;
+ 	for (int b = 0; b < kBuses; b++)
+ 		memset(g.bus[b], 0, sizeof(int32_t) * n);
+ 	g.active = 0;
+-	prepare_fx(n);
++	if (fx)
++		prepare_fx(n);
+ 	if (g.voices) {
+ 		for (uint32_t i = 0; i < g.nvoices; i++) {
+ 			Voice& v = g.voices[i];
++			if (!((mask >> i) & 1)) {
++				g.dec[i].active = false; // played elsewhere: its next start here is a fresh one
++				continue;
++			}
+ 			if (!v.enabled || v.done) {
+ 				if (!v.enabled)
+ 					g.dec[i].active = false;
+@@ -663,7 +674,8 @@
+ 		fprintf(stderr, "[audio] %u subframes: %d voices mixed, %d enabled, %d stopping, %d at zero volume\n",
+ 		        g.traceTick, g.active, en, stop, silent);
+ 	}
+-	finish_fx(n);
++	if (fx)
++		finish_fx(n);
+ 	for (int k = 0; k < n; k++) {
+ 		outA[k] = (int16_t)sat16((int32_t)(((int64_t)g.bus[1][k] * master) >> g.masterShift));
+ 		outB[k] = (int16_t)sat16((int32_t)(((int64_t)g.bus[2][k] * master) >> g.masterShift));
+--- a/platform/audio/dsp_mixer.h
++++ b/platform/audio/dsp_mixer.h
+@@ -39,6 +39,11 @@
+  * command (Q15; SMS uses 0x5000 = 0.625). Voice blocks are updated in place (done/endReached/volumes). */
+ void port_dspmix_render(int16_t* outA, int16_t* outB, int n, uint16_t master);
+ 
++/* The same for the voices whose bit is set in `mask` (voice 0 = bit 0) only, the rest
++ * left out as if disabled; `fx` = 0 also leaves out the FX lines. The 3DS port mixes
++ * the voices its DSP cannot play this way (platform/3ds/audio_3ds.cpp). */
++void port_dspmix_render_voices(int16_t* outA, int16_t* outB, int n, uint16_t master, uint64_t mask, int fx);
++
+ /* Diagnostics: voices rendered in the last subframe. */
+ int port_dspmix_active_voices(void);
+ 
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -308,11 +308,21 @@
+ 			return false;
+ 	}
+ }
++
++#if defined(__3DS__)
++// 3DS port: told of every switch, with the CPU held (platform/3ds/audio_3ds.cpp times the audio
++// thread's turns).
++extern "C" void port_os_switch_hook(OSThread* from, OSThread* to) __attribute__((weak));
++#endif
+ 
+ // Hand the CPU to `next` (already chosen). Returns once `self` owns the CPU
+ // again, or never if `self` is exiting.
+ void switch_to(OSThread* self, OSThread* next, bool exiting)
+ {
++#if defined(__3DS__)
++	if (port_os_switch_hook)
++		port_os_switch_hook(self, next);
++#endif
+ 	Host* hs = self ? host_of(self) : NULL;
+ 	if (hs)
+ 		hs->irq_enabled = g_irq_enabled;
