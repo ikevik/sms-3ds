@@ -28,10 +28,18 @@
 // (state blocks against their separate writes, the sea against its original vertices). It ends
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
 // (draw zones, also timed with phases only). A run that sets a direction instead has ceilings, each
-// compared with the normal windows either side (kRoleCeiling). This one, phase 2's (native J3D):
-// J3D's GX writes dropped at the pipe, J3D's GX calls made free at the API, J3D not drawn at all
-// (each for every draw buffer: decomp patch 3ds-0027, SMS3DS_J3DCeilingBegin), after a warm-up
-// window. Earlier runs' steps, kept as settings in the table: the news ticker's glyphs
+// compared with the normal windows either side (kRoleCeiling). The batch now: static J3D native
+// (stage 1b), each window with the GX thread's J3D time by part (GXPC_J3DSampleOn); compiled shapes
+// drawn unchecked as a ceiling. Earlier runs' steps, kept as settings in the table:
+// static J3D native through stage 1b took the GX thread 41.6 -> 39.8 ms and the frame 46.8 -> 44.9;
+// the bypass of the GX thread's registers (gone) did no better, 8-10 ms of GX time for ~347 ops
+// either way (the op timers: GXPC_J3DSampleOn); its first form (a draw record per run, every
+// shape's matrices sent) took the render thread 36.5 -> 43.6 and the GPU 38.9 -> 41.0; phase 2's
+// J3D ceilings (each for every draw buffer: decomp patch 3ds-0027, SMS3DS_J3DCeilingBegin): J3D's
+// GX writes dropped at the pipe took
+// the GX thread 40.5 -> 11.3 ms, the render thread 37.6 -> 18.3, the GPU 39.1 -> 19.2 and the game
+// thread's work 43.4 -> 33.8; J3D's GX calls made free, the game thread 43.7 -> 34.8; J3D not drawn
+// at all, 42.9 -> 31.3; the news ticker's glyphs
 // outside its window left out (decomp patch 3ds-0026) saved the frame 1.5 ms; none in one run (the
 // whole-linear-heap flush left out hung the GPU at a scene change: pica_draw.c); the
 // state blocks compiled (sms-port patch 0039) saved 1.85 ms, 0 differing; the lights' reset loading its
@@ -92,6 +100,12 @@ extern uint32_t GXPC_BlockOps[2];                     // ... state blocks writte
 extern uint32_t GXPC_BlockCompiledBad;                // gx_api.cpp: compiled blocks unlike the entry-by-entry values
 uint32_t GX3DS_J3DSigBad(void);    // ... native J3D's verify mode: differences found so far
 extern uint32_t GXPC_J3DStats[16], GXPC_J3DPkgStats[4];  // gx_fifo.cpp: native J3D's counters
+// Native J3D's ops on the GX thread (gx_fifo.cpp): time by part (one op in four timed while
+// GXPC_J3DSampleOn; hand-overs all), the timed ops' whole time, ops in all and timed; and the
+// ceiling that draws compiled shapes without checking their data (GXPC_J3DNoCheck).
+extern uint64_t GXPC_J3DTicks[8], GXPC_J3DOpTicks;
+extern uint32_t GXPC_J3DOps[2];
+extern int GXPC_J3DSampleOn, GXPC_J3DNoCheck;
 int SMS3DS_ProfOn;
 // The sea's draw (decomp patch 3ds-0022): 0 vertex by vertex, 1 once per column and row (the
 // default; settings.txt sea_precomputed), 2 that checked against the original's values.
@@ -625,12 +639,13 @@ double hogRate() {
 // set), the state blocks (GXPC_SetStateBlockOps; -1 as set), the lights' reset loading its textures
 // once (SMS3DS_ResetTexOnce; -1 as set), the state blocks' command compiled
 // (GXPC_SetStateBlockCompiled; -1 as set), the news ticker's glyphs outside its window left out
-// (SMS3DS_TelopClip; -1 as set), the window's role (kRole*), J3D's ceiling (kJ3d*).
+// (SMS3DS_TelopClip; -1 as set), the window's role (kRole*), J3D's ceiling (kJ3d*), compiled shapes
+// drawn unchecked (GXPC_J3DNoCheck: a ceiling).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d;
+	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck;
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
@@ -640,17 +655,21 @@ enum { kRoleNormal, kRoleOn, kRoleCeiling, kRoleWarm, kRoleChecks };
 // thread nothing), at the pipe (the game thread makes them; the GX thread, the render thread and the
 // GPU never see them), or not drawn at all.
 enum { kJ3dNormal, kJ3dMuteApi, kJ3dMutePipe, kJ3dNoDraw };
-enum { kGsWarm, kGsN1, kGsPipe, kGsN2, kGsApi, kGsN3, kGsNoDraw, kGsN4, kGsChecks, kGameStepN };
+// The batch now: native J3D in the static draw buffers (native_j3d_buffers, stage 1b), with the
+// GX thread's J3D time by part in each window; compiled shapes drawn unchecked as a ceiling.
+enum { kGsWarm, kGsOff1, kGsOn1, kGsOff2, kGsOn2, kGsOff3, kGsNoCheck, kGsOff4, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"warm-up (normal, not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0},
-    {"normal", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0},
-    {"J3D's GX writes dropped at the pipe", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, kJ3dMutePipe},
-    {"normal", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0},
-    {"J3D's GX calls free (muted at the API)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, kJ3dMuteApi},
-    {"normal", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0},
-    {"J3D not drawn at all", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, kJ3dNoDraw},
-    {"normal", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0},
-    {"this build, every check run (not for timing)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, 2, 2, -1, -1, -1, kRoleChecks, 0},
+    {"warm-up (J3D emulated, not compared)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0},
+    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"the batch on (static J3D native)", 2, 0, 0, 0, 0, 1, 0, 1, 1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0},
+    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"the batch on (static J3D native)", 2, 0, 0, 0, 0, 1, 0, 1, 1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0},
+    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"the batch on with compiled shapes unchecked (not exact)", 2, 0, 0, 0, 0, 1, 0, 1, 1, 0, -1, -1, -1, -1, -1,
+     kRoleCeiling, 0, 1},
+    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"this build, every check run, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1, 0, 2, 2, -1, -1, -1,
+     kRoleChecks, 0, 0},
 };
 int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
@@ -663,7 +682,7 @@ uint32_t s_check0[4];     // the checked step's counters at its start: checks, d
 // Each window's drawing routines (draw zones): calls and ms per frame, the timer's own cost taken
 // out.
 double s_gameZoneMs[kGameStepN][kZones], s_gameZoneCalls[kGameStepN][kZones];
-const int kGsVerify = -1;  // (no native J3D verify step in this table)
+const int kGsVerify = kGsChecks;  // native J3D's verify step
 int s_waveSaved = 1;     // SMS3DS_WaveMode before part 4 (put back after it)
 uint32_t s_wave0[2];     // the checked step's counters at its start
 double s_gameSea[kGameStepN];  // the sea's draw, ms/frame (draw zone 7)
@@ -672,6 +691,11 @@ double s_gameSea[kGameStepN];  // the sea's draw, ms/frame (draw zone 7)
 uint32_t s_verify0[3];
 // Native J3D's settings before part 4 (put back after it).
 int s_nativeSaved = -1, s_packagesSaved = 1;
+uint64_t s_nj0[9];                  // GXPC_J3DTicks and GXPC_J3DOpTicks at the window's start
+uint32_t s_njOps0[2];               // GXPC_J3DOps at the window's start
+// Native J3D's ops on the GX thread, ms/frame: the parts (0-6 scaled from the timed ops), the
+// hand-overs (7), all of the ops (8); and the ops a frame.
+double s_gameNj[kGameStepN][9], s_gameNjOps[kGameStepN];
 // Each step's phases (ms/frame), frame and GPU time, and the hog's rate (MB/s, 0: none or not
 // started); the step being measured.
 double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN], s_gameHog[kGameStepN];
@@ -689,6 +713,8 @@ void setGameStep(int k) {
 	pica_set_heap_flush(g ? g->heapFlush : s_heapFlushSaved);
 	GXPC_SetNativeJ3DMode(g && g->native >= 0 ? g->native : s_nativeSaved);
 	GXPC_J3DPackages = g && g->packages >= 0 ? g->packages : s_packagesSaved;
+	GXPC_J3DNoCheck = g ? g->noCheck : 0;
+	GXPC_J3DSampleOn = g != nullptr;
 	GX3DS_SetCompactRings(g ? g->rings : 0);
 	SMS3DS_WaveMode = g && g->wave >= 0 ? g->wave : s_waveSaved;
 	GXPC_SetStateBlockOps(g && g->blockOps >= 0 ? g->blockOps : s_blockOpsSaved);
@@ -721,8 +747,8 @@ void reportGameStep(int k) {
 	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
 	else
 		snprintf(hog, sizeof hog,
-		         "; J3D's draw buffers %.2f ms (%.1f a frame), particles %.2f, shadows %.2f, HUD %.2f",
-		         s_gameZoneMs[k][5], s_gameZoneCalls[k][5], s_gameZoneMs[k][6], s_gameZoneMs[k][16], s_gameZoneMs[k][9]);
+		         "; J3D's draw buffers %.2f ms, particles %.2f, shadows %.2f, HUD %.2f, the sea %.2f",
+		         s_gameZoneMs[k][5], s_gameZoneMs[k][6], s_gameZoneMs[k][16], s_gameZoneMs[k][9], s_gameZoneMs[k][7]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -1563,6 +1589,9 @@ void SMS3DS_ProfFrame(void) {
 			s_check0[2] = GXPC_BlockOps[0];
 			s_check0[3] = GXPC_BlockCompiledBad;
 			s_glyph0[0] = SMS3DS_PrintGlyphs[0];
+			memcpy(s_nj0, GXPC_J3DTicks, sizeof GXPC_J3DTicks);
+			s_nj0[8] = GXPC_J3DOpTicks;
+			memcpy(s_njOps0, GXPC_J3DOps, sizeof s_njOps0);
 			s_glyph0[1] = SMS3DS_PrintGlyphs[1];
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
@@ -1583,6 +1612,15 @@ void SMS3DS_ProfFrame(void) {
 			s_gameSea[k] = double(s_zoneTicks[7]) / kFrames / kTicksPerMs;
 			for (int i = 0; i < 2; i++) s_gameGlyphs[k][i] = double(SMS3DS_PrintGlyphs[i] - s_glyph0[i]) / kFrames;
 			{
+				const uint32_t ops = GXPC_J3DOps[0] - s_njOps0[0], timed = GXPC_J3DOps[1] - s_njOps0[1];
+				const double scale = timed ? double(ops) / timed : 0;
+				for (int i = 0; i < 9; i++) {
+					const uint64_t d = (i < 8 ? GXPC_J3DTicks[i] : GXPC_J3DOpTicks) - s_nj0[i];
+					s_gameNj[k][i] = double(d) * (i == 7 ? 1.0 : scale) / kFrames / kTicksPerMs;
+				}
+				s_gameNjOps[k] = double(ops) / kFrames;
+			}
+			{
 				const double tick = tickCostMs();
 				for (int z = 0; z < kZones; z++) {
 					const double calls = s_zoneCalls[z] / double(kFrames);
@@ -1591,6 +1629,13 @@ void SMS3DS_ProfFrame(void) {
 				}
 			}
 			reportGameStep(k);
+			if (s_gameNjOps[k] > 0)
+				fprintf(stderr,
+				        "[prof]   native J3D on the GX thread, ms/frame (one op in four timed): %.1f ops a frame, %.2f ms | "
+				        "materials: lookup %.2f, record %.2f | shapes: lookup and check %.2f, state %.2f, matrices %.2f, "
+				        "runs %.2f | hand-overs %.2f\n",
+				        s_gameNjOps[k], s_gameNj[k][8], s_gameNj[k][0], s_gameNj[k][1], s_gameNj[k][2], s_gameNj[k][3],
+				        s_gameNj[k][5], s_gameNj[k][6], s_gameNj[k][7]);
 			if (kGameSteps[k].blockOps == 2)
 				fprintf(stderr,
 				        "[prof] state blocks, checked: %lu blocks, %lu registers compared on the GX thread "
