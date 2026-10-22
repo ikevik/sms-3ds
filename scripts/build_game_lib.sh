@@ -6,7 +6,9 @@
 #   CXX/CC/AR/SIZE/OBJCOPY override toolchain (default: devkitARM arm-none-eabi-*)
 #   ARCHFLAGS        default: -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations
 #   LIMIT=N          compile only the first N units (quick test)
-#   OPT=-O2          optimization level
+#   OPT=-O3          optimization level (-O3 by default: on Delfino Plaza the game thread's work
+#                    fell 40.0 -> 39.0 ms and the frame 43.3 -> 41.8 against -O2, with the code
+#                    11% larger; GCC's loop-UB and array-bounds warnings found nothing at -O3)
 #   SAMPLE=1         instrument every function for profile runs' sampler (platform/3ds/prof_3ds.cpp)
 #   AUDIO_SAMPLE=1   instrument JAudio's functions only, for the audio thread's sampler
 #                    (platform/3ds/audio_3ds.cpp): their hooks are renamed __audio_prof_enter/_exit
@@ -25,7 +27,7 @@ AR="${AR:-$DEVKITARM/bin/arm-none-eabi-ar}"
 SIZE="${SIZE:-$DEVKITARM/bin/arm-none-eabi-size}"
 OBJCOPY="${OBJCOPY:-$DEVKITARM/bin/arm-none-eabi-objcopy}"
 ARCHFLAGS="${ARCHFLAGS--march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft -mword-relocations}"
-OPT="${OPT:--O2}"
+OPT="${OPT:--O3}"
 
 [ -d "$DECOMP/src" ] || { echo "run scripts/apply_patches.sh first"; exit 1; }
 [ -f "$PCPORT/tools/gen_sources.py" ] || { echo "sms-pc-port missing at $PCPORT"; exit 1; }
