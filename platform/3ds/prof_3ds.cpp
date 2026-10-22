@@ -28,12 +28,14 @@
 // (state blocks against their separate writes, the sea against its original vertices). It ends
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
 // (draw zones, also timed with phases only). A run that sets a direction instead has ceilings, each
-// compared with the normal windows either side (kRoleCeiling). This one has no batch: this
-// build's own windows, with draw zones 37-48 inside the game logic's biggest callers (decomp patch
-// 3ds-0028: SDLModel::entry, the sky, the event watcher's name lookups, the hit checks, the
-// actors' clipping, the water manager's draws), GPU test windows each leaving one of the water
-// manager's draws or the sky's sphere out (SMS3DS_ProfDrawSkip), then the checks. Earlier runs'
-// steps, kept as settings in the table: the game-logic objects ranked with objects timed
+// compared with the normal windows either side (kRoleCeiling). This one's batch is the event
+// watcher's name cache (decomp patch 3ds-0029, SMS3DS_NameCache: off, then on), with draw zones
+// 37-48 inside the game logic's biggest callers (decomp patch 3ds-0028) and J3D's material entries
+// timed by part in every window (J3DJoint::entryIn, SMS3DS_J3DEntryTicks); the checks window has
+// every answer from the cache checked against a full search. Earlier runs' steps, kept as settings
+// in the table: the drill-down run's GPU test windows (SMS3DS_ProfDrawSkip) put the Shine's shadow
+// volume at 2.1 ms of GPU, the water volume and its silhouette at 1.6, the water's refraction and
+// specular and the sky's sphere at ~0; the game-logic objects ranked with objects timed
 // (kRoleRank) put Mario's movement first (2.5 ms), then the NPCs (2.3), the particle manager (1.7);
 // the -O3 build against the -O2 one (two apps) took the frame 43.3 -> 41.8 ms;
 // static J3D native through stage 1b took the GX thread 41.6 -> 39.8 ms and the frame 46.8 -> 44.9;
@@ -129,6 +131,18 @@ int SMS3DS_J3DCeiling;
 // (TModelWaterManager), 2 the water's refraction and specular, 4 the water volume and its
 // silhouette, 8 the sky's sphere. 0 in normal play.
 int SMS3DS_ProfDrawSkip;
+// The event watcher's name cache (decomp patch 3ds-0029): the name tree's changes so far, the
+// cache's mode (0 off, 1 on: settings.txt name_cache; 2 each answer from it checked against a full
+// search), its counters (lookups by name, answered from the cache, checked, differing, answers
+// kept).
+unsigned SMS3DS_NameTreeGen;
+int SMS3DS_NameCache = 1;
+unsigned SMS3DS_NameCacheStats[5];
+// J3D's material entries (decomp patch 3ds-0029, J3DJoint::entryIn) in profile runs: time by part
+// for the materials timed (one in four), and the counts (seen, timed, unlocked, entered).
+unsigned long long SMS3DS_J3DEntryTicks[4];
+unsigned SMS3DS_J3DEntryCount[4];
+unsigned long long SMS3DS_Ticks(void) { return svcGetSystemTick(); }
 int SMS3DS_PrintClip;
 float SMS3DS_PrintClipX0, SMS3DS_PrintClipX1;
 unsigned long SMS3DS_PrintGlyphs[2];
@@ -654,12 +668,13 @@ double hogRate() {
 // once (SMS3DS_ResetTexOnce; -1 as set), the state blocks' command compiled
 // (GXPC_SetStateBlockCompiled; -1 as set), the news ticker's glyphs outside its window left out
 // (SMS3DS_TelopClip; -1 as set), the window's role (kRole*), J3D's ceiling (kJ3d*), compiled shapes
-// drawn unchecked (GXPC_J3DNoCheck: a ceiling), the draws left out (SMS3DS_ProfDrawSkip).
+// drawn unchecked (GXPC_J3DNoCheck: a ceiling), the draws left out (SMS3DS_ProfDrawSkip), the
+// event watcher's name cache (SMS3DS_NameCache; -1 as set).
 struct GameStep {
 	const char* name;
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
-	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck, drawSkip;
+	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck, drawSkip, nameCache;
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
@@ -669,31 +684,25 @@ enum { kRoleNormal, kRoleOn, kRoleCeiling, kRoleWarm, kRoleChecks, kRoleRank };
 // thread nothing), at the pipe (the game thread makes them; the GX thread, the render thread and the
 // GPU never see them), or not drawn at all.
 enum { kJ3dNormal, kJ3dMuteApi, kJ3dMutePipe, kJ3dNoDraw };
-// No batch now: this build's own windows, with draw zones inside the game logic's biggest callers
-// (decomp patch 3ds-0028), and GPU test windows leaving out the water manager's draws and the sky's
-// sphere one part at a time, each compared with the normal windows either side, then the checks.
-enum { kGsWarm, kGsN1, kGsShine, kGsN2, kGsRefrac, kGsN3, kGsVolume, kGsN4, kGsSky, kGsN5, kGsChecks, kGameStepN };
+// The batch: the event watcher's name cache, off (normal) and on, alternately; then the checks, with
+// every answer from the cache checked against a full search.
+enum { kGsWarm, kGsOff1, kGsOn1, kGsOff2, kGsOn2, kGsOff3, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0, 0},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
-    {"the Shine's shadow volume left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0, 1},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
-    {"the water's refraction and specular left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0,
-     2},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
-    {"the water volume and its silhouette left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0,
-     4},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
-    {"the sky's sphere left out", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleCeiling, 0, 0, 8},
-    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0},
-    {"this build, every check run, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1, 0, 2, 2, -1, -1, -1,
-     kRoleChecks, 0, 0, 0},
+    {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0, 0, -1},
+    {"the name cache off", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, 0},
+    {"the name cache on", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0, 0, 1},
+    {"the name cache off", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, 0},
+    {"the name cache on", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0, 0, 1},
+    {"the name cache off", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, 0},
+    {"the name cache on, every check run, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1, 0, 2, 2,
+     -1, -1, -1, kRoleChecks, 0, 0, 0, 2},
 };
 int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
 int s_texOnceSaved = 1;        // SMS3DS_ResetTexOnce before part 4 (put back after it)
 int s_blockOpsSaved = 1;  // GXPC_StateBlockOps before part 4 (put back after it)
 int s_telopSaved = 1;     // SMS3DS_TelopClip before part 4 (put back after it)
+int s_nameCacheSaved = 1;  // SMS3DS_NameCache before part 4 (put back after it)
 unsigned long s_glyph0[2];                // SMS3DS_PrintGlyphs at the window's start
 double s_gameGlyphs[kGameStepN][2];       // the ticker's glyphs a frame: drawn, left out
 uint32_t s_check0[4];     // the checked step's counters at its start: checks, differing, blocks as commands, compiled differing
@@ -710,6 +719,9 @@ uint32_t s_verify0[3];
 // Native J3D's settings before part 4 (put back after it).
 int s_nativeSaved = -1, s_packagesSaved = 1;
 uint64_t s_nj0[9];                  // GXPC_J3DTicks and GXPC_J3DOpTicks at the window's start
+unsigned s_names0[6];               // SMS3DS_NameCacheStats and SMS3DS_NameTreeGen at the window's start
+unsigned long long s_entryT0[4];    // SMS3DS_J3DEntryTicks at the window's start
+unsigned s_entryN0[4];              // SMS3DS_J3DEntryCount at the window's start
 uint32_t s_njOps0[2];               // GXPC_J3DOps at the window's start
 // Native J3D's ops on the GX thread, ms/frame: the parts (0-6 scaled from the timed ops), the
 // hand-overs (7), all of the ops (8); and the ops a frame.
@@ -741,6 +753,7 @@ void setGameStep(int k) {
 	GXPC_SetStateBlockCompiled(g && g->compiled >= 0 ? g->compiled : s_compiledSaved);
 	SMS3DS_TelopClip = g && g->telop >= 0 ? g->telop : s_telopSaved;
 	SMS3DS_J3DCeiling = g ? g->j3d : 0;
+	SMS3DS_NameCache = g && g->nameCache >= 0 ? g->nameCache : s_nameCacheSaved;
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -923,6 +936,7 @@ void startGame() {
 	s_texOnceSaved = SMS3DS_ResetTexOnce;
 	s_compiledSaved = GXPC_StateBlockCompiled();
 	s_telopSaved = SMS3DS_TelopClip;
+	s_nameCacheSaved = SMS3DS_NameCache;
 	s_heapFlushSaved = pica_heap_flush();
 	s_nativeSaved = GXPC_NativeJ3DMode();
 	s_packagesSaved = GXPC_J3DPackages;
@@ -1672,6 +1686,10 @@ void SMS3DS_ProfFrame(void) {
 			memcpy(s_nj0, GXPC_J3DTicks, sizeof GXPC_J3DTicks);
 			s_nj0[8] = GXPC_J3DOpTicks;
 			memcpy(s_njOps0, GXPC_J3DOps, sizeof s_njOps0);
+			memcpy(s_names0, SMS3DS_NameCacheStats, sizeof SMS3DS_NameCacheStats);
+			s_names0[5] = SMS3DS_NameTreeGen;
+			memcpy(s_entryT0, SMS3DS_J3DEntryTicks, sizeof s_entryT0);
+			memcpy(s_entryN0, SMS3DS_J3DEntryCount, sizeof s_entryN0);
 			s_glyph0[1] = SMS3DS_PrintGlyphs[1];
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
@@ -1710,6 +1728,37 @@ void SMS3DS_ProfFrame(void) {
 			}
 			reportGameStep(k);
 			if (kGameSteps[k].role == kRoleRank) reportLogicRank();
+			{
+				unsigned d[6];
+				for (int i = 0; i < 5; i++) d[i] = SMS3DS_NameCacheStats[i] - s_names0[i];
+				d[5] = SMS3DS_NameTreeGen - s_names0[5];
+				const double f = kFrames;
+				fprintf(stderr,
+				        "[prof]   the event watcher's name lookups (%s), a frame: %.1f through the cache, %.1f answered "
+				        "from it, %.1f answers kept | the name tree changed %.2f times a frame | the lookups' zone "
+				        "%.1f x %.3f = %.2f ms",
+				        SMS3DS_NameCache == 0 ? "the cache off" : SMS3DS_NameCache == 2 ? "the cache checked" : "the cache on",
+				        d[0] / f, d[1] / f, d[4] / f, d[5] / f, s_gameZoneCalls[k][42],
+				        s_gameZoneCalls[k][42] > 0 ? s_gameZoneMs[k][42] / s_gameZoneCalls[k][42] : 0.0, s_gameZoneMs[k][42]);
+				if (SMS3DS_NameCache == 2) fprintf(stderr, " | checked against a full search: %u, differing: %u", d[2], d[3]);
+				fprintf(stderr, "\n");
+			}
+			{
+				unsigned n[4];
+				for (int i = 0; i < 4; i++) n[i] = SMS3DS_J3DEntryCount[i] - s_entryN0[i];
+				const double scale = n[1] ? double(n[0]) / n[1] : 0;
+				double ms[4], all = 0;
+				for (int i = 0; i < 4; i++) {
+					ms[i] = double(SMS3DS_J3DEntryTicks[i] - s_entryT0[i]) * scale / kFrames / kTicksPerMs;
+					all += ms[i];
+				}
+				fprintf(stderr,
+				        "[prof]   J3D's material entries (J3DJoint::entryIn, one in four timed): %.1f a frame, %.1f unlocked, "
+				        "%.1f entered, %.2f ms | packets' lookup and material animation %.2f | material calc and "
+				        "matrices %.2f | packets set and entry %.2f | display lists %.2f\n",
+				        n[0] / double(kFrames), n[2] / double(kFrames), n[3] / double(kFrames), all, ms[0], ms[1], ms[2],
+				        ms[3]);
+			}
 			if (s_gameNjOps[k] > 0)
 				fprintf(stderr,
 				        "[prof]   native J3D on the GX thread, ms/frame (one op in four timed): %.1f ops a frame, %.2f ms | "

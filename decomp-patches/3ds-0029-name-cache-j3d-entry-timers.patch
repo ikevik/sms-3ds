@@ -1,0 +1,501 @@
+--- a/include/sms3ds_names.h
++++ b/include/sms3ds_names.h
+@@ -0,0 +1,15 @@
++// 3DS port (decomp patch 3ds-0029): the scene's name tree (JDrama::TNameRefGen's root and every
++// container its searchF walks) counts its changes, so that a lookup by name can be answered from a
++// cache exactly (src/System/EventWatcher.cpp). Each change to a container's children, to a name or
++// to the root is followed by SMS3DS_NAME_TREE_CHANGED(), and a cached answer holds only for the
++// generation it was found under. Some of the containers that count are not in the tree: a wasted
++// count costs a full search, never a wrong answer.
++#ifndef SMS3DS_NAMES_H
++#define SMS3DS_NAMES_H
++#if defined(__3DS__)
++extern "C" unsigned SMS3DS_NameTreeGen;
++#define SMS3DS_NAME_TREE_CHANGED() ((void)++SMS3DS_NameTreeGen)
++#else
++#define SMS3DS_NAME_TREE_CHANGED() ((void)0)
++#endif
++#endif
+--- a/include/Strategic/NameRefAry.tpp
++++ b/include/Strategic/NameRefAry.tpp
+@@ -2,6 +2,7 @@
+ #define STRATEGIC_NAME_REF_ARY_TPP
+ 
+ #include <Strategic/NameRefAry.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ 
+ // Out of line, and in a .tpp so that the twenty-odd TUs which only *use* a
+ // TNameRefAryT do not each emit a weak copy: the map has these three only in
+@@ -31,6 +32,7 @@
+ 		JDrama::TNameRef::getType(stream, stream2);
+ 		nameRefAryAt(getChildren(), i).load(stream2);
+ 	}
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ template <class T, class U> void TNameRefAryT<T, U>::loadAfter()
+--- a/include/Strategic/NameRefPtrAry.tpp
++++ b/include/Strategic/NameRefPtrAry.tpp
+@@ -2,6 +2,7 @@
+ #define STRATEGIC_NAME_REF_PTR_ARY_TPP
+ 
+ #include <Strategic/NameRefPtrAry.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ 
+ // Out of line, and in a .tpp so that a TU which only *instantiates* the class
+ // (Camera/CubeManagerBase.cpp) emits the weak vtable and the in-class dtor but
+@@ -23,6 +24,7 @@
+ 			ref->load(stream2);
+ 		}
+ 	}
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ template <class T, class U> void TNameRefPtrAryT<T, U>::loadAfter()
+--- a/libs/JSystem/src/J3D/J3DGraphAnimator/J3DJoint.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphAnimator/J3DJoint.cpp
+@@ -1,4 +1,43 @@
+ #include <JSystem/J3D/J3DGraphAnimator/J3DJoint.hpp>
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0029, platform/3ds/prof_3ds.cpp): in profile runs J3DJoint::entryIn
++// counts its materials (SMS3DS_J3DEntryCount: seen, timed, unlocked, entered into a draw buffer)
++// and times one in four by part (SMS3DS_J3DEntryTicks: the packets' lookup and the material
++// animation, the material's calc and current matrices, the packets set and the entry, the display
++// list). Outside a profile run each costs one branch.
++extern "C" int SMS3DS_ProfOn;
++extern "C" unsigned long long SMS3DS_Ticks(void);
++extern "C" unsigned long long SMS3DS_J3DEntryTicks[4];
++extern "C" unsigned SMS3DS_J3DEntryCount[4];
++namespace {
++struct TEntryTimer {
++	bool on;
++	unsigned long long t;
++	TEntryTimer()
++	    : on(SMS3DS_ProfOn && (SMS3DS_J3DEntryCount[0]++ & 3) == 0)
++	    , t(on ? SMS3DS_Ticks() : 0)
++	{
++		if (on)
++			SMS3DS_J3DEntryCount[1]++;
++	}
++	void lap(int part)
++	{
++		if (on) {
++			const unsigned long long now = SMS3DS_Ticks();
++			SMS3DS_J3DEntryTicks[part] += now - t;
++			t = now;
++		}
++	}
++};
++} // namespace
++#define SMS3DS_ENTRY_TIMER() TEntryTimer sms3ds_entry_
++#define SMS3DS_ENTRY_LAP(part) sms3ds_entry_.lap(part)
++#define SMS3DS_ENTRY_COUNT(i) (SMS3DS_ProfOn ? (void)SMS3DS_J3DEntryCount[i]++ : (void)0)
++#else
++#define SMS3DS_ENTRY_TIMER()
++#define SMS3DS_ENTRY_LAP(part)
++#define SMS3DS_ENTRY_COUNT(i)
++#endif
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DTransform.hpp>
+ #include <JSystem/J3D/J3DGraphAnimator/J3DAnimation.hpp>
+@@ -357,18 +396,22 @@
+ 		if (mesh->getShape()->checkFlag(J3DShpFlag_Visible)) {
+ 			mesh = mesh->getNext();
+ 		} else {
++			SMS3DS_ENTRY_TIMER();
+ 			J3DMatPacket* matPacket
+ 			    = j3dSys.getModel()->getMatPacket(mesh->getIndex());
+ 			J3DShapePacket* shapePacket = j3dSys.getModel()->getShapePacket(
+ 			    mesh->getShape()->getIndex());
+ 
+ 			if (!matPacket->isLocked()) {
++				SMS3DS_ENTRY_COUNT(2);
+ 				if (mesh->getMaterialAnm())
+ 					mesh->getMaterialAnm()->calc(mesh);
++				SMS3DS_ENTRY_LAP(0);
+ 
+ 				MtxPtr anmMtx = j3dSys.getModel()->getAnmMtx(mJntNo);
+ 				mesh->calc(anmMtx);
+ 				mesh->setCurrentMtx();
++				SMS3DS_ENTRY_LAP(1);
+ 			}
+ 
+ 			matPacket->setMaterialAnmID(mesh->getMaterialAnm());
+@@ -376,10 +419,13 @@
+ 
+ 			bool b = !mesh->isDrawModeOpaTexEdge();
+ 			bool r = matPacket->entry(j3dSys.getDrawBuffer(b));
++			SMS3DS_ENTRY_LAP(2);
+ 			if (r) {
++				SMS3DS_ENTRY_COUNT(3);
+ 				j3dSys.setMatPacket(matPacket);
+ 				J3DDrawBuffer::entryNum++;
+ 				mesh->makeDisplayList();
++				SMS3DS_ENTRY_LAP(3);
+ 			}
+ 			mesh = mesh->getNext();
+ 		}
+--- a/libs/JSystem/src/JDrama/JDRLighting.cpp
++++ b/libs/JSystem/src/JDrama/JDRLighting.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/JDrama/JDRLighting.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <JSystem/JDrama/JDRNameRefGen.hpp>
+ #include <dolphin/gx.h>
+ #include <dolphin/os/OSCache.h>
+@@ -69,6 +70,7 @@
+ 		TNameRef::getType(stream, stream2);
+ 		mLights[i].load(stream2);
+ 	}
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ TNameRef* TLightAry::searchF(u16 key, const char* name)
+@@ -138,6 +140,7 @@
+ 		TNameRef::getType(stream, stream2);
+ 		mAmbColors[i].load(stream2);
+ 	}
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ TNameRef* TAmbAry::searchF(u16 key, const char* name)
+--- a/libs/JSystem/src/JDrama/JDRNameRef.cpp
++++ b/libs/JSystem/src/JDrama/JDRNameRef.cpp
+@@ -1,6 +1,7 @@
+ #include <string.h>
+ #include <JSystem/JDrama/JDRNameRef.hpp>
+ #include <JSystem/JDrama/JDRNameRefGen.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ 
+ using namespace JDrama;
+ 
+@@ -47,6 +48,7 @@
+ {
+ 	mKeyCode = stream.readU16();
+ 	mName    = stream.readString();
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TNameRef::save(JSUMemoryOutputStream&) { }
+--- a/libs/JSystem/src/JDrama/JDRNameRefGen.cpp
++++ b/libs/JSystem/src/JDrama/JDRNameRefGen.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/JDrama/JDRNameRefGen.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <JSystem/JDrama/JDRViewObjPtrList.hpp>
+ #include <JSystem/JDrama/JDRViewObjPtrList.tpp>
+ #include <JSystem/JDrama/JDRViewObj.hpp>
+@@ -31,6 +32,7 @@
+ 
+ 	if ((mRootNameRef = TNameRef::genObject(stream, tmpStream)))
+ 		mRootNameRef->load(tmpStream);
++	SMS3DS_NAME_TREE_CHANGED();
+ 
+ 	return mRootNameRef;
+ }
+--- a/libs/JSystem/src/JGadget/std-list.cpp
++++ b/libs/JSystem/src/JGadget/std-list.cpp
+@@ -1,5 +1,6 @@
+ 
+ #include <JSystem/JGadget/std-list.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ 
+ using namespace JGadget;
+ 
+@@ -14,5 +15,7 @@
+ TList_pointer_void::iterator TList_pointer_void::insert(iterator where,
+                                                         const value_type& value)
+ {
+-	return Base::insert(where, value);
++	iterator it = Base::insert(where, value);
++	SMS3DS_NAME_TREE_CHANGED();
++	return it;
+ }
+--- a/libs/JSystem/src/JGadget/std-vector.cpp
++++ b/libs/JSystem/src/JGadget/std-vector.cpp
+@@ -1,4 +1,5 @@
+ #include <JSystem/JGadget/std-vector.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ 
+ using namespace JGadget;
+ 
+@@ -19,34 +20,43 @@
+ TVector_pointer_void::iterator
+ TVector_pointer_void::insert(iterator where, const value_type& what)
+ {
+-	return Base::insert(where, what);
++	iterator it = Base::insert(where, what);
++	SMS3DS_NAME_TREE_CHANGED();
++	return it;
+ }
+ 
+ void TVector_pointer_void::insert(value_type* p, size_t count,
+                                   value_type const& value)
+ {
+ 	Base::insert(p, count, value);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ TVector_pointer_void::iterator TVector_pointer_void::erase(value_type* p)
+ {
+-	return Base::erase(p);
++	iterator it = Base::erase(p);
++	SMS3DS_NAME_TREE_CHANGED();
++	return it;
+ }
+ 
+ TVector_pointer_void::iterator TVector_pointer_void::erase(value_type* pFirst,
+                                                            value_type* pLast)
+ {
+-	return Base::erase(pFirst, pLast);
++	iterator it = Base::erase(pFirst, pLast);
++	SMS3DS_NAME_TREE_CHANGED();
++	return it;
+ }
+ 
+ void TVector_pointer_void::assign(size_t count, value_type const& value)
+ {
+ 	Base::assign(count, value);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TVector_pointer_void::resize(size_t new_size, value_type const& value)
+ {
+ 	Base::resize(new_size, value);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TVector_pointer_void::reserve(size_t new_capacity)
+@@ -58,17 +68,22 @@
+ TVector_pointer_void::operator=(const TVector_pointer_void& other)
+ {
+ 	Base::operator=(other);
++	SMS3DS_NAME_TREE_CHANGED();
+ 	return *this;
+ }
+ 
+ TVector_pointer_void::value_type* TVector_pointer_void::InsertRaw(value_type* p,
+                                                                   size_t count)
+ {
+-	return Base::InsertRaw(p, count);
++	value_type* r = Base::InsertRaw(p, count);
++	SMS3DS_NAME_TREE_CHANGED();
++	return r;
+ }
+ 
+ TVector_pointer_void::value_type*
+ TVector_pointer_void::ResizeRaw(size_t new_size)
+ {
+-	return Base::ResizeRaw(new_size);
++	value_type* r = Base::ResizeRaw(new_size);
++	SMS3DS_NAME_TREE_CHANGED();
++	return r;
+ }
+--- a/src/Enemy/conductor.cpp
++++ b/src/Enemy/conductor.cpp
+@@ -1,4 +1,5 @@
+ #include <Enemy/Conductor.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <NPC/NpcSave.hpp>
+ #include <Enemy/EnemyManager.hpp>
+ #include <Enemy/Graph.hpp>
+@@ -86,6 +87,7 @@
+ void TConductor::registerManager(TLiveManager* param_1)
+ {
+ 	unk10.push_back(param_1);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TConductor::registerEnemyManager(TEnemyManager* param_1)
+@@ -96,11 +98,13 @@
+ void TConductor::registerAloneActor(TLiveActor* param_1)
+ {
+ 	unk30.push_back(param_1);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TConductor::registerOtherObj(JDrama::TViewObj* param_1)
+ {
+ 	unk40.push_back(param_1);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TConductor::registerGenerator(TGenerator* param_1)
+@@ -111,6 +115,7 @@
+ void TConductor::registerAreaCylinderManager(TAreaCylinderManager* param_1)
+ {
+ 	unk50.push_back(param_1);
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TConductor::registerSDLModelData(SDLModelData* param_1)
+--- a/src/MoveBG/MapObjInit.cpp
++++ b/src/MoveBG/MapObjInit.cpp
+@@ -1,4 +1,5 @@
+ #include <MoveBG/MapObjManager.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <MoveBG/MapObjGeneral.hpp>
+ #include <MoveBG/MapObjBase.hpp>
+ #include <Map/MapData.hpp>
+@@ -11228,6 +11229,7 @@
+ 
+ 	if (strcmp(mName, "地形オブジェ") == 0)
+ 		mName = unkF4;
++	SMS3DS_NAME_TREE_CHANGED();
+ 
+ #ifdef TARGET_PC
+ 	mMapObjData = sObjDataTable[i];
+--- a/src/Strategic/Strategy.cpp
++++ b/src/Strategic/Strategy.cpp
+@@ -1,4 +1,5 @@
+ #include <Strategic/Strategy.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <Strategic/ObjHitCheck.hpp>
+ #include <macros.h>
+ 
+@@ -40,6 +41,7 @@
+ 			unk10[ref->unk20] = ref;
+ 		}
+ 	}
++	SMS3DS_NAME_TREE_CHANGED();
+ 
+ 	gpStrategy = this;
+ }
+--- a/src/Strategic/objmanager.cpp
++++ b/src/Strategic/objmanager.cpp
+@@ -1,4 +1,5 @@
+ #include <Strategic/ObjManager.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <Strategic/ObjModel.hpp>
+ #include <JSystem/J3D/J3DGraphLoader/J3DModelLoaderFlags.hpp>
+ #include <Strategic/HitActor.hpp>
+@@ -51,6 +52,7 @@
+ {
+ 	unk18[mObjNum] = obj;
+ 	++mObjNum;
++	SMS3DS_NAME_TREE_CHANGED();
+ }
+ 
+ void TObjManager::load(JSUMemoryInputStream& stream)
+--- a/src/System/EventWatcher.cpp
++++ b/src/System/EventWatcher.cpp
+@@ -92,6 +92,59 @@
+ 	interp->push(name);
+ }
+ 
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0029): getNameRefPtr's lookups by name answered from a cache. A full
++// search's answer (the first match in the scene's name tree, depth first) changes only when the
++// tree does, and every change to the tree bumps SMS3DS_NameTreeGen (sms3ds_names.h), so an answer
++// kept with the root and the generation it was found under is the full search's answer while both
++// hold. SMS3DS_NameCache: 0 off (every lookup a full search, as the original), 1 on (the default;
++// settings.txt name_cache), 2 each answer from the cache checked against a full search.
++#include "sms3ds_names.h"
++extern "C" int SMS3DS_NameCache;
++// Lookups by name, answered from the cache, checked, differing, answers kept.
++extern "C" unsigned SMS3DS_NameCacheStats[5];
++namespace {
++struct TNameCacheEntry {
++	JDrama::TNameRef* root;
++	JDrama::TNameRef* result;
++	unsigned gen;
++	u16 key;
++	char name[54];  // the name looked up (longer ones are not kept)
++};
++TNameCacheEntry sNameCache[64];
++} // namespace
++
++static JDrama::TNameRef* searchNameCached(const char* name)
++{
++	if (!SMS3DS_NameCache)
++		return JDrama::TNameRefGen::search<JDrama::TNameRef>(name);
++	JDrama::TNameRef* const root = JDrama::TNameRefGen::getInstance()->getRootNameRef();
++	const u16 key                = JDrama::TNameRef::calcKeyCode(name);
++	TNameCacheEntry& e           = sNameCache[key & 63];
++	SMS3DS_NameCacheStats[0]++;
++	if (e.root == root && e.gen == SMS3DS_NameTreeGen && e.key == key && strcmp(e.name, name) == 0) {
++		SMS3DS_NameCacheStats[1]++;
++		if (SMS3DS_NameCache == 2) {
++			SMS3DS_NameCacheStats[2]++;
++			if (JDrama::TNameRefGen::search<JDrama::TNameRef>(name) != e.result)
++				SMS3DS_NameCacheStats[3]++;
++		}
++		return e.result;
++	}
++	JDrama::TNameRef* const result = JDrama::TNameRefGen::search<JDrama::TNameRef>(name);
++	const size_t len               = strlen(name);
++	if (len < sizeof e.name) {
++		e.root   = root;
++		e.result = result;
++		e.gen    = SMS3DS_NameTreeGen;
++		e.key    = key;
++		memcpy(e.name, name, len + 1);
++		SMS3DS_NameCacheStats[4]++;
++	}
++	return result;
++}
++#endif
++
+ // The `name` local is necessary. It gives this function the compiled size that
+ // the symbol map records for it (0xe4), and it gives each of the ~15 callers
+ // the one extra stack object that they need. Do not remove it.
+@@ -103,7 +156,11 @@
+ 	switch (slice.typeof()) {
+ 	case TSpcSlice::TYPE_STRING: {
+ 		const char* name = slice.getDataString();
++#if defined(__3DS__)
++		result = searchNameCached(name);
++#else
+ 		result           = JDrama::TNameRefGen::search<JDrama::TNameRef>(name);
++#endif
+ 		break;
+ 	}
+ 
+--- a/src/System/MarDirectorSetupObjects.cpp
++++ b/src/System/MarDirectorSetupObjects.cpp
+@@ -1,4 +1,5 @@
+ #include <System/MarDirector.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <JSystem/JKernel/JKRFileFinder.hpp>
+ #include <JSystem/JKernel/JKRMemArchive.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DDrawBuffer.hpp>
+@@ -279,6 +280,7 @@
+ 	gpMSound->initSound();
+ 
+ 	unk10 = nullptr;
++	SMS3DS_NAME_TREE_CHANGED();
+ 	decideMarioPosIdx();
+ 	createObjects();
+ 	TParams::init();
+@@ -436,6 +438,7 @@
+ 
+ 	gpCamera->setNoticeInfo();
+ 	unk10 = root;
++	SMS3DS_NAME_TREE_CHANGED();
+ 
+ 	JDrama::TViewObjPtrListT<JDrama::TViewObj>* perfEventGroup
+ 	    = new JDrama::TViewObjPtrListT<JDrama::TViewObj>("PERF Event Group");
+--- a/src/System/MovieDirector.cpp
++++ b/src/System/MovieDirector.cpp
+@@ -1,4 +1,5 @@
+ #include <System/MovieDirector.hpp>
++#include "sms3ds_names.h"  // 3DS port: decomp patch 3ds-0029 (the name tree's changes counted)
+ #include <THPPlayer/THPPlayer.h>
+ #include <JSystem/JKernel/JKRMemArchive.hpp>
+ #include <JSystem/JDrama/JDRDStage.hpp>
+@@ -276,6 +277,7 @@
+ void TMovieDirector::setup(JDrama::TDisplay* param_1, TMarioGamePad* param_2)
+ {
+ 	unk14 = new JDrama::TDStageGroup(param_1);
++	SMS3DS_NAME_TREE_CHANGED();
+ 	unk20 = param_2;
+ 	getGamePad()->setFlag(1);
+ 
+@@ -334,6 +336,7 @@
+ 	JDrama::TViewObjPtrListT<JDrama::TViewObj>* rootViewObjs
+ 	    = new JDrama::TViewObjPtrListT<JDrama::TViewObj>("root View Objs");
+ 	unk10 = rootViewObjs;
++	SMS3DS_NAME_TREE_CHANGED();
+ 
+ 	JDrama::TViewObjPtrListT<JDrama::TViewObj>* group2d
+ 	    = new JDrama::TViewObjPtrListT<JDrama::TViewObj>("Group 2D");

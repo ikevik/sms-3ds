@@ -371,6 +371,12 @@ static const char kDefaultSettings[] =
     "# leaves nothing of a glyph outside it.\n"
     "ticker_clipped = on\n"
     "\n"
+    "# The event watcher's lookups of objects by name answered from a cache (on), or each one a\n"
+    "# full search of the scene's objects as the original (off). The same answers: the cache\n"
+    "# drops them whenever the scene's objects change. verify: each answer checked against a full\n"
+    "# search (slower).\n"
+    "name_cache = on\n"
+    "\n"
     "# What touching the bottom right of the bottom screen low down runs: the game thread's steps\n"
     "# (steps) or the game thread by object (objects). Higher up it starts the whole profile run.\n"
     "profile_low_touch = steps\n";
@@ -406,6 +412,7 @@ extern "C" int SMS3DS_WaveMode;    // decomp patch 3ds-0022: the sea precomputed
 extern "C" void GXPC_SetStateBlockOps(int mode);  // patch 0038: state resets as one command (gx_state_block_ops)
 extern "C" int SMS3DS_ResetTexOnce;  // decomp patch 3ds-0024: the lights' reset loads its textures once
 extern "C" int SMS3DS_TelopClip;     // decomp patch 3ds-0026: the ticker's glyphs outside its window left out
+extern "C" int SMS3DS_NameCache;     // decomp patch 3ds-0029: the event watcher's name lookups cached
 extern "C" void GXPC_SetStateBlockCompiled(int on);  // patch 0039 (gx_state_block_compiled)
 extern "C" void pica_set_heap_flush(int on);  // pica_draw.c (heap_flush)
 extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt profile_low_touch)
@@ -569,6 +576,8 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "gx_state_block_compiled", v, sizeof v)) GXPC_SetStateBlockCompiled(strcmp(v, "off") != 0);
 		if (setting_value(kSettingsPath, "heap_flush", v, sizeof v)) pica_set_heap_flush(strcmp(v, "off") != 0);
 		if (setting_value(kSettingsPath, "ticker_clipped", v, sizeof v)) SMS3DS_TelopClip = strcmp(v, "off") != 0;
+		if (setting_value(kSettingsPath, "name_cache", v, sizeof v))
+			SMS3DS_NameCache = strcmp(v, "off") == 0 ? 0 : strcmp(v, "verify") == 0 ? 2 : 1;
 		fprintf(stderr, "[3ds] the sea: %s (sea_precomputed)\n", SMS3DS_WaveMode ? "worked out once per column and row" : "vertex by vertex");
 		if (setting_value(kSettingsPath, "profile_low_touch", v, sizeof v))
 			SMS3DS_ProfSetLowTouch(strcmp(v, "objects") == 0 ? 5 : 4);
