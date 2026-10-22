@@ -28,9 +28,10 @@
 // (state blocks against their separate writes, the sea against its original vertices). It ends
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
 // (draw zones, also timed with phases only). A run that sets a direction instead has ceilings, each
-// compared with the normal windows either side (kRoleCeiling). The batch now: static J3D native
-// (stage 1b), each window with the GX thread's J3D time by part (GXPC_J3DSampleOn); compiled shapes
-// drawn unchecked as a ceiling. Earlier runs' steps, kept as settings in the table:
+// compared with the normal windows either side (kRoleCeiling). This one has no batch: this
+// build's own windows (an -O3 build of the game against the -O2 one is two apps, each with this
+// run), then one with objects timed that ranks the game-logic objects (kRoleRank), then the checks
+// (native J3D, now on by default, verified). Earlier runs' steps, kept as settings in the table:
 // static J3D native through stage 1b took the GX thread 41.6 -> 39.8 ms and the frame 46.8 -> 44.9;
 // the bypass of the GX thread's registers (gone) did no better, 8-10 ms of GX time for ~347 ops
 // either way (the op timers: GXPC_J3DSampleOn); its first form (a draw record per run, every
@@ -649,25 +650,23 @@ struct GameStep {
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
-// the checks (not timed).
-enum { kRoleNormal, kRoleOn, kRoleCeiling, kRoleWarm, kRoleChecks };
+// the checks (not timed), the game-logic objects ranked (objects timed: not timed itself).
+enum { kRoleNormal, kRoleOn, kRoleCeiling, kRoleWarm, kRoleChecks, kRoleRank };
 // J3D's ceilings, for every draw buffer: its GX writes muted at the API (its GX calls cost the game
 // thread nothing), at the pipe (the game thread makes them; the GX thread, the render thread and the
 // GPU never see them), or not drawn at all.
 enum { kJ3dNormal, kJ3dMuteApi, kJ3dMutePipe, kJ3dNoDraw };
-// The batch now: native J3D in the static draw buffers (native_j3d_buffers, stage 1b), with the
-// GX thread's J3D time by part in each window; compiled shapes drawn unchecked as a ceiling.
-enum { kGsWarm, kGsOff1, kGsOn1, kGsOff2, kGsOn2, kGsOff3, kGsNoCheck, kGsOff4, kGsChecks, kGameStepN };
+// No batch now: this build's own figures (an -O3 build of the game against an -O2 one is two apps,
+// each with this run), its game-logic objects ranked, then every check.
+enum { kGsWarm, kGsN1, kGsN2, kGsN3, kGsN4, kGsRank, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
-    {"warm-up (J3D emulated, not compared)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0},
-    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"the batch on (static J3D native)", 2, 0, 0, 0, 0, 1, 0, 1, 1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0},
-    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"the batch on (static J3D native)", 2, 0, 0, 0, 0, 1, 0, 1, 1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0},
-    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
-    {"the batch on with compiled shapes unchecked (not exact)", 2, 0, 0, 0, 0, 1, 0, 1, 1, 0, -1, -1, -1, -1, -1,
-     kRoleCeiling, 0, 1},
-    {"the batch off (J3D emulated)", 2, 0, 0, 0, 0, 1, 0, 0, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0},
+    {"the game-logic objects ranked (objects timed: not for timing)", 1, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1,
+     kRoleRank, 0, 0},
     {"this build, every check run, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1, 0, 2, 2, -1, -1, -1,
      kRoleChecks, 0, 0},
 };
@@ -736,6 +735,48 @@ double gameWork(int k) {
 	for (int i = 0; i < PHASES; i++)
 		if (i != 15) sum += s_gamePh[k][i];
 	return sum;
+}
+// The rank window (kRoleRank, objects timed): the objects of the game-logic phases (hit check,
+// movement, calc-anim, last-tick) by their own time, most first. Timing each object costs the game
+// thread some 10 ms a frame, so the figures rank the objects rather than price them.
+void reportLogicRank() {
+	static const int kLogic[] = {3, 4, 7, 8};
+	static Entry* order[kTable];
+	const double per = 1.0 / kFrames / kTicksPerMs;
+	double phaseAll[PHASES] = {};
+	int n = 0;
+	for (int i = 0; i < kTable; i++) {
+		Entry& e = s_table[i];
+		if (!e.vt) continue;
+		bool logic = false;
+		for (int ph : kLogic) logic = logic || e.phase == ph;
+		if (!logic) continue;
+		phaseAll[e.phase] += e.ticks * per;
+		order[n++] = &e;
+	}
+	qsort(order, n, sizeof order[0], [](const void* a, const void* b) {
+		const uint64_t x = (*(Entry* const*)a)->ticks, y = (*(Entry* const*)b)->ticks;
+		return x < y ? 1 : x > y ? -1 : 0;
+	});
+	fprintf(stderr,
+	        "[prof] game-logic objects by their own time, objects timed (ms/frame; in all hit check %.1f, movement %.1f, "
+	        "calc-anim %.1f, last-tick %.1f), performs/frame, phase, vtable, a name:\n",
+	        phaseAll[3], phaseAll[4], phaseAll[7], phaseAll[8]);
+	double listed = 0;
+	for (int i = 0; i < n && i < 30; i++) {
+		const Entry* e = order[i];
+		const double ms = e->ticks * per;
+		if (ms < 0.05) break;
+		listed += ms;
+		char name[40];
+		snprintf(name, sizeof name, "%s", e->name ? e->name : "");
+		for (char* c = name; *c; c++)
+			if ((unsigned char)*c < 0x20 || (unsigned char)*c >= 0x7f) *c = '?';  // Shift-JIS names
+		fprintf(stderr, "[prof]   %6.2f ms %6.1f %-15s vt %08lx \"%s\"\n", ms, double(e->calls) / kFrames,
+		        kPhaseName[e->phase], (unsigned long)uintptr_t(e->vt), name);
+	}
+	fprintf(stderr, "[prof]   (listed %.1f of %.1f ms/frame)\n", listed,
+	        phaseAll[3] + phaseAll[4] + phaseAll[7] + phaseAll[8]);
 }
 void reportGameStep(int k) {
 	char line[768];
@@ -1629,6 +1670,7 @@ void SMS3DS_ProfFrame(void) {
 				}
 			}
 			reportGameStep(k);
+			if (kGameSteps[k].role == kRoleRank) reportLogicRank();
 			if (s_gameNjOps[k] > 0)
 				fprintf(stderr,
 				        "[prof]   native J3D on the GX thread, ms/frame (one op in four timed): %.1f ops a frame, %.2f ms | "
