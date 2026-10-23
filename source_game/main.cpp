@@ -71,7 +71,11 @@ int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // before the low touch's run starts by itself; 0 off), profile_auto_quit (on: quit once that run
 // is done) and quit_after (seconds of free play before quitting; 0 off). Free play: the stage's
 // director in its play state, drawing a scene. It may also give perf_timers and draw_state_check,
-// as settings.txt does, and gx_detail (on: the GX thread's commands timed, as in profile runs).
+// as settings.txt does, gx_detail (on: the GX thread's commands timed, as in profile runs),
+// gx_zones (on: the GX thread's zones sampled, in a GX_ZONES=1 build), status_screen (off: the
+// bottom screen not redrawn) and profile_steps (gpu: the profile run's windows are the GPU's
+// ceilings; reverts: parts of this build put back as before, one window each; cache: the frame's
+// cache work three ways).
 static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
 static bool s_statusDraw = true;  // autorun.txt status_screen = off: the bottom screen not redrawn
 extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
@@ -442,6 +446,10 @@ extern "C" int SMS3DS_TelopClip;     // decomp patch 3ds-0026: the ticker's glyp
 extern "C" int SMS3DS_NameCache;     // decomp patch 3ds-0029: the event watcher's name lookups cached
 extern "C" int SMS3DS_RankCheck;     // decomp patch 3ds-0031: the scene sound's reused distances checked
 extern "C" void GX3DS_StartZoneSampler(void);  // gx3ds_backend.cpp: autorun.txt gx_zones
+extern "C" void SMS3DS_ProfGpuSteps(void);      // prof_3ds.cpp: autorun.txt profile_steps = gpu
+extern "C" void SMS3DS_ProfRevertSteps(void);   // ... profile_steps = reverts
+extern "C" void SMS3DS_ProfCacheSteps(void);    // ... profile_steps = cache
+extern "C" void GX3DS_SetGxPoll(int on);        // gx3ds_backend.cpp: settings.txt gx_poll
 extern "C" void GX3DS_SetPerfTimers(int on);  // gx3ds_backend.cpp: the [perf] breakdown by phase timed
 extern "C" void GX3DS_SetDrawStateCheck(int on);  // ... draws taking the last draw's setup checked
 extern "C" int GXPC_Detail;  // patch 0027: the GX thread's command timing, as in profile runs
@@ -617,6 +625,7 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "name_cache", v, sizeof v))
 			SMS3DS_NameCache = strcmp(v, "off") == 0 ? 0 : strcmp(v, "verify") == 0 ? 2 : 1;
 		if (setting_value(kSettingsPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
+		if (setting_value(kSettingsPath, "gx_poll", v, sizeof v)) GX3DS_SetGxPoll(strcmp(v, "off") != 0);
 		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) {
 			GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
 			SMS3DS_RankCheck = strcmp(v, "on") == 0;
@@ -643,6 +652,14 @@ static void* game_thread(void*)
 		// gx_zones = on: the GX thread's zones sampled (a GX library built with GX_ZONES=1).
 		if (setting_value(kAutoPath, "gx_zones", v, sizeof v) && strcmp(v, "on") == 0) GX3DS_StartZoneSampler();
 		if (setting_value(kAutoPath, "profile_auto", v, sizeof v)) s_profAuto = atoi(v);
+		// profile_steps = gpu: the profile run's windows are the GPU's ceilings (prof_3ds.cpp, kGpuSteps);
+		// reverts: parts of this build put back as before, one window each (kRvSteps); cache: the frame's
+		// cache work three ways (kCacheSteps).
+		if (setting_value(kAutoPath, "profile_steps", v, sizeof v)) {
+			if (strcmp(v, "gpu") == 0) SMS3DS_ProfGpuSteps();
+			if (strcmp(v, "reverts") == 0) SMS3DS_ProfRevertSteps();
+			if (strcmp(v, "cache") == 0) SMS3DS_ProfCacheSteps();
+		}
 		if (setting_value(kAutoPath, "profile_auto_quit", v, sizeof v)) s_profAutoQuit = strcmp(v, "on") == 0;
 		if (SMS3DS_DemoStage >= 0 || s_profAuto > 0 || s_quitAfter > 0)
 			fprintf(stderr,

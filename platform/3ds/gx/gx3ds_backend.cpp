@@ -4960,6 +4960,14 @@ static std::atomic<uint64_t> s_sBusy{0}, s_sIdle{0};  // GX thread: parsing, wai
 // two sees the other's write, so no wake-up is lost (the events are one-shot: a spare signal only
 // ends one wait early, and every wait is in a loop).
 static std::atomic<int> s_gameWaits{0};
+// Whether the GX thread polls before it sleeps (settings.txt gx_poll; on by default, off in builds
+// made with SMS3DS_GX_POLL_DEFAULT=0). On the New 3DS the GX thread shares core 1 with the system,
+// which caps the application's time there: polling may spend that share for nothing.
+#ifndef SMS3DS_GX_POLL_DEFAULT
+#define SMS3DS_GX_POLL_DEFAULT 1
+#endif
+static bool s_gxPoll = SMS3DS_GX_POLL_DEFAULT;
+static bool s_gamePoll = true;  // the game thread's waits poll first too (GX3DS_SetGamePoll; the profiler)
 enum { EV_GX = 2, EV_GAME = 3 };
 
 // Game thread: waits until ready() (the GX thread signals EV_GAME as it releases chunks and frames).
@@ -4971,7 +4979,7 @@ static void streamWait(std::atomic<uint64_t>& acc, F ready) {
 	// Polled for up to 2 ms before it sleeps, a pause between checks (pica_poll_pause): Azahar runs the
 	// cores in turn, a slice at a time, and the game thread saw the GX thread's frame done only at its
 	// slice's end, 1.2-1.4 ms after the signal at each frame's end, sleeping or not.
-	for (uint32_t i = 1;; i++) {
+	for (uint32_t i = 1; s_gamePoll; i++) {
 		if (ready()) break;
 		pica_poll_pause();
 		if ((i & 15) == 0 && svcGetSystemTick() - t0 > uint64_t(2.0 * kTicksPerMs)) break;
@@ -5186,8 +5194,8 @@ static void gxMain(void*) {
 			GXPC_GxIdle = 1;  // (the game thread hands over what it has, and signals: streamOp, streamSwap)
 			GX_ZONE_SET(GZ_IDLE);
 			std::atomic_thread_fence(std::memory_order_seq_cst);
-			// polled for up to 2 ms first, as the game thread's waits (streamWait)
-			for (uint32_t i = 1; s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire); i++) {
+			// polled for up to 2 ms first, as the game thread's waits (streamWait), unless s_gxPoll is off
+			for (uint32_t i = 1; s_gxPoll && s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire); i++) {
 				pica_poll_pause();
 				if ((i & 15) == 0 && svcGetSystemTick() - t0 > uint64_t(2.0 * kTicksPerMs)) break;
 			}
@@ -5659,6 +5667,9 @@ void GXPC_StreamDrain(void) {
 // Off before the first frame: GX runs on the game thread (no GX thread).
 void GX3DS_SetGxThread(int on) { gx::s_gxWanted = on != 0; }
 void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.txt perf_timers
+void GX3DS_SetGxPoll(int on) { gx::s_gxPoll = on != 0; }  // settings.txt gx_poll
+void GX3DS_SetGamePoll(int on) { gx::s_gamePoll = on != 0; }
+int GX3DS_GxPoll(void) { return gx::s_gxPoll; }
 void GX3DS_SetDrawStateCheck(int on) {  // settings.txt draw_state_check
 	gx::s_fpCheck = on != 0;
 	gx::GXPC_FastListCheck = on != 0;

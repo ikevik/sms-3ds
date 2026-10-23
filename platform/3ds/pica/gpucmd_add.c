@@ -12,8 +12,18 @@
 #include <3ds.h>
 #include <string.h>
 
+void __real_GPUCMD_Add(u32 header, const u32* param, u32 paramlength);
+
+/* libctru's own instead (pica_set_gpucmd_libctru; the profiler's revert steps). */
+static int s_libctru;
+void pica_set_gpucmd_libctru(int on) { s_libctru = on; }
+
 void __wrap_GPUCMD_Add(u32 header, const u32* param, u32 paramlength)
 {
+	if (s_libctru) {
+		__real_GPUCMD_Add(header, param, paramlength);
+		return;
+	}
 	/* One value (most of citro3d's: GPUCMD_AddWrite, GPUCMD_AddMaskedWrite): the value, the header. */
 	if (paramlength <= 1 && param) {
 		u32* buf = gpuCmdBuf;

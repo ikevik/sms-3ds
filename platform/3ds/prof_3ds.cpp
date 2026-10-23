@@ -21,9 +21,9 @@
 // SMS3DS_GxOrigin, kStreamOpOrigin: native J3D stage 0, docs/native-j3d.md).
 // Part 5, on its own (the bottom right of the bottom screen, low down): the game thread by object,
 // each big drawing object's drawing left out in turn (below, kSkipTargets).
-// Part 4, the game thread (kGameSteps, after part 3): its time by phase for kFrames frames in each step, with only the phases timed (object
+// Part 4, the game thread (s_steps: kStdSteps, or kGpuSteps; after part 3): its time by phase for kFrames frames in each step, with only the phases timed (object
 // timing costs the game thread some 10 ms a frame, far more than its estimate). The standard run
-// (a table, kGameSteps), the same for every build: the build's batch of changes off and on,
+// (a table, kStdSteps), the same for every build: the build's batch of changes off and on,
 // alternately (A B A B A: the view drifts), then on with every correctness check this port has
 // (state blocks against their separate writes, the sea against its original vertices). It ends
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
@@ -99,6 +99,19 @@ void GXPC_SetMute(int on);         // gx_api.cpp: the GX writes dropped (part 4)
 void GX3DS_SetDropDraws(int on);   // gx3ds_backend.cpp: the render thread draws nothing (part 4)
 void pica_set_heap_flush(int on);  // pica_draw.c: the whole-linear-heap flush at frame end (part 4)
 int pica_heap_flush(void);
+// The revert steps' switches (profile_steps = reverts): the readbacks converted before the GPU
+// starts (pica_draw.c), libctru's GPUCMD_Add (gpucmd_add.c), every draw's state compared
+// (pica_draw.c), no polling before the game and GX threads sleep (gx3ds_backend.cpp), the voices
+// decoded in ndsp's thread (audio_3ds.cpp).
+void pica_set_readback_late(int on);
+void pica_set_gpucmd_libctru(int on);
+void pica_set_draw_same_off(int on);
+void GX3DS_SetGamePoll(int on);
+void GX3DS_SetGxPoll(int on);
+int GX3DS_GxPoll(void);
+void SMS3DS_AudioFeedHere(int on);
+void pica_set_cache_way(int way);  // pica_draw.c: the frame's cache work in kernel calls (0), through GSP (1), ...
+int pica_cache_way(void);
 void GXPC_SetNativeJ3DMode(int mode);  // gx_api.cpp: native J3D's mode, its buffers kept (part 4)
 int GXPC_NativeJ3DMode(void);
 extern int GXPC_J3DPackages;       // gx_fifo.cpp: native J3D's compiled shapes (part 4)
@@ -346,7 +359,7 @@ double s_hookUs;          // what a pair costs (calibrate)
 // state: 0 idle, 1 requested, 2 CPU part (settling, then measuring), 3 GPU part (pixels cut), 7 GPU
 // part (pixels cut, the picture shrunk 8x: nothing clipped at the screen's sides), 5 GPU part
 // (positions collapsed), 6 GPU part (no draws), 8-12 GPU part (GPU tests 5, 6, 0, 7, 8: see
-// s_gpuMinShaderMs), 4 GPU by object, 13 the game thread (kGameSteps), 14 the last muted frames'
+// s_gpuMinShaderMs), 4 GPU by object, 13 the game thread (s_steps), 14 the last muted frames'
 // copies passing through the GPU
 volatile int s_request;  // 1 the whole run, 2 part 4 alone
 int s_state, s_frame;
@@ -718,6 +731,8 @@ struct GameStep {
 	int profOn, math, gpuTest, mute, dropDraws, heapFlush;
 	uint32_t hog;
 	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck, drawSkip, nameCache;
+	int revert;  // kRv*: parts of this build put back as they were before it (profile_steps = reverts)
+	int cacheWay;  // pica_set_cache_way + 1 (0: this build's)
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
@@ -730,30 +745,105 @@ enum { kJ3dNormal, kJ3dMuteApi, kJ3dMutePipe, kJ3dNoDraw };
 // This build's own windows, then every check this port has (native J3D verified on the render
 // thread, the state blocks against their separate writes, the sea against its original vertices,
 // the name cache against full searches).
-enum { kGsWarm, kGsN1, kGsN2, kGsChecks, kGameStepN };
-const GameStep kGameSteps[kGameStepN] = {
+enum { kGsWarm, kGsN1, kGsN2, kGsChecks, kGsN };
+const GameStep kStdSteps[kGsN] = {
     {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0, 0, -1},
     {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, -1},
     {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, -1},
     {"this build, every check run, the name cache checked, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0,
      3, 1, 0, 2, 2, -1, -1, -1, kRoleChecks, 0, 0, 0, 2},
 };
+// autorun.txt profile_steps = gpu (main.cpp, SMS3DS_ProfGpuSteps): the GPU's ceilings instead, each
+// between normal windows (on hardware; Azahar's GPU costs nothing): no draws (what the GPU does
+// whatever is drawn: copies, clears, presenting), pixels cut to 8x8, the textures outside VRAM
+// swapped for one 8x8 in it, the picture shrunk 8x (no triangle crosses the screen's sides). Then
+// every check, as the standard run.
+#define SMS3DS_STEP(name, gpu, role) {name, 2, 0, gpu, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1}
+enum { kGpuN = 11 };
+const GameStep kGpuSteps[kGpuN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, kRoleWarm),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("GPU: no draws (its fixed work)", 3, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("GPU: pixels cut to 8x8", 1, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("GPU: textures outside VRAM swapped for an 8x8 one in it", 7, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("GPU: the picture shrunk 8x (nothing crosses the sides)", 4, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
+// autorun.txt profile_steps = reverts (main.cpp, SMS3DS_ProfRevertSteps): what of build 39a2f81 made
+// the New 3DS's GPU slower (39 -> 42 ms a frame in Delfino Plaza, with the same draws and state),
+// each part put back as it was before it for one window, between normal windows: the readbacks
+// converted before the GPU starts (the GPU waited for them), the game and GX threads sleeping at
+// once instead of polling up to 2 ms first, the voices decoded in ndsp's thread on core 0 instead of
+// on core 2, libctru's GPUCMD_Add, every draw's state compared; then all five; then every check.
+enum { kRvReadback = 1, kRvPolls = 2, kRvFeeder = 4, kRvGpuCmd = 8, kRvSame = 16, kRvAll = 31 };
+#define SMS3DS_STEP(name, rv, role) {name, 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1, rv}
+enum { kRvN = 15 };
+const GameStep kRvSteps[kRvN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, kRoleWarm),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("as before: readbacks converted before the GPU starts", kRvReadback, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("as before: the game and GX threads sleep at once", kRvPolls, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("as before: the voices decoded in ndsp's thread (core 0)", kRvFeeder, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("as before: libctru's GPUCMD_Add", kRvGpuCmd, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("as before: every draw's state compared", kRvSame, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("as before: all five", kRvAll, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
+// autorun.txt profile_steps = cache (main.cpp, SMS3DS_ProfCacheSteps): the frame's cache work through
+// GSP (as citro3d) against kernel calls on the render thread (this build), and the whole heap only
+// written back; then the readbacks converted before the GPU starts. The game thread's phases are
+// not timed (that slowed it some 3 ms, so the GPU was no longer the frame's limit), so its work
+// shows only in the [perf] lines; then every check.
+#define SMS3DS_STEP(name, rv, way, role) {name, 0, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1, rv, way}
+enum { kCacheN = 11 };
+const GameStep kCacheSteps[kCacheN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, 0, kRoleWarm),
+    SMS3DS_STEP("this build", 0, 0, kRoleNormal),
+    SMS3DS_STEP("cache work through GSP", 0, 2, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, kRoleNormal),
+    SMS3DS_STEP("cache work through GSP, readbacks converted before the GPU starts (as 39a2f81)", kRvReadback, 2, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, kRoleNormal),
+    SMS3DS_STEP("the heap only written back (svcStoreProcessDataCache)", 0, 3, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, kRoleNormal),
+    SMS3DS_STEP("readbacks converted before the GPU starts", kRvReadback, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, kRoleNormal),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
+enum { kStepMax2 = kGpuN > kGsN ? kGpuN : kGsN, kStepMax3 = kRvN > kStepMax2 ? kRvN : kStepMax2,
+       kGameStepMax = kCacheN > kStepMax3 ? kCacheN : kStepMax3 };
+// The run's steps: the standard ones, or the GPU's ceilings.
+const GameStep* s_steps = kStdSteps;
+int s_stepN = kGsN, s_stepVerify = kGsChecks;  // (the step that verifies native J3D)
 int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
+int s_gxPollSaved = 1;     // GX3DS_GxPoll before part 4 (put back after it)
+int s_cacheWaySaved = 0;   // pica_cache_way before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
 int s_texOnceSaved = 1;        // SMS3DS_ResetTexOnce before part 4 (put back after it)
 int s_blockOpsSaved = 1;  // GXPC_StateBlockOps before part 4 (put back after it)
 int s_telopSaved = 1;     // SMS3DS_TelopClip before part 4 (put back after it)
 int s_nameCacheSaved = 1;  // SMS3DS_NameCache before part 4 (put back after it)
 unsigned long s_glyph0[2];                // SMS3DS_PrintGlyphs at the window's start
-double s_gameGlyphs[kGameStepN][2];       // the ticker's glyphs a frame: drawn, left out
+double s_gameGlyphs[kGameStepMax][2];       // the ticker's glyphs a frame: drawn, left out
 uint32_t s_check0[4];     // the checked step's counters at its start: checks, differing, blocks as commands, compiled differing
 // Each window's drawing routines (draw zones): calls and ms per frame, the timer's own cost taken
 // out.
-double s_gameZoneMs[kGameStepN][kZones], s_gameZoneCalls[kGameStepN][kZones];
-const int kGsVerify = kGsChecks;  // native J3D's verify step
+double s_gameZoneMs[kGameStepMax][kZones], s_gameZoneCalls[kGameStepMax][kZones];
 int s_waveSaved = 1;     // SMS3DS_WaveMode before part 4 (put back after it)
 uint32_t s_wave0[2];     // the checked step's counters at its start
-double s_gameSea[kGameStepN];  // the sea's draw, ms/frame (draw zone 7)
+double s_gameSea[kGameStepMax];  // the sea's draw, ms/frame (draw zone 7)
 // The verify step's counters at its start: native draws verified, shape ops drawn from compiled
 // shapes, differences.
 uint32_t s_verify0[3];
@@ -768,18 +858,18 @@ unsigned s_modelN0[3];              // SMS3DS_J3DModelEntryCount at the window's
 uint32_t s_njOps0[2];               // GXPC_J3DOps at the window's start
 // Native J3D's ops on the GX thread, ms/frame: the parts (0-6 scaled from the timed ops), the
 // hand-overs (7), all of the ops (8); and the ops a frame.
-double s_gameNj[kGameStepN][9], s_gameNjOps[kGameStepN];
+double s_gameNj[kGameStepMax][9], s_gameNjOps[kGameStepMax];
 // Each step's phases (ms/frame), frame and GPU time, and the hog's rate (MB/s, 0: none or not
 // started); the step being measured.
-double s_gamePh[kGameStepN][PHASES], s_gameFrame[kGameStepN], s_gameGpu[kGameStepN], s_gameHog[kGameStepN];
-double s_gameGx[kGameStepN], s_gameRender[kGameStepN];  // the GX and render threads' busy ms/frame
-uint32_t s_gameRing[kGameStepN][2];  // stream buffers taken, render queue bytes reached
+double s_gamePh[kGameStepMax][PHASES], s_gameFrame[kGameStepMax], s_gameGpu[kGameStepMax], s_gameHog[kGameStepMax];
+double s_gameGx[kGameStepMax], s_gameRender[kGameStepMax];  // the GX and render threads' busy ms/frame
+uint32_t s_gameRing[kGameStepMax][2];  // stream buffers taken, render queue bytes reached
 uint64_t s_thread0[2];
 int s_gameStep;
 // Puts step k's settings in place; past the last, normal play's (the GPU test stays until the
 // tail of part 4 ends).
 void setGameStep(int k) {
-	const GameStep* g = k < kGameStepN ? &kGameSteps[k] : nullptr;
+	const GameStep* g = k < s_stepN ? &s_steps[k] : nullptr;
 	sms_math_fast = g ? g->math : 0;
 	GXPC_SetMute(g ? g->mute : 0);
 	GX3DS_SetDropDraws(g ? g->dropDraws : 0);
@@ -797,6 +887,14 @@ void setGameStep(int k) {
 	SMS3DS_TelopClip = g && g->telop >= 0 ? g->telop : s_telopSaved;
 	SMS3DS_J3DCeiling = g ? g->j3d : 0;
 	SMS3DS_NameCache = g && g->nameCache >= 0 ? g->nameCache : s_nameCacheSaved;
+	const int rv = g ? g->revert : 0;
+	pica_set_readback_late(!(rv & kRvReadback));
+	GX3DS_SetGamePoll(!(rv & kRvPolls));
+	GX3DS_SetGxPoll(rv & kRvPolls ? 0 : s_gxPollSaved);
+	SMS3DS_AudioFeedHere(rv & kRvFeeder);
+	pica_set_gpucmd_libctru(rv & kRvGpuCmd);
+	pica_set_draw_same_off(rv & kRvSame);
+	pica_set_cache_way(g && g->cacheWay ? g->cacheWay - 1 : s_cacheWaySaved);
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -861,13 +959,13 @@ void reportGameStep(int k) {
 		if (i != 15 && s_gamePh[k][i] >= 0.05)
 			at += snprintf(line + at, sizeof line - at, "%s %s %.1f", at ? " |" : "", kPhaseName[i], s_gamePh[k][i]);
 	char hog[192] = "";
-	if (kGameSteps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
+	if (s_steps[k].hog) snprintf(hog, sizeof hog, "; core 2 went through %.0f MB/s", s_gameHog[k]);
 	else
 		snprintf(hog, sizeof hog,
 		         "; J3D's draw buffers %.2f ms, particles %.2f, shadows %.2f, HUD %.2f, the sea %.2f",
 		         s_gameZoneMs[k][5], s_gameZoneMs[k][6], s_gameZoneMs[k][16], s_gameZoneMs[k][9], s_gameZoneMs[k][7]);
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
-	        "ms/frame (end rendering, waits included, %.1f more):%s\n", kGameSteps[k].name, s_gameFrame[k], s_gameGpu[k],
+	        "ms/frame (end rendering, waits included, %.1f more):%s\n", s_steps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
 }
 // A window's figures (ms/frame): the game thread's work and its wait at the frame's end, the GX
@@ -885,7 +983,7 @@ WinFig winFig(int k) {
 int meanFig(const bool* want, WinFig& m) {
 	m = WinFig{};
 	int n = 0;
-	for (int k = 0; k < kGameStepN; k++) {
+	for (int k = 0; k < s_stepN; k++) {
 		if (!want[k]) continue;
 		const WinFig f = winFig(k);
 		m.work += f.work, m.end += f.end, m.gx += f.gx, m.render += f.render, m.gpu += f.gpu, m.frame += f.frame;
@@ -917,10 +1015,10 @@ void printFigs(const char* head, const WinFig& a, const WinFig& b) {
 	        at ? line : " none");
 }
 void reportGameSaved() {
-	bool isNormal[kGameStepN], isOn[kGameStepN], isTimed[kGameStepN];
-	for (int k = 0; k < kGameStepN; k++) {
-		isNormal[k] = kGameSteps[k].role == kRoleNormal;
-		isOn[k] = kGameSteps[k].role == kRoleOn;
+	bool isNormal[kGameStepMax], isOn[kGameStepMax], isTimed[kGameStepMax];
+	for (int k = 0; k < s_stepN; k++) {
+		isNormal[k] = s_steps[k].role == kRoleNormal;
+		isOn[k] = s_steps[k].role == kRoleOn;
 		isTimed[k] = isNormal[k] || isOn[k];
 	}
 	WinFig normal, on;
@@ -931,14 +1029,14 @@ void reportGameSaved() {
 		printFigs(head, normal, on);
 	}
 	// Each ceiling against the normal windows either side of it (the view drifts).
-	for (int k = 0; k < kGameStepN; k++) {
-		if (kGameSteps[k].role != kRoleCeiling) continue;
-		bool side[kGameStepN] = {};
+	for (int k = 0; k < s_stepN; k++) {
+		if (s_steps[k].role != kRoleCeiling) continue;
+		bool side[kGameStepMax] = {};
 		if (k > 0 && isNormal[k - 1]) side[k - 1] = true;
-		if (k + 1 < kGameStepN && isNormal[k + 1]) side[k + 1] = true;
+		if (k + 1 < s_stepN && isNormal[k + 1]) side[k + 1] = true;
 		WinFig base;
 		if (!meanFig(side, base)) continue;
-		snprintf(head, sizeof head, "ceiling, %s (against the normal windows either side)", kGameSteps[k].name);
+		snprintf(head, sizeof head, "ceiling, %s (against the normal windows either side)", s_steps[k].name);
 		printFigs(head, base, winFig(k));
 	}
 	// The scorecard: the frame's limits with the batch on (else the normal windows), against 33.3 ms
@@ -958,7 +1056,7 @@ void reportGameSaved() {
 	        nTimed ? (normal.work * nNormal + on.work * nOn) / nTimed : 0.0);
 	for (int z = 0; z < kZones; z++) {
 		double ms = 0, calls = 0;
-		for (int k = 0; k < kGameStepN; k++) {
+		for (int k = 0; k < s_stepN; k++) {
 			if (!isTimed[k]) continue;
 			ms += s_gameZoneMs[k][z] / nTimed;
 			calls += s_gameZoneCalls[k][z] / nTimed;
@@ -966,7 +1064,7 @@ void reportGameSaved() {
 		if (calls <= 0) continue;
 		char each[96];
 		int at = 0;
-		for (int k = 0; k < kGameStepN; k++)
+		for (int k = 0; k < s_stepN; k++)
 			at += snprintf(each + at, sizeof each - at, "%s%.2f", k ? ", " : "", s_gameZoneMs[k][z]);
 		fprintf(stderr, "[prof]   %-42s %6.1f x %.3f = %5.2f ms [%s]\n", kZoneName[z], calls, calls > 0 ? ms / calls : 0.0, ms,
 		        each);
@@ -981,6 +1079,8 @@ void startGame() {
 	s_telopSaved = SMS3DS_TelopClip;
 	s_nameCacheSaved = SMS3DS_NameCache;
 	s_heapFlushSaved = pica_heap_flush();
+	s_gxPollSaved = GX3DS_GxPoll();
+	s_cacheWaySaved = pica_cache_way();
 	s_nativeSaved = GXPC_NativeJ3DMode();
 	s_packagesSaved = GXPC_J3DPackages;
 	s_gameStep = 0;
@@ -1578,7 +1678,7 @@ void SMS3DS_ProfFrame(void) {
 		if (s_request == 2) {
 			s_request = 0;
 			fprintf(stderr, "[prof] game-thread run: %d frames each ", kFrames);
-			for (int k = 0; k < kGameStepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", kGameSteps[k].name);
+			for (int k = 0; k < s_stepN; k++) fprintf(stderr, "%s%s", k ? ", " : "", s_steps[k].name);
 			fprintf(stderr, " (stand still until \"[prof] done\")\n");
 			startGame();
 			return;
@@ -1766,7 +1866,7 @@ void SMS3DS_ProfFrame(void) {
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
 			s_verify0[2] = GX3DS_J3DSigBad();
-			SMS3DS_ProfOn = kGameSteps[s_gameStep].profOn;
+			SMS3DS_ProfOn = s_steps[s_gameStep].profOn;
 		} else if (s_frame == kSettle + kFrames) {
 			SMS3DS_ProfOn = 0;
 			const int k = s_gameStep;
@@ -1799,7 +1899,7 @@ void SMS3DS_ProfFrame(void) {
 				}
 			}
 			reportGameStep(k);
-			if (kGameSteps[k].role == kRoleRank) reportLogicRank();
+			if (s_steps[k].role == kRoleRank) reportLogicRank();
 			{
 				unsigned d[6];
 				for (int i = 0; i < 5; i++) d[i] = SMS3DS_NameCacheStats[i] - s_names0[i];
@@ -1847,7 +1947,7 @@ void SMS3DS_ProfFrame(void) {
 				        "runs %.2f | hand-overs %.2f\n",
 				        s_gameNjOps[k], s_gameNj[k][8], s_gameNj[k][0], s_gameNj[k][1], s_gameNj[k][2], s_gameNj[k][3],
 				        s_gameNj[k][5], s_gameNj[k][6], s_gameNj[k][7]);
-			if (kGameSteps[k].blockOps == 2)
+			if (s_steps[k].blockOps == 2)
 				fprintf(stderr,
 				        "[prof] state blocks, checked: %lu blocks, %lu registers compared on the GX thread "
 				        "afterwards, %lu differing; values and API words unlike the entry-by-entry ones: %lu (blocks "
@@ -1856,18 +1956,18 @@ void SMS3DS_ProfFrame(void) {
 				        (unsigned long)(GXPC_FltChecks[0] + GXPC_FltChecks[1] + GXPC_FltChecks[2] - s_check0[0]),
 				        (unsigned long)(GXPC_FltWrong[0] + GXPC_FltWrong[1] + GXPC_FltWrong[2] - s_check0[1]),
 				        (unsigned long)(GXPC_BlockCompiledBad - s_check0[3]), (unsigned long)GXPC_BlockOps[1]);
-			if (kGameSteps[k].wave == 2)
+			if (s_steps[k].wave == 2)
 				fprintf(stderr, "[prof] the sea precomputed, checked: %lu vertices compared with the original's, %lu differing\n",
 				        (unsigned long)(uint32_t(SMS3DS_WaveChecked) - s_wave0[0]),
 				        (unsigned long)(uint32_t(SMS3DS_WaveDiffs) - s_wave0[1]));
-			if (k == kGsVerify)
+			if (k == s_stepVerify)
 				fprintf(stderr,
 				        "[prof] compiled shapes verified: %lu native draws checked by the render thread, %lu shape ops "
 				        "drawn from compiled shapes, %lu differences (the render thread logs each as [j3d] lines)\n",
 				        (unsigned long)(GXPC_J3DStats[15] - s_verify0[0]), (unsigned long)(GXPC_J3DPkgStats[0] - s_verify0[1]),
 				        (unsigned long)(GX3DS_J3DSigBad() - s_verify0[2]));
 			setGameStep(++s_gameStep);
-			if (s_gameStep == kGameStepN) s_state = 14;
+			if (s_gameStep == s_stepN) s_state = 14;
 			s_frame = 0;
 		}
 		return;
@@ -1969,4 +2069,23 @@ extern "C" void GX3DS_StartZoneSampler(void) {
 	GX3DS_ZoneSampling = t != nullptr;
 	fprintf(stderr, "[prof] GX zone sampler %s (zones only in a GX library built with GX_ZONES=1)\n",
 	        t ? "on core 2, every 100 us" : "could not start");
+}
+
+// autorun.txt profile_steps = gpu (main.cpp): the profile run's GPU ceilings (kGpuSteps).
+extern "C" void SMS3DS_ProfGpuSteps(void) {
+	s_steps = kGpuSteps;
+	s_stepN = kGpuN;
+	s_stepVerify = kGpuN - 1;
+}
+// autorun.txt profile_steps = cache (main.cpp): the frame's cache work, three ways (kCacheSteps).
+extern "C" void SMS3DS_ProfCacheSteps(void) {
+	s_steps = kCacheSteps;
+	s_stepN = kCacheN;
+	s_stepVerify = kCacheN - 1;
+}
+// autorun.txt profile_steps = reverts (main.cpp): parts of this build put back one at a time (kRvSteps).
+extern "C" void SMS3DS_ProfRevertSteps(void) {
+	s_steps = kRvSteps;
+	s_stepN = kRvN;
+	s_stepVerify = kRvN - 1;
 }

@@ -490,10 +490,45 @@ static void vram_verify(void)
 	}
 }
 
+/* The CPU's caches and what the GPU reads or writes (pica_set_cache_way): 0, the kernel calls GSP
+ * makes for GSPGPU_FlushDataCache and GSPGPU_InvalidateDataCache, made on this thread instead; 1,
+ * through GSP, as citro3d does; 2, as 0 with the whole heap only written back at each frame's end
+ * (svcStoreProcessDataCache), not also dropped from the caches. On the New 3DS GSP did the frame's
+ * whole-heap flush (2-3 ms) and the goop map's invalidate (2 ms) on core 1, and the GPU took ~2 ms
+ * longer over a frame while either ran (log-reverts, 2026-10-23). A failed kernel call goes
+ * through GSP. */
+static int s_cacheWay;
+static uint32_t s_cacheFails;
+void pica_set_cache_way(int way) { s_cacheWay = way; }
+int pica_cache_way(void) { return s_cacheWay; }
+static int cache_kernel(Result r)
+{
+	if (R_SUCCEEDED(r)) return 1;
+	if (!s_cacheFails++) fprintf(stderr, "[pica] a cache call failed (%08lx): through GSP\n", (unsigned long)r);
+	return 0;
+}
+static void cache_flush(const void* p, uint32_t n)
+{
+	if (s_cacheWay == 1 || !cache_kernel(svcFlushProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)p, n)))
+		GSPGPU_FlushDataCache(p, n);
+}
+static void cache_invalidate(const void* p, uint32_t n)
+{
+	if (s_cacheWay == 1 || !cache_kernel(svcInvalidateProcessDataCache(CUR_PROCESS_HANDLE, (u32)(uintptr_t)p, n)))
+		GSPGPU_InvalidateDataCache(p, n);
+}
+static void heap_writeback(void)
+{
+	extern u32 __ctru_linear_heap, __ctru_linear_heap_size;
+	if (s_cacheWay == 2 && cache_kernel(svcStoreProcessDataCache(CUR_PROCESS_HANDLE, __ctru_linear_heap, __ctru_linear_heap_size)))
+		return;
+	cache_flush((void*)__ctru_linear_heap, __ctru_linear_heap_size);
+}
+
 static void tex_flush(PicaTex* t)
 {
 	s_texGen++; /* bound textures are bound again (apply_state): the bind empties the texture cache */
-	GSPGPU_FlushDataCache(t->tex.data, t->bytes);
+	cache_flush(t->tex.data, t->bytes);
 	if (t->vram && !t->noVram) vram_copy(t);
 }
 
@@ -865,8 +900,14 @@ static void ovl_frame_begin(void)
 }
 static int ovl_queue_room(void) { return s_ovq[s_ovb].numEntries < OVL_COPY_LIMIT; }
 
+static void readback_arrived(void);
 static void readback_finish(void);
 static void readback_queue(void);
+/* Readbacks converted after the frame's queue starts (pica_set_readback_late; the profiler's revert
+ * steps): first, the GPU waited for them, some 3 ms a frame on the New 3DS (invalidating the
+ * 256 KB goop map's buffer 2.1, converting it 1.0) whenever it was the frame's limit. */
+static int s_rbLate = 1;
+void pica_set_readback_late(int on) { s_rbLate = on; }
 
 static void ovl_frame_end(void)
 {
@@ -876,16 +917,15 @@ static void ovl_frame_end(void)
 	if (C3Di_SplitFrame(&buf, &size)) GX_ProcessCommandList(buf, size * 4, GX_CMDLIST_FLUSH);
 	GPUCMD_SetBuffer(NULL, 0, 0);
 	end_mark(PICA_END_SUBMIT);
-	if (s_heapFlush) {
-		/* As C3D_FrameEnd(0): write back the whole linear heap. */
-		extern u32 __ctru_linear_heap, __ctru_linear_heap_size;
-		GSPGPU_FlushDataCache((void*)__ctru_linear_heap, __ctru_linear_heap_size);
-	}
+	if (s_heapFlush) heap_writeback(); /* as C3D_FrameEnd(0): the whole linear heap written back */
 	end_mark(PICA_END_HEAP_FLUSH);
 	s_where = "waiting for the GPU to finish the previous frame";
 	ovl_wait_running();
 	end_mark(PICA_END_WAIT);
-	readback_finish(); /* the previous frame's copies are drawn: into the game's memory */
+	/* The previous frame's copies have arrived: converted into the game's memory once this frame's
+	 * queue runs (s_rbLate), else first. */
+	readback_arrived();
+	if (!s_rbLate) readback_finish();
 	end_mark(PICA_END_RB_CONVERT);
 	readback_queue();  /* this frame's, fetched from VRAM after its draws */
 	end_mark(PICA_END_RB_FETCH);
@@ -900,6 +940,10 @@ static void ovl_frame_end(void)
 	s_ovRunning = q;
 	s_ovb ^= 1;
 	end_mark(PICA_END_RUN);
+	if (s_rbLate) {
+		readback_finish();
+		end_mark(PICA_END_RB_CONVERT);
+	}
 }
 
 const char* pica_queue_state(void);
@@ -918,7 +962,7 @@ void pica_linear_free_block(void* p)
 	linearFree(p);
 	LIN_UNLOCK();
 }
-void pica_flush(const void* p, uint32_t bytes) { GSPGPU_FlushDataCache(p, bytes); }
+void pica_flush(const void* p, uint32_t bytes) { cache_flush(p, bytes); }
 /* Waits until the GPU has finished every frame handed to it. */
 void pica_gpu_idle(void)
 {
@@ -1344,6 +1388,8 @@ static void gx_light_vectors(const float (*nrm_rows)[4], const float LD[4])
  * object s_last was set from (apply_state: s_sameSrc, s_sameState) and with the layout gx_setup
  * last took (s_sameLayout). */
 uint32_t pica_draw_same;
+static int s_sameOff;  /* pica_draw_same ignored (pica_set_draw_same_off; the profiler's revert steps) */
+void pica_set_draw_same_off(int on) { s_sameOff = on; }
 static const PicaState* s_sameSrc;
 static uint32_t s_sameState, s_sameLayout;
 
@@ -1363,7 +1409,7 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
                  const PicaState* st)
 {
 	(void)nverts;
-	const uint32_t same = pica_draw_same;
+	const uint32_t same = s_sameOff ? 0 : pica_draw_same;
 	pica_draw_same = 0;
 	if (!s_in_frame || nidx == 0) return 1;
 	if (!gx_setup(verts, L, u, matrices_dirty, pos_rows, nrm_rows, st, same)) return 0;
@@ -1616,7 +1662,7 @@ static void apply_state(const PicaState* st, uint32_t same)
 
 void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nidx, const PicaState* st)
 {
-	const uint32_t same = pica_draw_same;
+	const uint32_t same = s_sameOff ? 0 : pica_draw_same;
 	pica_draw_same = 0;
 	if (!s_in_frame || nidx == 0) return;
 	apply_state(st, same);
@@ -1687,8 +1733,8 @@ void pica_clear_rect(float x, float y, float w, float h, uint32_t rgba, uint32_t
 /* The GPU reads the rings from memory: write back what the CPU wrote since the last time. */
 static void flush_rings(void)
 {
-	if (s_vused > s_vflushed) GSPGPU_FlushDataCache(s_vring[s_half] + s_vflushed, s_vused - s_vflushed);
-	if (s_iused > s_iflushed) GSPGPU_FlushDataCache(s_iring[s_half] + s_iflushed, s_iused - s_iflushed);
+	if (s_vused > s_vflushed) cache_flush(s_vring[s_half] + s_vflushed, s_vused - s_vflushed);
+	if (s_iused > s_iflushed) cache_flush(s_iring[s_half] + s_iflushed, s_iused - s_iflushed);
 	s_vflushed = s_vused;
 	s_iflushed = s_iused;
 }
@@ -1979,8 +2025,9 @@ typedef struct {
 	uint8_t* buf;
 } Readback;
 #define MAX_READBACK 8
-static Readback s_rbCur[MAX_READBACK], s_rbRun[MAX_READBACK];
-static int s_nrbCur, s_nrbRun;
+/* Asked for this frame, queued with the frame the GPU runs, arrived (to convert) */
+static Readback s_rbCur[MAX_READBACK], s_rbRun[MAX_READBACK], s_rbArrived[MAX_READBACK];
+static int s_nrbCur, s_nrbRun, s_nrbArrived;
 static uint32_t s_rbDone, s_rbSkipped;
 
 void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, int chan, float x, float y, float w,
@@ -2036,7 +2083,7 @@ static void readback_queue(void)
 		if (!r->buf) continue;
 		/* Without the whole-heap flush, lines the CPU left dirty here could be written back over
 		 * what the GPU copies in. */
-		if (!s_heapFlush) GSPGPU_InvalidateDataCache(r->buf, size);
+		if (!s_heapFlush) cache_invalidate(r->buf, size);
 		GX_TextureCopy((u32*)r->tex->tex.data, 0, (u32*)r->buf, 0, size, 8);
 	}
 	memcpy(s_rbRun, s_rbCur, sizeof(Readback) * (size_t)s_nrbCur);
@@ -2124,13 +2171,21 @@ static void readback_rows(const Readback* r)
 	}
 }
 
+/* The queue that ran the last frame has finished: its copies are in their buffers. */
+static void readback_arrived(void)
+{
+	memcpy(s_rbArrived, s_rbRun, sizeof(Readback) * (size_t)s_nrbRun);
+	s_nrbArrived = s_nrbRun;
+	s_nrbRun = 0;
+}
+
 static void readback_finish(void)
 {
-	for (int i = 0; i < s_nrbRun; i++) {
-		Readback* r = &s_rbRun[i];
+	for (int i = 0; i < s_nrbArrived; i++) {
+		Readback* r = &s_rbArrived[i];
 		if (!r->buf) continue;
 		end_mark(PICA_END_RB_CONVERT);
-		GSPGPU_InvalidateDataCache(r->buf, (uint32_t)r->th * r->tw * 4);
+		cache_invalidate(r->buf, (uint32_t)r->th * r->tw * 4);
 		end_mark(PICA_END_RB_INVAL);
 		const uint32_t bytes = (uint32_t)((r->dh + 3) / 4) * r->tilesPerRow * 32;
 		uint32_t before = 0, after = 0, maxv = 0;
@@ -2159,7 +2214,7 @@ static void readback_finish(void)
 		r->buf = NULL;
 		s_rbDone++;
 	}
-	s_nrbRun = 0;
+	s_nrbArrived = 0;
 }
 
 uint32_t pica_readbacks(void) { return s_rbDone; }

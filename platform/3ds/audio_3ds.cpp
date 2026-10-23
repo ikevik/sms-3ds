@@ -48,6 +48,7 @@ void port_os_switch_hook(void* from, void* to);
 // JAudio's turns on core 2 (settings.txt audio_thread = core2; sms-pc-port patch 0043, Makefile wraps,
 // scripts/build_game_lib.sh's lock hooks).
 void SMS3DS_AudioSetThread(int core2);
+void SMS3DS_AudioFeedHere(int on);  // the voices' decoding back in ndsp's thread (the profiler)
 void port_os_set_off_cpu(int on);
 void port_os_resume_hook(void);
 void port_audio_checkpoint(void);
@@ -301,6 +302,7 @@ Thread s_feeder;
 LightEvent s_feedDue;
 volatile bool s_feedRun;
 volatile u32 s_feedFrames, s_feedDone;  // DSP frames given to the feeder, and done
+volatile bool s_feedHere;  // the decoding back in ndsp's thread for now (SMS3DS_AudioFeedHere; the profiler)
 volatile u32 s_turnTicks, s_turnWaitTicks, s_emuWaitTicks, s_turnBlocks, s_serialBlocks, s_handoffs;
 volatile u32 s_thpLate;             // turns' blocks a movie's sound started in (left silent)
 u32 s_hookCalls;                    // the game's side: calls into its sound code (the lock hooks)
@@ -677,12 +679,13 @@ void ndsp_frame(void*)
 		}
 		if (!q) s_sinkDry++;
 	}
-	if (s_feeder) {  // the feeder on core 2 does the rest
+	if (s_feeder && !s_feedHere) {  // the feeder on core 2 does the rest
 		s_feedFrames++;
 		LightEvent_Signal(&s_feedDue);
 		s_cbTicks += ticks() - t0;
 		return;
 	}
+	while (s_feeder && s_feedDone != s_feedFrames) svcSleepThread(100000);  // (its frames finished first)
 	feed_frame(s_dspFrames);
 	s_cbTicks += ticks() - t0;
 }
@@ -1750,6 +1753,8 @@ void __wrap__ZN8JASystem11TDSPChannel9updateAllEv(void)
 // --- JAudio's turns on core 2: the entry points ------------------------------------------------
 
 volatile int port_audio_turn_waiting;
+
+void SMS3DS_AudioFeedHere(int on) { s_feedHere = on != 0; }
 
 // settings.txt audio_thread = core2, from the game thread after SMS3DS_AudioInit: JAudio's blocks are
 // run by a thread on core 2 (above the render thread there) instead of JAudio's audio thread.
