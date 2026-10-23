@@ -573,7 +573,9 @@ static void* game_thread(void*)
 		if (mode)
 			SMS3DS_AudioSetUpdateInterval(setting_value(kSettingsPath, "audio_update_interval", v, sizeof v)
 			                                  ? atoi(v) : SMS3DS_AUDIO_UPDATE_INTERVAL_DEFAULT);
-		if (mode && setting_value(kSettingsPath, "audio_thread", v, sizeof v))
+		// (autorun.txt's audio_thread, for an unattended run, before settings.txt's)
+		if (mode && (setting_value(SMS_DIR "/autorun.txt", "audio_thread", v, sizeof v) ||
+		             setting_value(kSettingsPath, "audio_thread", v, sizeof v)))
 			SMS3DS_AudioSetThread(strcmp(v, "core2") == 0);
 		static const char* const kAudio[] = {"off", "on (the 3DS DSP)", "software mixer", "silent (no voice plays)"};
 		fprintf(stderr, "[3ds] audio: %s (audio%s)\n", kAudio[mode], cycle > 0 && mode ? ", audio_cycle" : "");
