@@ -79,6 +79,10 @@ int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // lite: the lite setting off and on in turn; liteplus: more trims on top of it). It may also give
 // lite (on), as settings.txt does.
 static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
+// lite = plus: Bianco Hills' draw distance (lite_stage_draw_distance). In Azahar at its spawn view, of
+// ~90K vertices a frame 20000 leaves out ~31K (mostly behind the hills nearby), 15000 ~43K, 25000 ~21K;
+// 10000 and less showed in wide views.
+static const int kPlusBiancoFar = 20000;
 // autorun.txt buttons = <seconds>:<keys>,... (keys A B X Y L R START SELECT UP DOWN LEFT RIGHT,
 // joined by '+'): those buttons held for 0.25 s from that many seconds after launch (pad_3ds.c,
 // pad3ds_script). shots = <seconds>,...: the frame drawn then saved as sdmc:/sms/shot-<tenths of a
@@ -128,6 +132,7 @@ void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
 void GX3DS_SetSkipTev(unsigned id, unsigned to);  // gx3ds_backend.cpp: autorun.txt skip_tev (debugging)
 void GX3DS_NewStage(void);  // gx3ds_backend.cpp: a new stage loads (the renderer's caches of the last go)
+void SMS3DS_LiteStage(int stage);  // prof_3ds.cpp: the stage that loads (its draw distance with lite on)
 extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
@@ -268,6 +273,7 @@ static void log_scene(uint32_t frames, uint32_t batches)
 	// Another stage or scenario: a new stage loads, and the display lists cached for the last one
 	// go (the stages left behind filled the heap: crash dump 41).
 	if (have_last && (s.curr_stage != last.curr_stage || s.curr_scen != last.curr_scen)) GX3DS_NewStage();
+	if (!have_last || s.curr_stage != last.curr_stage) SMS3DS_LiteStage(s.curr_stage);  // (its draw distance)
 	if (!changed && now - last_ms < 1000)
 		return;
 	fprintf(stderr,
@@ -496,6 +502,7 @@ extern "C" void SMS3DS_ProfFixedSteps(void);    // ... profile_steps = fixed
 extern "C" void SMS3DS_ProfTradeSteps(void);    // ... profile_steps = trades
 extern "C" void SMS3DS_ProfLiteSteps(void);     // ... profile_steps = lite
 extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist);  // prof_3ds.cpp: settings.txt lite
+extern "C" void SMS3DS_SetStageFar(int stage, int dist);  // ... lite_stage_draw_distance
 extern "C" void SMS3DS_SetLiteParts(int particles, int seaStep, int actorDist, int shineOff);
 extern "C" void SMS3DS_ProfLitePlusSteps(void);  // ... profile_steps = liteplus
 extern "C" void SMS3DS_ProfLightingSteps(void);  // ... profile_steps = lighting
@@ -696,6 +703,18 @@ static void* game_thread(void*)
 			const int ad = setting_value(kSettingsPath, "lite_actor_distance", v, sizeof v) ? atoi(v) : -1;
 			const int so = setting_value(kSettingsPath, "lite_shine_shadow", v, sizeof v) ? strcmp(v, "off") == 0 : plus ? 1 : -1;
 			SMS3DS_SetLiteParts(pn, ss, ad, so);
+			// lite_stage_draw_distance = <stage>:<distance>,...: a stage's own draw distance in place of
+			// lite_draw_distance (0: no limit; stages as the log's [scene] area= gives them: 0 Delfino
+			// Airstrip, 1 Delfino Plaza, 2 Bianco Hills, 3 Ricco Harbor). lite = plus gives Bianco Hills
+			// kPlusBiancoFar: it lagged on a New 3DS (43 ms a frame, the GPU the limit). autorun.txt's first.
+			if (plus) SMS3DS_SetStageFar(2, kPlusBiancoFar);
+			char list[128];
+			if (setting_value(SMS_DIR "/autorun.txt", "lite_stage_draw_distance", list, sizeof list) ||
+			    setting_value(kSettingsPath, "lite_stage_draw_distance", list, sizeof list))
+				for (char* p = strtok(list, ","); p; p = strtok(nullptr, ",")) {
+					int stage, dist;
+					if (sscanf(p, " %d : %d", &stage, &dist) == 2) SMS3DS_SetStageFar(stage, dist);
+				}
 			SMS3DS_SetLite(on, dd, sd);
 		}
 		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) {

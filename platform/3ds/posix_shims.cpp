@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -96,23 +97,33 @@ extern "C" WEAK long sysconf(int name)
 
 // --- files ----------------------------------------------------------------------------
 // newlib has no pread: seek, read and restore under one lock (the disc is read from
-// several threads).
-static LightLock g_pread_lock;
-static bool g_pread_lock_ready;
+// several threads). A failed read is tried again: the disc reader (sms-pc-port's gcdisc.cpp)
+// gives up on the first failure and returns nothing, and the game then decompresses what the
+// buffer held before (crash dump 42: Ricco Harbor's second episode, four of its models and
+// animations unreadable after a long session on a console). Each failure is logged.
+static LightLock g_pread_lock = 1;  // 1: unlocked
 extern "C" WEAK ssize_t pread(int fd, void* buf, size_t count, off_t offset)
 {
-	if (!g_pread_lock_ready) {
-		LightLock_Init(&g_pread_lock);
-		g_pread_lock_ready = true;
-	}
 	LightLock_Lock(&g_pread_lock);
 	ssize_t n = -1;
+	int err = 0, tries = 0;
 	off_t was = lseek(fd, 0, SEEK_CUR);
-	if (was != (off_t)-1 && lseek(fd, offset, SEEK_SET) != (off_t)-1) {
-		n = read(fd, buf, count);
-		lseek(fd, was, SEEK_SET);
+	for (; tries < 8; tries++) {
+		if (tries) svcSleepThread(2000000LL * tries);  // 2, 4, ... ms
+		n = -1;
+		if (lseek(fd, offset, SEEK_SET) != (off_t)-1) n = read(fd, buf, count);
+		if (n > 0 || count == 0) break;
+		err = errno;
+		if (n == 0) {  // nothing at or past the end: as asked, unless the file is longer
+			struct stat st;
+			if (fstat(fd, &st) == 0 && offset >= st.st_size) break;
+		}
 	}
+	if (was != (off_t)-1) lseek(fd, was, SEEK_SET);
 	LightLock_Unlock(&g_pread_lock);
+	if (tries)
+		fprintf(stderr, "[file] read of %lu bytes at %lld %s after %d tries (errno %d)\n", (unsigned long)count,
+		        (long long)offset, n > 0 ? "worked" : "FAILED", tries + (n > 0 ? 1 : 0), err);
 	return n;
 }
 

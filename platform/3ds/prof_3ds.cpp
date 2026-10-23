@@ -1814,12 +1814,20 @@ void skipGate() { SMS3DS_ProfSkipOn = s_trade != 0 || s_skipNow != nullptr || SM
 float s_liteShadowDist = 2000.0f, s_liteFar = 4000.0f, s_liteActorFar = 0.0f;
 int s_liteParticles = 2, s_liteSeaStep = 1;
 bool s_liteShine = true;  // the Shine's shadow volume drawn
+// Stages with a draw distance of their own (settings.txt lite_stage_draw_distance; lite = plus gives
+// Bianco Hills one): -1 none (lite_draw_distance's), 0 no limit. s_stageNow: the stage loaded (main.cpp).
+float s_stageFar[64] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+int s_stageNow = -1;
+float liteFarNow() { return s_stageNow >= 0 && s_stageNow < 64 && s_stageFar[s_stageNow] >= 0.0f ? s_stageFar[s_stageNow] : s_liteFar; }
 void liteApply(bool on) {
 	// (a distance of 0: Mario's and Yoshi's shadows only)
 	SMS3DS_LiteShadowDist2 = !on ? 0.0f : s_liteShadowDist > 1.0f ? s_liteShadowDist * s_liteShadowDist : 1.0f;
 	SMS3DS_LiteParticles = on ? s_liteParticles : 0;
 	SMS3DS_LiteMirror = on;
-	SMS3DS_LiteFar = on ? s_liteFar : 0.0f;
+	SMS3DS_LiteFar = on ? liteFarNow() : 0.0f;
 	SMS3DS_LiteActorFar = on ? s_liteActorFar : 0.0f;
 	SMS3DS_LiteSeaStep = on ? s_liteSeaStep : 0;
 	SMS3DS_ProfDrawSkip = (SMS3DS_ProfDrawSkip & ~1) | (on && !s_liteShine ? 1 : 0);  // 1: the Shine's shadow volume
@@ -2381,6 +2389,20 @@ extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist) {
 		        "drawn wholly past %.0f (0: no limit), no mirror, NPCs and objects clipped past %.0f (0: the game's), the sea's grid every "
 		        "%d, the Shine's shadow %s)\n", double(s_liteShadowDist), s_liteParticles, double(s_liteFar),
 		        double(s_liteActorFar), s_liteSeaStep, s_liteShine ? "drawn" : "not drawn");
+}
+// settings.txt lite_stage_draw_distance (main.cpp), before SMS3DS_SetLite: stage's own draw distance
+// (0: no limit; negative: lite_draw_distance's).
+extern "C" void SMS3DS_SetStageFar(int stage, int dist) {
+	if (stage >= 0 && stage < 64) s_stageFar[stage] = dist < 0 ? -1.0f : float(dist);
+}
+// The main thread's scene watch: the stage that loads (its draw distance, with the lite setting on).
+extern "C" void SMS3DS_LiteStage(int stage) {
+	const float before = liteFarNow();
+	s_stageNow = stage;
+	if (!s_liteOn || liteFarNow() == before) return;
+	SMS3DS_LiteFar = liteFarNow();
+	GXPC_CullFar = SMS3DS_LiteFar;
+	fprintf(stderr, "[3ds] lite: stage %d, nothing drawn wholly past %.0f (0: no limit)\n", stage, double(SMS3DS_LiteFar));
 }
 // settings.txt's further lite keys (main.cpp), before SMS3DS_SetLite: lite_particles (one in N),
 // lite_sea_step, lite_actor_distance, lite_shine_shadow (off); a negative value keeps the default.
