@@ -287,6 +287,9 @@ void pica_vertex_bench(void);
 /* GPU state sent so far: texture binds, combiner stages, matrix-row uniforms, other uniform
  * vectors, bool uniforms, draws. */
 void pica_state_stats(uint32_t out[6]);
+/* Counts so far of what the GPU does besides the GX-mode draws: CPU-path draws, EFB copies, their
+ * pixels, copies' rectangle clears, their pixels, EFB fills, render-target switches. */
+void pica_fixed_stats(uint32_t out[7]);
 /* On: every draw is submitted and waited for on its own, and one the GPU never finishes is logged
  * ([gpucheck] lines) with its layout, textures and combiner stages. Very slow. */
 void pica_set_gpu_check(int on);

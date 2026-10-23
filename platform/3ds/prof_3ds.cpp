@@ -110,6 +110,8 @@ void GX3DS_SetGamePoll(int on);
 void GX3DS_SetGxPoll(int on);
 int GX3DS_GxPoll(void);
 void SMS3DS_AudioFeedHere(int on);
+void GX3DS_SetSkipColourCopies(int on);  // gx3ds_backend.cpp: colour texture copies left out (trades)
+extern float GXPC_CullFar;               // gx_fifo.cpp (sms-port patch 0051): draws farther than this left out
 void pica_set_cache_way(int way);  // pica_draw.c: the frame's cache work in kernel calls (0), through GSP (1), ...
 int pica_cache_way(void);
 void GXPC_SetNativeJ3DMode(int mode);  // gx_api.cpp: native J3D's mode, its buffers kept (part 4)
@@ -200,6 +202,14 @@ unsigned long SMS3DS_PrintGlyphs[2];
 unsigned long SMS3DS_WaveChecked, SMS3DS_WaveDiffs;
 void SMS3DS_ProfSetLowTouch(int part);  // the low touch's run: 4 the game thread's steps, 5 by object
 int SMS3DS_ProfSkipOn;  // part 5: an object's drawing is being left out (SMS3DS_ProfSkip; decomp patch 3ds-0021)
+// The lite setting (settings.txt lite, SMS3DS_SetLite): a console-only quality trade for frame rate,
+// off by default. Shadows only near the camera besides Mario's and Yoshi's, half the particles
+// (decomp patch 3ds-0033), nothing drawn wholly past a distance (sms-port patch 0051's
+// GXPC_CullFar), no mirror (its objects and its EFB copy left out through SMS3DS_ProfSkip).
+float SMS3DS_LiteShadowDist2;
+int SMS3DS_LiteParticles;
+int SMS3DS_LiteMirror;
+float SMS3DS_LiteFar;
 int SMS3DS_ProfSkip(const void* vtable, const char* name);
 int SMS3DS_J3DCeilingBegin(void);  // decomp patch 3ds-0027: a J3D ceiling step's draw buffers
 void SMS3DS_J3DCeilingEnd(void);
@@ -733,6 +743,9 @@ struct GameStep {
 	int native, packages, rings, wave, blockOps, texOnce, compiled, telop, role, j3d, noCheck, drawSkip, nameCache;
 	int revert;  // kRv*: parts of this build put back as they were before it (profile_steps = reverts)
 	int cacheWay;  // pica_set_cache_way + 1 (0: this build's)
+	int trade;     // kTr*: what of the game is left out (profile_steps = trades)
+	int farCull;   // GXPC_CullFar: draws wholly farther than this left out (0: none)
+	int lite;      // the lite setting: 0 as set, 1 off, 2 on (profile_steps = lite)
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
@@ -822,8 +835,95 @@ const GameStep kCacheSteps[kCacheN] = {
     kStdSteps[kGsChecks],
 };
 #undef SMS3DS_STEP
+// autorun.txt profile_steps = fixed (main.cpp, SMS3DS_ProfFixedSteps): what the GPU still does with
+// the game's GX-mode draws left out (GPU test 3, 6.8 ms a frame on the New 3DS in Delfino Plaza),
+// part by part (GPU tests 10-15, pica_draw.c): test 3 first and last (drift), between them each
+// part left out too, then all of them; each window's GPU time against test 3's is that part's.
+// Phases untimed; then every check.
+#define SMS3DS_STEP(name, gpu, role) {name, 0, 0, gpu, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1, 0, 0}
+enum { kFixedN = 12 };
+const GameStep kFixedSteps[kFixedN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, kRoleWarm),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("GPU: no draws (its fixed work)", 3, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws, no CPU-path draws", 10, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws, no EFB copies", 11, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws, no copies' rectangle clears", 12, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws, no EFB fill", 13, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws, no draws' setup", 14, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws, none of these (presenting only)", 15, kRoleCeiling),
+    SMS3DS_STEP("GPU: no draws (its fixed work)", 3, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
+// autorun.txt profile_steps = trades (main.cpp, SMS3DS_ProfTradeSteps): the quality trade-offs that
+// could bring the New 3DS to 30 fps, each as a ceiling (the whole of it left out) between normal
+// windows: the sea (TMapObjWave), the bind shadows (TMBindShadowManager), the Shine's shadow volume
+// (decomp patch 3ds-0028's draw skip 1), the mirror (its camera, actor, models and map buffer) with
+// the colour texture copies and their clears (the mirror's and the screen texture's), map pieces
+// and objects wholly farther than 4000 and than 2500 (sms-port patch 0051; past 8000 cut only 4% of
+// the vertices at the spawn view), the particles and splashes (TMarioParticleManager,
+// TSplashManager), the NPCs' animation every other frame (their managers' calc-anim performs), the
+// HUD's drawing (TGCConsole2 in the drawing phases); then all of them at once (far: 4000); then
+// every check. Objects are matched by class: the vtable each one's
+// first word points into (SMS3DS_ProfSkip, decomp patch 3ds-0021's hook in testPerform).
+enum { kTrSea = 1, kTrShadows = 2, kTrMirror = 4, kTrParticles = 8, kTrNpcHalf = 16, kTrHud = 32, kTrAll = 63 };
+#define SMS3DS_STEP(name, trade, far, draw, role) \
+	{name, 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, draw, -1, 0, 0, trade, far}
+enum { kTradeN = 23 };
+const GameStep kTradeSteps[kTradeN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, 0, 0, kRoleWarm),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: no sea", kTrSea, 0, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: no bind shadows", kTrShadows, 0, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: no Shine shadow volume", 0, 0, 1, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: no mirror, no colour copies", kTrMirror, 0, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: nothing drawn past 4000", 0, 4000, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: nothing drawn past 2500", 0, 2500, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: no particles or splashes", kTrParticles, 0, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: NPCs animated every other frame", kTrNpcHalf, 0, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: no HUD drawn", kTrHud, 0, 0, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    SMS3DS_STEP("trade: all of these (past 4000)", kTrAll, 4000, 1, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, 0, 0, kRoleNormal),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
+// autorun.txt profile_steps = lite (main.cpp, SMS3DS_ProfLiteSteps): the lite setting off and on in
+// turn, phases untimed (the frame as in normal play); then every check.
+#define SMS3DS_STEP(name, lite, role) {name, 0, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1, 0, 0, 0, 0, lite}
+enum { kLiteN = 10 };
+const GameStep kLiteSteps[kLiteN] = {
+    SMS3DS_STEP("warm-up (not compared)", 1, kRoleWarm),
+    SMS3DS_STEP("lite off", 1, kRoleNormal),
+    SMS3DS_STEP("lite on", 2, kRoleOn),
+    SMS3DS_STEP("lite off", 1, kRoleNormal),
+    SMS3DS_STEP("lite on", 2, kRoleOn),
+    SMS3DS_STEP("lite off", 1, kRoleNormal),
+    SMS3DS_STEP("lite on", 2, kRoleOn),
+    SMS3DS_STEP("lite off", 1, kRoleNormal),
+    SMS3DS_STEP("lite on", 2, kRoleOn),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
+int s_trade;  // this window's kTr* (SMS3DS_ProfSkip)
+void skipGate();          // SMS3DS_ProfSkipOn from what is left out now (below)
+void liteApply(bool on);  // the lite setting's parts on or off (below)
+bool s_liteOn;            // the lite setting as set (SMS3DS_SetLite)
+double s_gameSkips[32];  // each step's performs left out a frame
 enum { kStepMax2 = kGpuN > kGsN ? kGpuN : kGsN, kStepMax3 = kRvN > kStepMax2 ? kRvN : kStepMax2,
-       kGameStepMax = kCacheN > kStepMax3 ? kCacheN : kStepMax3 };
+       kStepMax4 = kCacheN > kStepMax3 ? kCacheN : kStepMax3, kStepMax5 = kFixedN > kStepMax4 ? kFixedN : kStepMax4,
+       kStepMax6 = kTradeN > kStepMax5 ? kTradeN : kStepMax5, kGameStepMax = kLiteN > kStepMax6 ? kLiteN : kStepMax6 };
+static_assert(kGameStepMax <= 32, "s_gameSkips");
 // The run's steps: the standard ones, or the GPU's ceilings.
 const GameStep* s_steps = kStdSteps;
 int s_stepN = kGsN, s_stepVerify = kGsChecks;  // (the step that verifies native J3D)
@@ -895,6 +995,11 @@ void setGameStep(int k) {
 	pica_set_gpucmd_libctru(rv & kRvGpuCmd);
 	pica_set_draw_same_off(rv & kRvSame);
 	pica_set_cache_way(g && g->cacheWay ? g->cacheWay - 1 : s_cacheWaySaved);
+	s_trade = g ? g->trade : 0;
+	liteApply(g && g->lite ? g->lite == 2 : s_liteOn);
+	skipGate();
+	GX3DS_SetSkipColourCopies(s_trade & kTrMirror);
+	GXPC_CullFar = g && g->farCull ? float(g->farCull) : SMS3DS_LiteFar;
 	if (g) pica_set_gpu_test(g->gpuTest);
 	if (g && g->hog) {
 		if (!hogStart(g->hog)) fprintf(stderr, "[prof] game thread: no memory or thread for a %lu KB hog\n", (unsigned long)(g->hog >> 10));
@@ -964,6 +1069,10 @@ void reportGameStep(int k) {
 		snprintf(hog, sizeof hog,
 		         "; J3D's draw buffers %.2f ms, particles %.2f, shadows %.2f, HUD %.2f, the sea %.2f",
 		         s_gameZoneMs[k][5], s_gameZoneMs[k][6], s_gameZoneMs[k][16], s_gameZoneMs[k][9], s_gameZoneMs[k][7]);
+	if (s_steps[k].trade || s_steps[k].lite == 2) {
+		const size_t at0 = strlen(hog);
+		snprintf(hog + at0, sizeof hog - at0, "; %.1f performs a frame left out", s_gameSkips[k]);
+	}
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", s_steps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -1186,8 +1295,8 @@ void reportSkip() {
 
 void startSkip() {
 	GXPC_Detail = 0;  // as in normal play
-	SMS3DS_ProfSkipOn = 0;
 	s_skipNow = nullptr;
+	skipGate();
 	s_skipDone = false;
 	s_state = 15;
 	s_frame = 0;
@@ -1562,7 +1671,87 @@ void SMS3DS_ProfSetLowTouch(int part) { s_lowPart = part == 5 ? 5 : 4; }
 // 0 idle, 1 CPU part, 2 GPU part, 3 GPU by object, 4 the game thread's steps or objects (for the status screen)
 // Part 5 (decomp patch 3ds-0021, JDrama::TViewObj::testPerform): 1 to leave this object's perform
 // out (only the target, only in its phase: one of the drawing phases).
+// The trade-off windows' classes (vtable symbols; an object's first word is its class's vtable + 8).
+extern "C" const char _ZTV11TMapObjWave[], _ZTV19TMBindShadowManager[], _ZTV11TGCConsole2[], _ZTV21TMarioParticleManager[],
+    _ZTV14TSplashManager[], _ZTV13TMirrorCamera[], _ZTV12TMirrorActor[], _ZTV19TMirrorModelManager[],
+    _ZTV17TMirrorMapDrawBuf[];
+// TNPCManager and the managers derived from it (include/NPC/NpcManager.hpp; weak: a class with no
+// vtable in the app is a null entry).
+extern "C" __attribute__((weak)) const char _ZTV11TNPCManager[], _ZTV15TKinojiiManager[],
+    _ZTV15TKinopioManager[], _ZTV16TMareBaseManager[], _ZTV14TMareMAManager[], _ZTV14TMareMBManager[],
+    _ZTV17TMareMBaseManager[], _ZTV14TMareMCManager[], _ZTV14TMareMDManager[], _ZTV14TMareWAManager[],
+    _ZTV14TMareWBManager[], _ZTV17TMareWBaseManager[], _ZTV15TMonteMAManager[], _ZTV15TMonteMBManager[],
+    _ZTV18TMonteMBaseManager[], _ZTV15TMonteMCManager[], _ZTV15TMonteMDManager[], _ZTV15TMonteMEManager[],
+    _ZTV15TMonteMFManager[], _ZTV15TMonteMGManager[], _ZTV15TMonteMHManager[], _ZTV14TMonteMManager[],
+    _ZTV15TMonteWAManager[], _ZTV15TMonteWBManager[], _ZTV18TMonteWBaseManager[], _ZTV15TMonteWCManager[],
+    _ZTV14TMonteWManager[], _ZTV13TPeachManager[], _ZTV18TRaccoonDogManager[], _ZTV18TSunflowerLManager[],
+    _ZTV18TSunflowerSManager[];
+static const char* const kNpcManagerVt[] = {
+    _ZTV11TNPCManager, _ZTV15TKinojiiManager, _ZTV15TKinopioManager, _ZTV16TMareBaseManager,
+    _ZTV14TMareMAManager, _ZTV14TMareMBManager, _ZTV17TMareMBaseManager, _ZTV14TMareMCManager,
+    _ZTV14TMareMDManager, _ZTV14TMareWAManager, _ZTV14TMareWBManager, _ZTV17TMareWBaseManager,
+    _ZTV15TMonteMAManager, _ZTV15TMonteMBManager, _ZTV18TMonteMBaseManager, _ZTV15TMonteMCManager,
+    _ZTV15TMonteMDManager, _ZTV15TMonteMEManager, _ZTV15TMonteMFManager, _ZTV15TMonteMGManager,
+    _ZTV15TMonteMHManager, _ZTV14TMonteMManager, _ZTV15TMonteWAManager, _ZTV15TMonteWBManager,
+    _ZTV18TMonteWBaseManager, _ZTV15TMonteWCManager, _ZTV14TMonteWManager, _ZTV13TPeachManager,
+    _ZTV18TRaccoonDogManager, _ZTV18TSunflowerLManager, _ZTV18TSunflowerSManager,
+};
+static inline bool isClass(const void* vt, const char* sym) { return sym && vt == sym + 8; }
+static bool isNpcManager(const void* vt) {
+	for (const char* sym : kNpcManagerVt)
+		if (isClass(vt, sym)) return true;
+	return false;
+}
+static bool tradeSkip(const void* vt) {
+	if ((s_trade & kTrSea) && isClass(vt, _ZTV11TMapObjWave)) return true;
+	if ((s_trade & kTrShadows) && isClass(vt, _ZTV19TMBindShadowManager)) return true;
+	if ((s_trade & kTrParticles) && (isClass(vt, _ZTV21TMarioParticleManager) || isClass(vt, _ZTV14TSplashManager)))
+		return true;
+	if ((s_trade & kTrMirror) && (isClass(vt, _ZTV13TMirrorCamera) || isClass(vt, _ZTV12TMirrorActor) ||
+	                              isClass(vt, _ZTV19TMirrorModelManager) || isClass(vt, _ZTV17TMirrorMapDrawBuf)))
+		return true;
+	if ((s_trade & kTrHud) && isClass(vt, _ZTV11TGCConsole2) && s_phase >= 9 && s_phase <= 12) return true;
+	if ((s_trade & kTrNpcHalf) && s_phase == 7 && (s_frame & 1) && isNpcManager(vt)) return true;
+	return false;
+}
+// The lite setting's mirror: its camera, actor, models and map buffer, and the EFB copy into its
+// texture (the EFB copy controller named 鏡描画ステージ, "mirror drawing stage", in Shift-JIS).
+extern "C" const char _ZTVN6JDrama11TEfbCtrlTexE[];
+static bool liteMirrorSkip(const void* vt, const char* name) {
+	static const char kMirrorStage[] = "\x8b\xbe\x95\x60\x89\xe6\x83\x58\x83\x65\x81\x5b\x83\x57";
+	if (isClass(vt, _ZTVN6JDrama11TEfbCtrlTexE) && name && strcmp(name, kMirrorStage) == 0) {
+		static bool s_logged;
+		if (!s_logged) fprintf(stderr, "[3ds] lite: the mirror's EFB copy left out\n");
+		s_logged = true;
+		return true;
+	}
+	return isClass(vt, _ZTV13TMirrorCamera) || isClass(vt, _ZTV12TMirrorActor) || isClass(vt, _ZTV19TMirrorModelManager) ||
+	       isClass(vt, _ZTV17TMirrorMapDrawBuf);
+}
+namespace {
+void skipGate() { SMS3DS_ProfSkipOn = s_trade != 0 || s_skipNow != nullptr || SMS3DS_LiteMirror; }
+// The lite setting's parts, as set by SMS3DS_SetLite (or its defaults when only a profile run turns
+// it on): shadows' distance, particles, mirror, draw distance.
+float s_liteShadowDist = 2000.0f, s_liteFar = 4000.0f;
+void liteApply(bool on) {
+	SMS3DS_LiteShadowDist2 = on ? s_liteShadowDist * s_liteShadowDist : 0.0f;
+	SMS3DS_LiteParticles = on;
+	SMS3DS_LiteMirror = on;
+	SMS3DS_LiteFar = on ? s_liteFar : 0.0f;
+	GXPC_CullFar = SMS3DS_LiteFar;
+	skipGate();
+}
+}  // namespace
 int SMS3DS_ProfSkip(const void* vtable, const char* name) {
+	if (SMS3DS_LiteMirror && liteMirrorSkip(vtable, name)) {
+		s_skipFired++;
+		return 1;
+	}
+	if (s_trade) {
+		if (!tradeSkip(vtable)) return 0;
+		s_skipFired++;
+		return 1;
+	}
 	const SkipTarget* t = s_skipNow;
 	if (!t || t->vt != vtable || t->phase != s_phase || (t->byName && name != t->name)) return 0;
 	s_skipFired++;
@@ -1842,6 +2031,7 @@ void SMS3DS_ProfFrame(void) {
 			resetCpu();
 			s_winStart = s_phaseLast = now;
 			s_phase = 0;
+			s_skipFired = 0;
 			s_gpu0 = pica_gpu_ms_sum();
 			GX3DS_ThreadTicks(s_thread0);
 			uint32_t rs0[2];
@@ -1874,6 +2064,7 @@ void SMS3DS_ProfFrame(void) {
 			s_gameFrame[k] = double(now - s_winStart) / kFrames / kTicksPerMs;
 			s_gameGpu[k] = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
 			s_gameHog[k] = hogRate();
+			s_gameSkips[k] = double(s_skipFired) / kFrames;
 			uint64_t th[2];
 			GX3DS_ThreadTicks(th);
 			s_gameGx[k] = double(th[0] - s_thread0[0]) / kFrames / kTicksPerMs;
@@ -2004,7 +2195,7 @@ void SMS3DS_ProfFrame(void) {
 			s_skipStep = -1;
 			s_skipNext = 0;
 			s_skipNow = nullptr;
-			SMS3DS_ProfSkipOn = 0;
+			skipGate();
 			s_state = 16;
 			s_frame = 0;
 		}
@@ -2028,7 +2219,8 @@ void SMS3DS_ProfFrame(void) {
 				        w.work, w.gx, w.render, w.gpu, w.frame);
 				if (s_skipDone) {
 					SMS3DS_ProfOn = 0;
-					SMS3DS_ProfSkipOn = 0;
+					s_skipNow = nullptr;
+					skipGate();
 					reportSkip();
 					fprintf(stderr, "[prof] done\n");
 					SMS3DS_ProfRunsDone++;
@@ -2048,7 +2240,7 @@ void SMS3DS_ProfFrame(void) {
 				s_skipStep = (s_skipStep >= 0 && s_skipNext % kSkipPerBase == 0) ? -1 : s_skipNext++;
 			}
 			s_skipNow = s_skipStep >= 0 ? &s_skip[s_skipStep] : nullptr;
-			SMS3DS_ProfSkipOn = s_skipNow != nullptr;
+			skipGate();
 			s_frame = 0;
 		}
 		return;
@@ -2076,6 +2268,35 @@ extern "C" void SMS3DS_ProfGpuSteps(void) {
 	s_steps = kGpuSteps;
 	s_stepN = kGpuN;
 	s_stepVerify = kGpuN - 1;
+}
+// settings.txt lite = on (main.cpp): the lite setting, with its draw distance and its shadows'
+// distance (game units; 0 or less: the defaults, 4000 and 2000).
+extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist) {
+	if (drawDist > 0) s_liteFar = float(drawDist);
+	if (shadowDist > 0) s_liteShadowDist = float(shadowDist);
+	s_liteOn = on != 0;
+	liteApply(s_liteOn);
+	if (s_liteOn)
+		fprintf(stderr, "[3ds] lite: on (shadows only within %.0f besides Mario's and Yoshi's, half the particles, nothing "
+		        "drawn wholly past %.0f, no mirror)\n", double(s_liteShadowDist), double(s_liteFar));
+}
+// autorun.txt profile_steps = lite (main.cpp): the lite setting off and on in turn (kLiteSteps).
+extern "C" void SMS3DS_ProfLiteSteps(void) {
+	s_steps = kLiteSteps;
+	s_stepN = kLiteN;
+	s_stepVerify = kLiteN - 1;
+}
+// autorun.txt profile_steps = trades (main.cpp): the quality trade-offs' ceilings (kTradeSteps).
+extern "C" void SMS3DS_ProfTradeSteps(void) {
+	s_steps = kTradeSteps;
+	s_stepN = kTradeN;
+	s_stepVerify = kTradeN - 1;
+}
+// autorun.txt profile_steps = fixed (main.cpp): the GPU's fixed work by part (kFixedSteps).
+extern "C" void SMS3DS_ProfFixedSteps(void) {
+	s_steps = kFixedSteps;
+	s_stepN = kFixedN;
+	s_stepVerify = kFixedN - 1;
 }
 // autorun.txt profile_steps = cache (main.cpp): the frame's cache work, three ways (kCacheSteps).
 extern "C" void SMS3DS_ProfCacheSteps(void) {

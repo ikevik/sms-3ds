@@ -733,8 +733,27 @@ void pica_end_ticks(uint64_t out[PICA_END_COUNT]) { memcpy(out, s_endTicks, size
  * fewer attributes would save. 7 binds one small texture in place of every texture without a VRAM
  * copy, 8 in place of every texture: what textures in main memory, and textures at all, cost.
  * 9 changes nothing drawn: like every test it only leaves out the copies' readbacks (the
- * profiler's game-thread step, while the GX writes are muted and the copies hold nothing real). */
+ * profiler's game-thread step, while the GX writes are muted and the copies hold nothing real).
+ * 10-15 are 3 with more of what the GPU still does left out, for the parts of that: 10 the
+ * CPU-path draws, 11 the EFB copies' passes, 12 the copies' clears of their rectangles, 13 the
+ * EFB's fill at each frame's start, 14 the GX-mode draws' setup too, 15 all of these (presenting
+ * and the screen transfer left). */
 static int s_gpuTest;
+enum { SKIP_CPU = 1, SKIP_COPY = 2, SKIP_RECT = 4, SKIP_FILL = 8, SKIP_SETUP = 16 };
+/* GX-mode draws left out (tests 3, 10-15) */
+static inline int test_no_draws(void) { return s_gpuTest == 3 || (s_gpuTest >= 10 && s_gpuTest <= 15); }
+/* Whether tests 10-15 leave out this part (SKIP_*) */
+static inline int test_skips(int part)
+{
+	static const uint8_t kSkips[6] = {SKIP_CPU, SKIP_COPY, SKIP_RECT, SKIP_FILL, SKIP_SETUP, 31};
+	return s_gpuTest >= 10 && s_gpuTest <= 15 && (kSkips[s_gpuTest - 10] & part);
+}
+/* What the GPU does besides the GX-mode draws, for [perf] (pica_fixed_stats): CPU-path draws, EFB
+ * copies and the pixels drawn into them, copies' rectangle clears and their pixels (in the EFB
+ * texture's), EFB fills, render-target switches. */
+enum { FX_CPU, FX_COPY, FX_COPY_PX, FX_RECT, FX_RECT_PX, FX_FILL, FX_TARGET, FX_COUNT };
+static uint32_t s_fx[FX_COUNT];
+void pica_fixed_stats(uint32_t out[FX_COUNT]) { memcpy(out, s_fx, sizeof s_fx); }
 static C3D_Tex s_smallTex; /* tests 7 and 8: 8x8 white */
 static int s_smallTexReady;
 int pica_cycle_gpu_test(void)
@@ -974,6 +993,7 @@ void pica_gpu_idle(void)
 static void draw_on(C3D_RenderTarget* t)
 {
 	s_texGen++; /* a texture drawn into is sampled with the texture cache emptied */
+	s_fx[FX_TARGET]++;
 	if (!s_ovl) {
 		C3D_FrameDrawOn(t);
 		return;
@@ -1051,7 +1071,10 @@ static int frame_begin_ex(u8 flags)
 	s_vused = s_iused = s_vflushed = s_iflushed = 0;
 	s_last_valid = 0;
 	if (s_clear_pending) {
-		C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
+		if (!test_skips(SKIP_FILL)) {
+			C3D_RenderTargetClear(s_efb, C3D_CLEAR_ALL, s_clear_rgba, s_clear_depth);
+			s_fx[FX_FILL]++;
+		}
 		s_clear_pending = 0;
 	}
 	draw_on(s_efb);
@@ -1412,8 +1435,9 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	const uint32_t same = s_sameOff ? 0 : pica_draw_same;
 	pica_draw_same = 0;
 	if (!s_in_frame || nidx == 0) return 1;
+	if (test_skips(SKIP_SETUP)) return 1;
 	if (!gx_setup(verts, L, u, matrices_dirty, pos_rows, nrm_rows, st, same)) return 0;
-	if (s_gpuTest == 3) return 1;  /* the setup without the draw */
+	if (test_no_draws()) return 1;  /* the setup without the draw */
 	s_frameDraws++;
 	s_stat[ST_DRAW]++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
@@ -1664,12 +1688,13 @@ void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nid
 {
 	const uint32_t same = s_sameOff ? 0 : pica_draw_same;
 	pica_draw_same = 0;
-	if (!s_in_frame || nidx == 0) return;
+	if (!s_in_frame || nidx == 0 || test_skips(SKIP_CPU)) return;
 	apply_state(st, same);
 	cpu_mode();
 	set_buffer(verts, sizeof(PicaVtx), 5, 0x43210);
 	s_frameDraws++;
 	s_stat[ST_DRAW]++;
+	s_fx[FX_CPU]++;
 	C3D_DrawElements(GPU_TRIANGLES, (int)nidx, C3D_UNSIGNED_SHORT, idx);
 	second_pass(GPU_TRIANGLES, (int)nidx, idx, st);
 	gpu_check("CPU-path draw", NULL, nidx, st);
@@ -1694,6 +1719,10 @@ void pica_clear_rect(float x, float y, float w, float h, uint32_t rgba, uint32_t
 {
 	if (!pica_init()) return;
 	if (!s_in_frame) frame_begin();
+	if (test_skips(SKIP_RECT)) return;
+	s_fx[FX_RECT]++;
+	s_fx[FX_RECT_PX] += (uint32_t)(w * h * ((float)s_efb->frameBuf.width / PICA_EFB_WIDTH) *
+	                               ((float)s_efb->frameBuf.height / PICA_EFB_HEIGHT));
 	PicaVtx* v;
 	uint16_t* idx;
 	uint32_t keep = s_dropped;
@@ -1951,6 +1980,9 @@ void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[
 	dst->ww = w;
 	dst->wh = h;
 	if (!s_in_frame) frame_begin();
+	if (test_skips(SKIP_COPY)) return;
+	s_fx[FX_COPY]++;
+	s_fx[FX_COPY_PX] += (uint32_t)dst->rt->frameBuf.width * dst->rt->frameBuf.height;
 	/* A draw pass, not a texture copy: it stays in the frame's command list (no CPU wait) and
 	 * can fix alpha, as the GameCube's copy does for EFB formats without alpha. */
 	draw_on(dst->rt);

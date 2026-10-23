@@ -75,7 +75,8 @@ int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // gx_zones (on: the GX thread's zones sampled, in a GX_ZONES=1 build), status_screen (off: the
 // bottom screen not redrawn) and profile_steps (gpu: the profile run's windows are the GPU's
 // ceilings; reverts: parts of this build put back as before, one window each; cache: the frame's
-// cache work three ways).
+// cache work three ways; fixed: the GPU's fixed work by part; trades: quality trade-offs' ceilings;
+// lite: the lite setting off and on in turn). It may also give lite (on), as settings.txt does.
 static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
 static bool s_statusDraw = true;  // autorun.txt status_screen = off: the bottom screen not redrawn
 extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
@@ -449,6 +450,10 @@ extern "C" void GX3DS_StartZoneSampler(void);  // gx3ds_backend.cpp: autorun.txt
 extern "C" void SMS3DS_ProfGpuSteps(void);      // prof_3ds.cpp: autorun.txt profile_steps = gpu
 extern "C" void SMS3DS_ProfRevertSteps(void);   // ... profile_steps = reverts
 extern "C" void SMS3DS_ProfCacheSteps(void);    // ... profile_steps = cache
+extern "C" void SMS3DS_ProfFixedSteps(void);    // ... profile_steps = fixed
+extern "C" void SMS3DS_ProfTradeSteps(void);    // ... profile_steps = trades
+extern "C" void SMS3DS_ProfLiteSteps(void);     // ... profile_steps = lite
+extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist);  // prof_3ds.cpp: settings.txt lite
 extern "C" void GX3DS_SetGxPoll(int on);        // gx3ds_backend.cpp: settings.txt gx_poll
 extern "C" void GX3DS_SetPerfTimers(int on);  // gx3ds_backend.cpp: the [perf] breakdown by phase timed
 extern "C" void GX3DS_SetDrawStateCheck(int on);  // ... draws taking the last draw's setup checked
@@ -626,6 +631,15 @@ static void* game_thread(void*)
 			SMS3DS_NameCache = strcmp(v, "off") == 0 ? 0 : strcmp(v, "verify") == 0 ? 2 : 1;
 		if (setting_value(kSettingsPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
 		if (setting_value(kSettingsPath, "gx_poll", v, sizeof v)) GX3DS_SetGxPoll(strcmp(v, "off") != 0);
+		// lite = on: console-only quality trades for frame rate (prof_3ds.cpp, SMS3DS_SetLite): shadows near
+		// the camera only (lite_shadow_distance, default 2000), half the particles, nothing drawn past
+		// lite_draw_distance (default 4000), no mirror. autorun.txt's lite before settings.txt's.
+		if (setting_value(SMS_DIR "/autorun.txt", "lite", v, sizeof v) || setting_value(kSettingsPath, "lite", v, sizeof v)) {
+			const bool on = strcmp(v, "on") == 0;
+			const int dd = setting_value(kSettingsPath, "lite_draw_distance", v, sizeof v) ? atoi(v) : 0;
+			const int sd = setting_value(kSettingsPath, "lite_shadow_distance", v, sizeof v) ? atoi(v) : 0;
+			SMS3DS_SetLite(on, dd, sd);
+		}
 		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) {
 			GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
 			SMS3DS_RankCheck = strcmp(v, "on") == 0;
@@ -654,11 +668,14 @@ static void* game_thread(void*)
 		if (setting_value(kAutoPath, "profile_auto", v, sizeof v)) s_profAuto = atoi(v);
 		// profile_steps = gpu: the profile run's windows are the GPU's ceilings (prof_3ds.cpp, kGpuSteps);
 		// reverts: parts of this build put back as before, one window each (kRvSteps); cache: the frame's
-		// cache work three ways (kCacheSteps).
+		// cache work three ways (kCacheSteps); fixed: the GPU's fixed work by part (kFixedSteps).
 		if (setting_value(kAutoPath, "profile_steps", v, sizeof v)) {
 			if (strcmp(v, "gpu") == 0) SMS3DS_ProfGpuSteps();
 			if (strcmp(v, "reverts") == 0) SMS3DS_ProfRevertSteps();
 			if (strcmp(v, "cache") == 0) SMS3DS_ProfCacheSteps();
+			if (strcmp(v, "fixed") == 0) SMS3DS_ProfFixedSteps();
+			if (strcmp(v, "trades") == 0) SMS3DS_ProfTradeSteps();
+			if (strcmp(v, "lite") == 0) SMS3DS_ProfLiteSteps();
 		}
 		if (setting_value(kAutoPath, "profile_auto_quit", v, sizeof v)) s_profAutoQuit = strcmp(v, "on") == 0;
 		if (SMS3DS_DemoStage >= 0 || s_profAuto > 0 || s_quitAfter > 0)

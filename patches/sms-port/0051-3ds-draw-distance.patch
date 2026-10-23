@@ -1,0 +1,69 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -2091,9 +2091,16 @@
+ extern "C" {
+ extern uint32_t GXPC_CullRuns, GXPC_CullVerts;
+ extern int GXPC_CullOff;
++extern float GXPC_CullFar;
++extern uint32_t GXPC_CullFarRuns, GXPC_CullFarVerts;
+ }
+ uint32_t GXPC_CullRuns, GXPC_CullVerts;
+ int GXPC_CullOff;
++// A shorter draw distance (prof_3ds.cpp: the lite setting's, and the trades profile run's ceilings):
++// a run whose box lies wholly farther than this from the camera (view depth, game units; 0: off) is
++// not drawn either. Counted apart.
++float GXPC_CullFar;
++uint32_t GXPC_CullFarRuns, GXPC_CullFarVerts;
+ static void dlRunBox(DlRun& r) {
+     r.hasBox = false;
+     if ((r.fmt & VF_MTX) || r.cls != PRIM_TRIS || r.nverts == 0 || r.stride < 12) return;
+@@ -2122,7 +2129,7 @@
+     memcpy(m, &g.xfMem[pm * 4], sizeof m);
+     memcpy(P, &g.xfReg[XFR_PROJ], sizeof P);
+     const bool ortho = g.xfReg[XFR_PROJ + 6] & 1;
+-    int l = 0, rt = 0, b = 0, t = 0, behind = 0;
++    int l = 0, rt = 0, b = 0, t = 0, behind = 0, far = 0;
+     for (int c = 0; c < 8; c++) {
+         const float x = r.box[(c & 1) ? 3 : 0], y = r.box[(c & 2) ? 4 : 1], z = r.box[(c & 4) ? 5 : 2];
+         const float vx = m[0] * x + m[1] * y + m[2] * z + m[3];
+@@ -2145,8 +2152,14 @@
+         b += cy < -mw;
+         t += cy > mw;
+         behind += cw <= 0.0f;
++        far += !ortho && cw > GXPC_CullFar;
+     }
+-    if (l < 8 && rt < 8 && b < 8 && t < 8 && behind < 8) return false;
++    if (l < 8 && rt < 8 && b < 8 && t < 8 && behind < 8) {
++        if (GXPC_CullFar <= 0.0f || far < 8) return false;
++        GXPC_CullFarRuns++;
++        GXPC_CullFarVerts += r.nverts;
++        return true;
++    }
+     GXPC_CullRuns++;
+     GXPC_CullVerts += r.nverts;
+     return true;
+@@ -3170,7 +3183,7 @@
+         memcpy(&P[i], &w, 4);
+     }
+     const bool ortho = effXF(XF_REG_BASE + XFR_PROJ + 6) & 1;
+-    int l = 0, rt = 0, b = 0, t = 0, behind = 0;
++    int l = 0, rt = 0, b = 0, t = 0, behind = 0, far = 0;
+     for (int c = 0; c < 8; c++) {
+         const float x = box[(c & 1) ? 3 : 0], y = box[(c & 2) ? 4 : 1], z = box[(c & 4) ? 5 : 2];
+         const float vx = m[0] * x + m[1] * y + m[2] * z + m[3];
+@@ -3192,8 +3205,14 @@
+         b += cy < -mw;
+         t += cy > mw;
+         behind += cw <= 0.0f;
++        far += !ortho && cw > GXPC_CullFar;
+     }
+-    if (l < 8 && rt < 8 && b < 8 && t < 8 && behind < 8) return false;
++    if (l < 8 && rt < 8 && b < 8 && t < 8 && behind < 8) {
++        if (GXPC_CullFar <= 0.0f || far < 8) return false;
++        GXPC_CullFarRuns++;
++        GXPC_CullFarVerts += nverts;
++        return true;
++    }
+     GXPC_CullRuns++;
+     GXPC_CullVerts += nverts;
+     GXPC_J3DStats[NJ_CULLED]++;

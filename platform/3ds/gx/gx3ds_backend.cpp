@@ -266,6 +266,8 @@ static uint64_t s_texHashed, s_texHashedOut, s_tlutHashed;
 static uintptr_t s_texOutLo = ~uintptr_t(0), s_texOutHi;
 extern "C" uint32_t GXPC_CullRuns, GXPC_CullVerts;  // patch 0014
 extern "C" int GXPC_CullOff;
+extern "C" float GXPC_CullFar;  // patch 0051: the profiler's far-geometry ceiling
+extern "C" uint32_t GXPC_CullFarRuns, GXPC_CullFarVerts;
 static uint32_t s_perfCullRuns0, s_perfCullVerts0;
 extern "C" size_t GXPC_DlCacheBytes(void);
 extern "C" uint32_t GXPC_DlEntryCount(void);
@@ -594,9 +596,16 @@ static void perfFrameEnd() {
 			to0 = s_texHashedOut;
 			tl0 = s_tlutHashed;
 		}
-		fprintf(stderr, "[perf]   off-screen culling: %.1f display-list draws (%.0f verts) skipped per frame%s\n",
-		        (GXPC_CullRuns - s_perfCullRuns0) / frames, (GXPC_CullVerts - s_perfCullVerts0) / frames,
-		        GXPC_CullOff ? " (off: L held at launch)" : "");
+		{
+			static uint32_t far0[2];
+			fprintf(stderr, "[perf]   off-screen culling: %.1f display-list draws (%.0f verts) skipped per frame%s | farther than "
+			        "%.0f: %.1f (%.0f verts)\n",
+			        (GXPC_CullRuns - s_perfCullRuns0) / frames, (GXPC_CullVerts - s_perfCullVerts0) / frames,
+			        GXPC_CullOff ? " (off: L held at launch)" : "", double(GXPC_CullFar), (GXPC_CullFarRuns - far0[0]) / frames,
+			        (GXPC_CullFarVerts - far0[1]) / frames);
+			far0[0] = GXPC_CullFarRuns;
+			far0[1] = GXPC_CullFarVerts;
+		}
 		static const char* const kFail[7] = {"not-valid", "size", "vcd", "vat", "mtx", "array", "changed"};
 		char fl[160];
 		int fat = 0;
@@ -646,6 +655,17 @@ static void perfFrameEnd() {
 			        (st[0] - st0[0]) / frames, (st[1] - st0[1]) / frames, (st[2] - st0[2]) / frames,
 			        (st[3] - st0[3]) / frames, (st[4] - st0[4]) / frames);
 			memcpy(st0, st, sizeof st0);
+		}
+		{
+			static uint32_t fx0[7];
+			uint32_t fx[7];
+			pica_fixed_stats(fx);
+			double d[7];
+			for (int i = 0; i < 7; i++) d[i] = (fx[i] - fx0[i]) / frames;
+			fprintf(stderr, "[perf]   GPU work besides GX-mode draws per frame: %.1f CPU-path draws | %.1f EFB copies "
+			        "(%.0f K pixels) | %.1f copies' rectangle clears (%.0f K pixels) | %.1f EFB fills | %.1f render-target "
+			        "switches\n", d[0], d[1], d[2] / 1000, d[3], d[4] / 1000, d[5], d[6]);
+			memcpy(fx0, fx, sizeof fx0);
 		}
 		{
 			uint32_t vKB, vN, lKB, lN, vFree, aUsed, aPeak, aSize;
@@ -978,6 +998,10 @@ static inline void copyMap(const EfbCopy* c, float& as, float& bs, float& at, fl
 	at = -c->h / c->win[3];
 	bt = 1.f - (c->y - c->win[1]) / c->win[3];
 }
+
+// A profiler ceiling (profile_steps = trades): the texture copies of colour formats left out, with
+// their clears (the mirror's and the screen texture's in Delfino Plaza); one-byte maps still copied.
+static volatile int s_skipColourCopies;
 
 static EfbCopy* findEfbCopy(const void* p) {
 	for (EfbCopy& c : s_efbCopies)
@@ -5494,6 +5518,7 @@ static void renderCopy(const CopyRec* cr) {
 	s_stats.copies++;
 	bool disp = (ctrl >> 14) & 1;  // copy to the external frame buffer: the frame is done
 	bool clear = (ctrl >> 11) & 1;
+	bool leftOut = false;  // a colour copy, and its clear, left out (GX3DS_SetSkipColourCopies)
 	if (!disp) {
 		s_texCopies++;
 		s_afterTexCopy = true;
@@ -5506,6 +5531,7 @@ static void renderCopy(const CopyRec* cr) {
 		const bool half = (ctrl >> 9) & 1;
 		// One-byte formats are maps the game draws back and copies again (the goop): texel for texel.
 		const bool exact = cfmt == 1 || (cfmt >= 7 && cfmt <= 10);
+		leftOut = s_skipColourCopies && !exact;
 		uint16_t tw, th;
 		float win[4];
 		pica_copy_tex_layout(rx, ry, rw, rh, half, exact, &tw, &th, win);
@@ -5544,7 +5570,7 @@ static void renderCopy(const CopyRec* cr) {
 			// A frame a GPU test may have touched (profile runs): a map's copy is left out, so the
 			// map stays as before the test (the goop map is drawn from its last copy, then copied).
 			const bool keep = exact && pica_gpu_test_seen();
-			if (!keep) {
+			if (!keep && !leftOut) {
 				PerfScope ps(PERF_COPY);
 				// One-channel formats read back with that channel in all four (R8 and I8 as I8),
 				// RA4 / RA8 with red as the intensity.
@@ -5579,7 +5605,7 @@ static void renderCopy(const CopyRec* cr) {
 		// The display copy's clear applies to the next frame.
 		if (clear && disp) {
 			pica_clear(rgba, rs.bp[BP_CLEAR_Z] & 0xFFFFFF);
-		} else if (clear) {  // a texture copy clears its source rectangle only
+		} else if (clear && !leftOut) {  // a texture copy clears its source rectangle only
 			const uint32_t tl = rs.bp[BP_COPY_SRC_TL], wh = rs.bp[BP_COPY_SRC_WH];
 			pica_clear_rect(float(tl & 0x3FF), float((tl >> 10) & 0x3FF), float((wh & 0x3FF) + 1),
 			                float(((wh >> 10) & 0x3FF) + 1), rgba, rs.bp[BP_CLEAR_Z] & 0xFFFFFF);
@@ -5669,6 +5695,7 @@ void GX3DS_SetGxThread(int on) { gx::s_gxWanted = on != 0; }
 void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.txt perf_timers
 void GX3DS_SetGxPoll(int on) { gx::s_gxPoll = on != 0; }  // settings.txt gx_poll
 void GX3DS_SetGamePoll(int on) { gx::s_gamePoll = on != 0; }
+void GX3DS_SetSkipColourCopies(int on) { gx::s_skipColourCopies = on != 0; }
 int GX3DS_GxPoll(void) { return gx::s_gxPoll; }
 void GX3DS_SetDrawStateCheck(int on) {  // settings.txt draw_state_check
 	gx::s_fpCheck = on != 0;

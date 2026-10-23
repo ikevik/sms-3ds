@@ -1,0 +1,60 @@
+--- a/libs/JSystem/src/JParticle/JPAEmitter.cpp
++++ b/libs/JSystem/src/JParticle/JPAEmitter.cpp
+@@ -1,4 +1,10 @@
+ #include <JSystem/JParticle/JPAEmitter.hpp>
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0033, settings.txt lite): half the particles. Emitters that spawn at a
++// rate spawn at half of it; those that emit a set of particles at once (fixed interval: spheres,
++// circles, lines) emit every other one of the set.
++extern "C" int SMS3DS_LiteParticles;
++#endif
+ #include <JSystem/JParticle/JPAEmitterManager.hpp>
+ #include <JSystem/JParticle/JPAParticle.hpp>
+ #include <JSystem/JParticle/JPAResourceManager.hpp>
+@@ -715,6 +721,10 @@
+ 				    += createRate * mChildSpawnRateVariance * getRandomRF();
+ 			}
+ 
++#if defined(__3DS__)
++			if (SMS3DS_LiteParticles)
++				createRate *= 0.5f;
++#endif
+ 			mChildSpawnTimer += createRate;
+ 
+ 			if (mChildSpawnTimer >= 1.0f) {
+@@ -764,6 +774,10 @@
+ 
+ 		if (numToCreate != 0) {
+ 			for (int i = 0; i < numToCreate; ++i) {
++#if defined(__3DS__)
++				if (SMS3DS_LiteParticles && (i & 1) && checkFlag(EMIT_FLAG_FIXED_INTERVAL))
++					continue;
++#endif
+ 				eio.mVolumeEmitIdx = i;
+ 				if (createParticle() == nullptr)
+ 					break;
+--- a/src/MarioUtil/ShadowUtil.cpp
++++ b/src/MarioUtil/ShadowUtil.cpp
+@@ -1,5 +1,10 @@
+ #include <MarioUtil/ShadowUtil.hpp>
+ #include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0023 (profile-run timers)
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0033, settings.txt lite): shadows only within this squared distance of
++// the camera, besides Mario's and Yoshi's (0: the game's own limit only).
++extern "C" f32 SMS3DS_LiteShadowDist2;
++#endif
+ #include <MarioUtil/GDUtil.hpp>
+ #include <MarioUtil/DrawUtil.hpp>
+ #include <MarioUtil/ReinitGX.hpp>
+@@ -1364,6 +1369,11 @@
+ 
+ 	if (dist > 20000000.0f * range)
+ 		return;
++#if defined(__3DS__)
++	if (SMS3DS_LiteShadowDist2 > 0.0f && dist > SMS3DS_LiteShadowDist2 && param_2 != 0x80000001
++	    && param_2 != 0x80000002)
++		return;
++#endif
+ 
+ 	if (param_1.mRadiusX < 0.01f || param_1.mRadiusZ < 0.01f)
+ 		return;
