@@ -14,8 +14,11 @@
 #                    the sampler: time in the units left out (JSystem, the maths, the GX API) is
 #                    charged to the instrumented function that called them, and their many small
 #                    functions add no hook calls (SAMPLE=1's hooks cost ~43 ms a frame)
-#   AUDIO_SAMPLE=1   instrument JAudio's functions only, for the audio thread's sampler
+#   AUDIO_SAMPLE=1   instrument JAudio's sequencer and channel code, for the audio thread's sampler
 #                    (platform/3ds/audio_3ds.cpp): their hooks are renamed __audio_prof_enter/_exit
+# The game's side of the sound code (JAInterface, JALibrary, MSound, JAudio's DVD thread) is always
+# instrumented, its hooks renamed __audio_lock_enter/_exit: with settings.txt audio_thread = core2 they
+# take the lock that keeps it apart from JAudio's turns on core 2 (audio_3ds.cpp).
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECOMP="${DECOMP:-$ROOT/build/decomp-patched}"
@@ -82,9 +85,12 @@ compile_one() {
   IFS=$'\t' read -r kind rel pch <<< "$1"
   out="$OBJ/$(echo "$rel" | tr '/' '_').o"
   extra=""; [ "$pch" = "1" ] && extra="-include $DECOMP/include/SMS.pch"
-  asample=""
-  case "$rel" in libs/JSystem/src/JAudio/*) [ -n "${AUDIO_SAMPLE:-}" ] && asample=1 ;; esac
-  [ -n "$asample" ] && extra="$extra -finstrument-functions -finstrument-functions-exclude-file-list=.h"
+  asample=""; alock=""
+  case "$rel" in
+    libs/JSystem/src/JAudio/JAInterface/*|libs/JSystem/src/JAudio/JALibrary/*|src/MSound/*|src/System/MSoundMainSide.cpp|libs/JSystem/src/JAudio/JASystem/JASDvdThread.cpp) alock=1 ;;
+    libs/JSystem/src/JAudio/*) [ -n "${AUDIO_SAMPLE:-}" ] && asample=1 ;;
+  esac
+  [ -n "$asample$alock" ] && extra="$extra -finstrument-functions -finstrument-functions-exclude-file-list=.h"
   for pre in ${SAMPLE_ONLY:-}; do
     case "$rel" in "$pre"*) extra="$extra -finstrument-functions -finstrument-functions-exclude-file-list=.h"; break ;; esac
   done
@@ -95,6 +101,8 @@ compile_one() {
   fi
   [ -n "$asample" ] && { "$OBJCOPY" --redefine-sym __cyg_profile_func_enter=__audio_prof_enter \
     --redefine-sym __cyg_profile_func_exit=__audio_prof_exit "$out" || { echo "FAIL $rel (objcopy)"; return 1; }; }
+  [ -n "$alock" ] && { "$OBJCOPY" --redefine-sym __cyg_profile_func_enter=__audio_lock_enter \
+    --redefine-sym __cyg_profile_func_exit=__audio_lock_exit "$out" || { echo "FAIL $rel (objcopy)"; return 1; }; }
   rm -f "$out.err"
 }
 export -f compile_one

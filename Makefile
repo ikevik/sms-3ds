@@ -77,6 +77,10 @@ SMSLIBS  += -Wl,--wrap=GDInitGDLObj
 SMSLIBS  += -Wl,--wrap=_ZN6MSound8mainLoopEv
 # ... and the audio thread's sequencer and channel updates.
 SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel16subframeCallbackEv -Wl,--wrap=_ZN8JASystem11TDSPChannel9updateAllEv
+# With audio_thread = core2: streams' and movies' callbacks seen as they register, to hand their blocks
+# back to JAudio's audio thread.
+SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_
+SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel19registerMixCallbackEPFPslEh
 # The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
 # and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
 SMSLIBS  += -Wl,--no-enum-size-warning

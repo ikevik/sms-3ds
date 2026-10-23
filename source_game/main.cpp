@@ -313,6 +313,10 @@ static const char kDefaultSettings[] =
     "# same sound to the ear, since the 3DS's DSP takes a voice's state every 4.9 ms anyway) or 1 (the\n"
     "# game's own).\n"
     "audio_update_interval = 2\n"
+    "# Where JAudio's sequencer and voice updates run: game (JAudio's own audio thread, taking turns\n"
+    "# with the game thread on its core) or core2 (a thread on core 2, the game's sound code kept apart\n"
+    "# from it by a lock, as the GameCube kept them apart by interrupts).\n"
+    "# audio_thread = game\n"
     "# With audio not off: every N seconds turn to the next of on, software and silent, and log what\n"
     "# each costs ([audio] lines). 0: stay.\n"
     "# audio_cycle = 10\n"
@@ -428,6 +432,7 @@ extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt
 #endif
 extern "C" int SMS3DS_AudioInit(int mode, int cycleSeconds);
 extern "C" void SMS3DS_AudioSetUpdateInterval(int subframes);
+extern "C" void SMS3DS_AudioSetThread(int core2);
 extern "C" void SMS3DS_AudioExit(void);
 
 // Delfino Plaza's Shine shadow volume: shells drawn (decomp patch 3ds-0012; 0: all of them).
@@ -542,6 +547,8 @@ static void* game_thread(void*)
 		if (mode)
 			SMS3DS_AudioSetUpdateInterval(setting_value(kSettingsPath, "audio_update_interval", v, sizeof v)
 			                                  ? atoi(v) : SMS3DS_AUDIO_UPDATE_INTERVAL_DEFAULT);
+		if (mode && setting_value(kSettingsPath, "audio_thread", v, sizeof v))
+			SMS3DS_AudioSetThread(strcmp(v, "core2") == 0);
 		static const char* const kAudio[] = {"off", "on (the 3DS DSP)", "software mixer", "silent (no voice plays)"};
 		fprintf(stderr, "[3ds] audio: %s (audio%s)\n", kAudio[mode], cycle > 0 && mode ? ", audio_cycle" : "");
 	}
