@@ -154,9 +154,17 @@ typedef struct {
 	float F[4][4];  /* view space -> clip: pica_gx_projection */
 	float T[6][4];  /* texture unit u: rows 2u, 2u+1 over its source vector */
 	float W[6][4];  /* unit u's source: W[2u] = (pos, normal, tex a, tex b), W[2u+1].x = tex c */
-	float CS[4];    /* colour = vertex colour * CS + CM (0..1) */
+	float CS[4];    /* colour = vertex colour * CS + CM (0..1): the channel's material */
 	float CM[4];
-	float LD[4];    /* light direction, and w: how much of the shade applies (0 or 1) */
+	/* GX lighting, when lit (gx_pass.v.pica): the material times clamp(AMB + each light's LC times
+	 * its diffuse term max(N.L, LF.x) * LF.y + LF.z), L from the vertex to LP (view space); a spot
+	 * light (bit i of attn) also times max(0, LA . (1, c, c^2)) / (LK . (1, d, d^2)), c = max(L . LD, 0),
+	 * d the distance to it. */
+	float AMB[4];
+	float LP[2][4], LC[2][4], LF[2][4];
+	float LA[2][4], LK[2][4], LD[2][4];
+	uint8_t lit, lights; /* lit: lighting with normals; lights: 0-2 */
+	uint8_t attn;        /* bit i: light i is attenuated (LA, LK, LD); bit 4 + i: as a specular light */
 } PicaGxUniforms;
 
 /* The free tail of this frame's vertex ring (begins a frame if none is open): a batch can be

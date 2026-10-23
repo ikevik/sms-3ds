@@ -343,11 +343,11 @@ struct PerfScopeExcl {
 // logged with the [perf] lines.
 enum GpuFallback {
 	FB_TRACE, FB_NOCLIP, FB_SIZE, FB_PNMTX, FB_TWOCOLOURS, FB_TEXGEN_TYPE, FB_TEXGEN_PROJ, FB_TEXGEN_SRC,
-	FB_TEXMTX_VARIES, FB_POST_NORMALISE, FB_POST_PROJ, FB_LAYOUT, FB_COUNT
+	FB_TEXMTX_VARIES, FB_POST_NORMALISE, FB_POST_PROJ, FB_LAYOUT, FB_LIGHTS, FB_COUNT
 };
 static const char* const kFallbackName[FB_COUNT] = {
 	"trace", "clip-off", "size", "pos-matrix>27", "two-colours", "texgen-type", "texgen-proj", "texgen-src",
-	"texmtx-varies", "post-normalise", "post-proj", "layout"};
+	"texmtx-varies", "post-normalise", "post-proj", "layout", "lights"};
 static uint32_t s_fbBatches[FB_COUNT], s_fbVerts[FB_COUNT];
 
 static bool gpuFail(GpuFallback why, uint32_t n) {
@@ -794,6 +794,10 @@ static inline float xff(int r) {
 	memcpy(&f, &rs.xfReg[r], 4);
 	return f;
 }
+// XF memory's normal matrices: 3x3 each, matrix k's rows at 0x400 + 9 k (GXLoadNrmMtxImm's 0x400 + 3 id).
+// (sms-pc-port's renderer copies them to word 256 of its own block, gx_render.cpp; XF memory itself
+// has nothing there: until 2026-10-23 every lit draw here read zero normals.)
+static constexpr uint32_t kXfNrm = 0x400;
 static inline const float* xfMtx(uint32_t word) {  // XF memory as floats
 	return reinterpret_cast<const float*>(&rs.xfMem[word]);
 }
@@ -902,6 +906,7 @@ static inline FILE* tf() { return s_traceFile ? s_traceFile : stderr; }
 // New 3DS each new TEV setup's dump cost several ms of SD writes on the game thread.
 static bool s_verbose;
 static unsigned s_traceDraw;
+static unsigned s_skipTev, s_skipTevTo;  // draws of these renderer-log TEV setups (#N) left out (GX3DS_SetSkipTev; 0: none)
 // Draws before and after the frame's first EFB-to-texture copy, and the copies (status screen).
 static bool s_afterTexCopy;
 static uint32_t s_drawsBeforeCopy, s_drawsAfterCopy, s_texCopies;
@@ -973,7 +978,11 @@ struct EfbCopy {
 	uint32_t fmt;    // copy texture format (1, 7-10: one byte a texel, a map such as the goop's)
 };
 static std::vector<EfbCopy> s_efbCopies;
-static const size_t kMaxEfbCopies = 6;  // pica_draw.c's copy_reserve counts on this many
+// pica_draw.c's copy_reserve counts on this many. Bianco Hills copies to 7 destinations a frame
+// (5 goop maps, a 256x256 RGB5A3 copy, the screen texture): with fewer, one was replaced every
+// frame, and the replaced ones' textures, freed two frames late, ran VRAM out.
+static const size_t kMaxEfbCopies = 8;
+static const uintptr_t kStampPage = 4096;  // the write stamps' granule (sms-pc-port's gx_fifo.cpp, kStampShift)
 
 // Logs each distinct kind of EFB copy once (destination, rectangle, format, flags).
 static void logCopyKind(const EfbCopy* c, uint32_t ctrl, uint32_t pix) {
@@ -1142,9 +1151,26 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	*copy = nullptr;
 	if (EfbCopy* c = findEfbCopy(ptr)) {
 		// The CPU rewrote the destination since the copy (a new stage loaded its own data there,
-		// as the goop map of the next level): the memory, not the old snapshot.
+		// as the goop map of the next level): the memory, not the old snapshot. Write stamps are
+		// per 4 KiB page (sms-pc-port's gx_fifo.cpp), so only pages the texture covers whole count
+		// (all of its pages when it covers none): its first and last pages hold other heap data
+		// too, whose cache flushes dropped the snapshot for memory the GPU never wrote (a 256x256
+		// copy in Bianco Hills, every frame: its draws read the destination's zeroed memory).
 		const uint32_t fmt0 = (img0 >> 20) & 15;
-		if (trustWriteStamps() && unwrittenSince(ptr, 0, 0) && !unwrittenSince(ptr, texLevelBytes(fmt0, w, h), c->clock)) {
+		const uintptr_t a = uintptr_t(ptr), e = a + texLevelBytes(fmt0, w, h);
+		const uintptr_t ia = (a + kStampPage - 1) & ~uintptr_t(kStampPage - 1), ie = e & ~uintptr_t(kStampPage - 1);
+		const bool stamped = trustWriteStamps() && unwrittenSince(ptr, 0, 0) && !unwrittenSince(ptr, e - a, c->clock);
+		const bool inner = stamped && (ie <= ia || !unwrittenSince(reinterpret_cast<const void*>(ia), ie - ia, c->clock));
+		if (stamped && !inner && s_verbose) {  // once per destination
+			static const void* s_said[8];
+			int i = 0;
+			while (i < 8 && s_said[i] && s_said[i] != ptr) i++;
+			if (i < 8 && !s_said[i]) {
+				s_said[i] = ptr;
+				fprintf(stderr, "[copy] dest %p: CPU writes to its edge pages only (other data): copy kept\n", ptr);
+			}
+		}
+		if (inner) {
 			pica_tex_free(c->tex);
 			s_efbCopies.erase(s_efbCopies.begin() + (c - s_efbCopies.data()));
 			s_rsGen++;
@@ -1931,6 +1957,20 @@ static bool translateTev(TevSetup& t, const bool pairWhite[kMaxPairs], PicaState
 			}
 		}
 	}
+	// Values read whole later: bit 2 * reg + channel, after each stage, read as some stage's d
+	// before being overwritten. Inputs a, b, c take a value's low 8 bits, as does the output.
+	uint8_t dReadAfter[16];
+	{
+		uint8_t rd = 0;
+		for (int s = int(N) - 1; s >= 0; s--) {
+			dReadAfter[s] = rd;
+			const uint32_t ce = CE[s], ae = AE[s], dc = ce & 15, da = (ae >> 4) & 7;
+			rd &= uint8_t(~(1u << (2 * ((ce >> 22) & 3) + CH_RGB)));
+			rd &= uint8_t(~(1u << (2 * ((ae >> 22) & 3) + CH_A)));
+			if (dc < 8) rd |= uint8_t(1u << (2 * (dc >> 1) + (dc & 1)));
+			if (da < 4) rd |= uint8_t(1u << (2 * da + CH_A));
+		}
+	}
 
 	TevLoc loc[4][2];
 	for (int r = 0; r < 4; r++) {
@@ -2052,6 +2092,29 @@ static bool translateTev(TevSetup& t, const bool pairWhite[kMaxPairs], PicaState
 			}
 		};
 
+		// (255 + lerp) * 2, unclamped, read only through its low 8 bits: on the console 510 + 2 lerp
+		// wraps to 2 lerp - 2, which water surfaces rely on (the file select's sea and Bianco Hills'
+		// river compute their alpha as (1 + a) * 2 for 2a). PICA stages clamp it to 1, which washes
+		// the water out white; drawn as 2 lerp (exact for lerp 1-128). d: the stage's d input.
+		auto rasIs255 = [&](int comp) {  // the vertex colour input is 255 for the whole draw
+			if (chan > 1) return false;
+			const int sw[4] = {int(rasSwap & 3), int((rasSwap >> 2) & 3), int((rasSwap >> 4) & 3), int((rasSwap >> 6) & 3)};
+			for (int k = comp == 3 ? 3 : 0; k < (comp == 3 ? 4 : 3); k++) {
+				const int c = sw[k];
+				if ((c == 3 ? t.aVarying[chan] : t.rgbVarying[chan]) || t.rasConst[chan][c] != 255) return false;
+			}
+			return true;
+		};
+		auto wrapD = [&](uint32_t env, int ch, TevSrc d) {
+			const uint32_t dArg = ch == CH_A ? (env >> 4) & 7 : env & 15;
+			if ((env >> 16 & 0x3F) != 0x10 || (dReadAfter[s] >> (2 * ((env >> 22) & 3) + ch) & 1)) return d;
+			const bool is255 = tsAll(d, ch == CH_A ? 1 : 3, 255) ||
+			                   (ch == CH_A ? dArg == 5 && rasIs255(3) : (dArg == 10 && rasIs255(4)) || (dArg == 11 && rasIs255(3)));
+			if (!is255) return d;
+			tevLogOnce("(255 + x) * 2 wraps: drawn as 2x", s, N, ce, ae);
+			return tsConst1(0);
+		};
+
 		// A channel whose result nothing reads is not computed.
 		const bool dead[2] = {!(liveAfter[s] >> (2 * ((ce >> 22) & 3) + CH_RGB) & 1),
 		                      !(liveAfter[s] >> (2 * ((ae >> 22) & 3) + CH_A) & 1)};
@@ -2059,7 +2122,8 @@ static bool translateTev(TevSetup& t, const bool pairWhite[kMaxPairs], PicaState
 		memset(plan, 0, sizeof plan);
 		if (!dead[CH_RGB])
 			plan[CH_RGB] = planChannel(colorIn((ce >> 12) & 15), colorIn((ce >> 8) & 15), colorIn((ce >> 4) & 15),
-		                           colorIn(ce & 15), 3, (ce >> 16) & 3, (ce >> 18) & 1, (ce >> 20) & 3, (ce >> 19) & 1);
+		                           wrapD(ce, CH_RGB, colorIn(ce & 15)), 3, (ce >> 16) & 3, (ce >> 18) & 1, (ce >> 20) & 3,
+		                           (ce >> 19) & 1);
 		if (!dead[CH_A] && ((ae >> 16) & 3) == 3 && ((ae >> 20) & 3) < 3) {
 			// An alpha compare in the R8 / GR16 / BGR24 modes compares the colour inputs a and b
 			// (here by their red): as the A8 mode on those.
@@ -2070,7 +2134,8 @@ static bool translateTev(TevSetup& t, const bool pairWhite[kMaxPairs], PicaState
 			                         (ae >> 19) & 1);
 		} else if (!dead[CH_A]) {
 			plan[CH_A] = planChannel(alphaIn((ae >> 13) & 7), alphaIn((ae >> 10) & 7), alphaIn((ae >> 7) & 7),
-			                         alphaIn((ae >> 4) & 7), 1, (ae >> 16) & 3, (ae >> 18) & 1, (ae >> 20) & 3, (ae >> 19) & 1);
+			                         wrapD(ae, CH_A, alphaIn((ae >> 4) & 7)), 1, (ae >> 16) & 3, (ae >> 18) & 1,
+			                         (ae >> 20) & 3, (ae >> 19) & 1);
 		}
 		if (lost) {
 			tevLogOnce("register value lost (no room in the combiner buffer)", s, N, ce, ae);
@@ -2952,7 +3017,7 @@ static uint64_t tevCacheKey(const bool pwhite[kMaxPairs], int nPairs, const Pica
 // composed into two rows. Batches it cannot express exactly (projected texture coordinates, a
 // texture matrix index that varies per vertex, clipping off, ...) stay on the CPU path.
 // XF memory changed since drawGpu last copied the matrix rows: position rows (s_posDirty, bit r
-// for rows 0-29, 4 words each from word 0) and normal rows (s_nrmDirty, 3 words each from word 256).
+// for rows 0-29, 4 words each from word 0) and normal rows (s_nrmDirty, 3 words each from word 0x400).
 // Only those rows are copied and their uniforms compared again: one matrix load used to recopy and
 // recompare all 30 rows of both at the next draw.
 static bool s_xfDirty = true;
@@ -2962,14 +3027,201 @@ static inline uint32_t rowBits(uint32_t r0, uint32_t r1) {  // rows r0..r1 (r1 <
 }
 static inline void xfMemChanged(uint32_t w0, uint32_t w1) {  // words w0..w1
 	if (w0 < 4 * PICA_GX_MTX_ROWS) s_posDirty |= rowBits(w0 >> 2, std::min<uint32_t>(w1, 4 * PICA_GX_MTX_ROWS - 1) >> 2);
-	if (w1 >= 256 && w0 < 256 + 3 * PICA_GX_MTX_ROWS)
-		s_nrmDirty |= rowBits((std::max<uint32_t>(w0, 256) - 256) / 3, (std::min<uint32_t>(w1, 256 + 3 * PICA_GX_MTX_ROWS - 1) - 256) / 3);
+	if (w1 >= kXfNrm && w0 < kXfNrm + 3 * PICA_GX_MTX_ROWS)
+		s_nrmDirty |= rowBits((std::max<uint32_t>(w0, kXfNrm) - kXfNrm) / 3,
+		                      (std::min<uint32_t>(w1, kXfNrm + 3 * PICA_GX_MTX_ROWS - 1) - kXfNrm) / 3);
 	s_xfDirty = true;
 }
 static bool s_gpuTransform = true;  // GX3DS_SetGpuTransform: off draws everything on the CPU path
 static float s_posRows[PICA_GX_MTX_ROWS][4], s_nrmRows[PICA_GX_MTX_ROWS][4];
 static uint32_t s_gpuBatches, s_cpuBatches;
 
+
+// GX's colour channels (XF COLORnCTRL, ALPHAnCTRL): the material (register, or the vertex colour:
+// bit 0) and, with lighting on (bit 1), times clamp(ambient (register, or the vertex colour: bit 6)
+// + each light in the mask (bits 2-5: lights 0-3, 11-14: 4-7): its colour x the diffuse term (bits
+// 7-8: none 1, sign N.L, clamp max(N.L, 0)) x its attenuation (bits 9-10: 0 none and 2 directional
+// 1, 1 specular, 3 spot)), with L from the vertex to the light, as Dolphin computes it. Light i's XF
+// words (0x600 + 16 i): 3 colour, 4-6 angle attenuation, 7-9 distance attenuation, 10-12 position,
+// 13-15 direction, in view space.
+static inline uint32_t chanLights(uint32_t ctrl) { return ((ctrl >> 2) & 15) | ((ctrl >> 7) & 0xF0); }
+static inline uint32_t chanDiffuse(uint32_t ctrl) { return (ctrl >> 7) & 3; }
+static inline uint32_t chanAttn(uint32_t ctrl) { return (ctrl >> 9) & 3; }
+struct GxLight {
+	float col[4];
+	float cosa[3], dista[3], pos[3], dir[3];
+};
+static void gxLight(int i, GxLight& l) {
+	const uint32_t* w = &rs.xfMem[0x600 + 16 * i];
+	for (int k = 0; k < 4; k++) l.col[k] = float((w[3] >> (24 - 8 * k)) & 0xFF) * (1.0f / 255.0f);
+	memcpy(l.cosa, w + 4, 12);
+	memcpy(l.dista, w + 7, 12);
+	memcpy(l.pos, w + 10, 12);
+	memcpy(l.dir, w + 13, 12);
+}
+// A lit part (colour, or alpha) that comes out at 1 whatever the normals: its ambient full (255)
+// and its lights only adding (diffuse none or clamp; attenuation numerators are clamped at 0, so
+// distance coefficients not below 0). J3D materials light the alpha that way (ALPHA0CTRL 0x0706
+// under an ambient alpha of 255) next to a colour in another diffuse mode, which the GX shader
+// cannot draw together: those went to the CPU path (Delfino Plaza: 118 batches a frame).
+// A spot light so far from the model (view-space origin o) that it gives under 1/1024 to any vertex
+// within 1e5 of the origin (wider than any stage), by its distance attenuation 1 / (k0 + k1 d + k2 d^2):
+// none. Delfino Plaza's light 1 sits at (2e5, 5e5, 2e5) in view space under 1 / (1 + 1e-6 d^2), some
+// 3e-6 of its colour; the GX shader has no distance attenuation, so it sent 87 batches a frame to
+// the CPU path.
+static bool lightNegligible(uint32_t ctrl, const GxLight& l, const float o[3]) {
+	if (chanAttn(ctrl) != 3 || l.dista[0] < 0.f || l.dista[1] < 0.f || l.dista[2] < 0.f) return false;
+	const float dx = l.pos[0] - o[0], dy = l.pos[1] - o[1], dz = l.pos[2] - o[2];
+	const float d = sqrtf(dx * dx + dy * dy + dz * dz) - 1e5f;
+	if (!(d > 0.f)) return false;
+	const float num = fabsf(l.cosa[0]) + fabsf(l.cosa[1]) + fabsf(l.cosa[2]);  // the angle term's most, cos in 0..1
+	const float den = l.dista[0] + l.dista[1] * d + l.dista[2] * d * d;
+	const float c = fmaxf(fmaxf(l.col[0], l.col[1]), fmaxf(l.col[2], l.col[3]));
+	return den > 0.f && num * c < den * (1.f / 1024.f);
+}
+static bool chanSaturated(uint32_t ctrl, uint32_t amb, bool alpha) {
+	if ((ctrl >> 6) & 1) return false;  // ambient from the vertex colour
+	if (alpha ? (amb & 0xFF) != 0xFF : (amb >> 8) != 0xFFFFFF) return false;
+	if (chanDiffuse(ctrl) == 1) return false;  // sign: N.L may be below 0
+	for (uint32_t m = chanLights(ctrl); m; m &= m - 1) {
+		GxLight l;
+		gxLight(__builtin_ctz(m), l);
+		if (l.dista[0] < 0.f || l.dista[1] < 0.f || l.dista[2] < 0.f) return false;
+	}
+	return true;
+}
+// One light's diffuse x attenuation at view-space point p with unit normal n (null: no normal,
+// so only a light without a diffuse term reaches it).
+static float gxLightTerm(uint32_t ctrl, const GxLight& l, const float* p, const float* n) {
+	const uint32_t attnFn = chanAttn(ctrl), dfn = chanDiffuse(ctrl);
+	float L[3], attn = 1.0f;
+	if (attnFn == 1) {  // specular: the position holds a direction
+		const float d = sqrtf(l.pos[0] * l.pos[0] + l.pos[1] * l.pos[1] + l.pos[2] * l.pos[2]);
+		for (int k = 0; k < 3; k++) L[k] = d > 0.f ? l.pos[k] / d : 0.f;
+		float c = 0.f;
+		if (n && n[0] * L[0] + n[1] * L[1] + n[2] * L[2] >= 0.f) {
+			c = n[0] * l.dir[0] + n[1] * l.dir[1] + n[2] * l.dir[2];
+			c = c > 0.f ? c : 0.f;
+		}
+		float dd[3] = {l.dista[0], l.dista[1], l.dista[2]};
+		if (dfn != 0) {  // (Dolphin: the distance coefficients as they are with diffuse none, else normalised)
+			const float m = sqrtf(dd[0] * dd[0] + dd[1] * dd[1] + dd[2] * dd[2]);
+			for (int k = 0; k < 3; k++) dd[k] = m > 0.f ? dd[k] / m : 0.f;
+		}
+		const float num = l.cosa[0] + l.cosa[1] * c + l.cosa[2] * c * c, den = dd[0] + dd[1] * c + dd[2] * c * c;
+		attn = num > 0.f && den > 0.f ? num / den : 0.f;
+	} else {
+		for (int k = 0; k < 3; k++) L[k] = l.pos[k] - p[k];
+		const float d2 = L[0] * L[0] + L[1] * L[1] + L[2] * L[2], d = sqrtf(d2);
+		for (int k = 0; k < 3; k++) L[k] = d > 0.f ? L[k] / d : (n ? n[k] : 0.f);
+		if (attnFn == 3) {  // spot
+			float c = L[0] * l.dir[0] + L[1] * l.dir[1] + L[2] * l.dir[2];
+			c = c > 0.f ? c : 0.f;
+			const float num = l.cosa[0] + l.cosa[1] * c + l.cosa[2] * c * c, den = l.dista[0] + l.dista[1] * d + l.dista[2] * d2;
+			attn = num > 0.f && den > 0.f ? num / den : 0.f;
+		}
+	}
+	if (dfn == 0) return attn;
+	if (!n) return 0.f;
+	const float dot = n[0] * L[0] + n[1] * L[1] + n[2] * L[2];
+	return attn * (dfn == 1 ? dot : (dot > 0.f ? dot : 0.f));
+}
+// A light whose attenuation is 1 everywhere (none, directional, or spot with angle (1 0 0) and
+// distance (1 0 0) terms), or 0 everywhere (spot or specular with no angle term): the shader's.
+static int gxLightFlat(uint32_t ctrl, const GxLight& l) {
+	const uint32_t a = chanAttn(ctrl);
+	if (a == 0 || a == 2) return 1;
+	if (l.cosa[0] == 0.f && l.cosa[1] == 0.f && l.cosa[2] == 0.f) return 0;
+	if (a == 3 && l.cosa[0] == 1.f && l.cosa[1] == 0.f && l.cosa[2] == 0.f && l.dista[0] == 1.f && l.dista[1] == 0.f &&
+	    l.dista[2] == 0.f)
+		return 1;
+	return -1;
+}
+// The lighting factor of channel rgb ctrl cctrl and alpha ctrl actrl at view-space point p with unit
+// normal n (null: none): what the material is multiplied by (1 where lighting is off). ambVtx: the
+// vertex colour, for an ambient taken from it (null: white).
+static void gxLighting(uint32_t cctrl, uint32_t actrl, uint32_t amb, uint32_t aamb, const float* p, const float* n,
+                       const uint8_t* ambVtx, const uint8_t* aambVtx, float out[4]) {
+	const uint32_t ctrls[2] = {cctrl, actrl};
+	for (int part = 0; part < 2; part++) {
+		const uint32_t ctrl = ctrls[part];
+		const int c0 = part ? 3 : 0, c1 = part ? 4 : 3;
+		if (!((ctrl >> 1) & 1)) {
+			for (int c = c0; c < c1; c++) out[c] = 1.0f;
+			continue;
+		}
+		const uint32_t a = part ? aamb : amb;
+		const uint8_t* av = part ? aambVtx : ambVtx;
+		for (int c = c0; c < c1; c++)
+			out[c] = ((ctrl >> 6) & 1) ? (av ? av[c] * (1.0f / 255.0f) : 1.0f) : float((a >> (24 - 8 * c)) & 0xFF) * (1.0f / 255.0f);
+		for (uint32_t m = chanLights(ctrl); m; m &= m - 1) {
+			GxLight l;
+			gxLight(__builtin_ctz(m), l);
+			const float t = gxLightTerm(ctrl, l, p, n);
+			for (int c = c0; c < c1; c++) out[c] += t * l.col[c];
+		}
+		for (int c = c0; c < c1; c++) out[c] = out[c] < 0.f ? 0.f : out[c] > 1.f ? 1.f : out[c];
+	}
+}
+
+// The renderer log (GX3DS_SetVerboseLog): a lit channel's colours and lights, once per distinct set
+// ([light] lines). A light's XF words (0x600 + 16 i): 3 colour, 4-6 angle attenuation, 7-9 distance
+// attenuation, 10-12 position, 13-15 direction.
+static void logLighting(int ch, int cha, bool hasNrm, bool hasClr, const VtxFmtLayout& L, uint32_t defPm) {
+	static uint64_t seen[96];
+	static int nSeen;
+	const uint32_t cctrl = rs.xfReg[XFR_COLOR0CTRL + ch], actrl = rs.xfReg[XFR_ALPHA0CTRL + cha];
+	const uint32_t mask = ((cctrl >> 2) & 15) | ((cctrl >> 7) & 0xF0);
+	uint64_t key = (uint64_t(cctrl) << 32) ^ actrl ^ (uint64_t(rs.xfReg[XFR_MAT0 + ch]) << 7) ^ rs.xfReg[XFR_AMB0 + ch] * 31ull;
+	for (int i = 0; i < 8; i++)
+		if (mask & (1u << i)) key = key * 1099511628211ull ^ rs.xfMem[0x600 + 16 * i + 3];
+	for (int i = 0; i < nSeen; i++)
+		if (seen[i] == key) return;
+	if (nSeen == 96) return;
+	seen[nSeen++] = key;
+	if (hasNrm && r_verts) {  // the first vertex: its normal, in view space, and N.L for the first light
+		const uint8_t* v = r_verts + size_t(r_spans ? r_bmin : 0) * r_stride;
+		const uint32_t pm = (r_fmt & VF_MTX) ? v[L.mtx] : defPm;
+		float nr[3], p[3];
+		memcpy(nr, v + L.nrm, 12);
+		memcpy(p, v, 12);
+		const float* nm = xfMtx(kXfNrm + pm * 3);
+		const float* m = xfMtx(pm * 4);
+		float vn[3], vp[3];
+		for (int k = 0; k < 3; k++) {
+			vn[k] = nm[3 * k] * nr[0] + nm[3 * k + 1] * nr[1] + nm[3 * k + 2] * nr[2];
+			vp[k] = m[4 * k] * p[0] + m[4 * k + 1] * p[1] + m[4 * k + 2] * p[2] + m[4 * k + 3];
+		}
+		int l0 = 0;
+		while (l0 < 8 && !(mask & (1u << l0))) l0++;
+		float nl = 0.f;
+		if (l0 < 8) {
+			const float* lp = reinterpret_cast<const float*>(&rs.xfMem[0x600 + 16 * l0 + 10]);
+			float d[3] = {lp[0] - vp[0], lp[1] - vp[1], lp[2] - vp[2]};
+			const float dl = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), nlen = sqrtf(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
+			if (dl > 0.f && nlen > 0.f) nl = (vn[0] * d[0] + vn[1] * d[1] + vn[2] * d[2]) / (dl * nlen);
+		}
+		fprintf(stderr, "[light] vertex 0: pm %u normal %.3g %.3g %.3g -> view %.3g %.3g %.3g, at %.4g %.4g %.4g, N.L %.3f\n", pm,
+		        nr[0], nr[1], nr[2], vn[0], vn[1], vn[2], vp[0], vp[1], vp[2], nl);
+		fprintf(stderr, "[light]   position rows %.3g %.3g %.3g / %.3g %.3g %.3g / %.3g %.3g %.3g, normal rows %.3g %.3g %.3g / %.3g %.3g %.3g / %.3g %.3g %.3g\n",
+		        m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10], nm[0], nm[1], nm[2], nm[3], nm[4], nm[5], nm[6], nm[7], nm[8]);
+	}
+	fprintf(stderr,
+	        "[light] frame %u chan %d/%d ctrl %04x/%04x (mat from %s, amb from %s, diffuse %u, atten %s) mat %08x amb %08x "
+	        "lights %02x%s%s\n",
+	        s_rFrames, ch, cha, cctrl & 0x7FFF, actrl & 0x7FFF, (cctrl & 1) ? "vertex" : "reg", ((cctrl >> 6) & 1) ? "vertex" : "reg",
+	        (cctrl >> 7) & 3, !((cctrl >> 9) & 1) ? "none" : ((cctrl >> 10) & 1) ? "spot" : "spec", rs.xfReg[XFR_MAT0 + ch],
+	        rs.xfReg[XFR_AMB0 + ch], mask, hasNrm ? "" : " (no normals)", hasClr ? "" : " (no colours)");
+
+	for (int i = 0; i < 8; i++) {
+		if (!(mask & (1u << i))) continue;
+		const uint32_t* w = &rs.xfMem[0x600 + 16 * i];
+		float f[12];
+		memcpy(f, w + 4, sizeof f);
+		fprintf(stderr, "[light]   light %d colour %08x cos %.3g %.3g %.3g dist %.3g %.3g %.3g pos %.4g %.4g %.4g dir %.3g %.3g %.3g\n", i,
+		        w[3], f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+	}
+}
 
 static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevSetup& tev, bool debug,
                     PicaTex* const utex[PICA_MAX_TEX], const EfbCopy* const ucopy[PICA_MAX_TEX],
@@ -3001,7 +3253,11 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	const bool clrFromVtx = !debug && (cctrl & 1) && hasClr, alphaFromVtx = (actrl & 1) && hasAClr;
 	if (clrFromVtx && alphaFromVtx && ch != cha) return gpuFail(FB_TWOCOLOURS, n);  // one colour attribute
 	const int clrField = clrFromVtx ? ch : alphaFromVtx ? cha : -1;
-	const bool lit = (((cctrl >> 1) & 1) || debug) && hasNrm;
+	const uint32_t amb = rs.xfReg[XFR_AMB0 + ch], aamb = rs.xfReg[XFR_AMB0 + cha];
+	const bool litC = ((cctrl >> 1) & 1) && !chanSaturated(cctrl, amb, false),
+	           litA = ((actrl >> 1) & 1) && !chanSaturated(actrl, aamb, true);
+	const bool lit = !debug && (litC || litA) && hasNrm;
+	if (s_verbose && ((cctrl >> 1) & 1)) logLighting(ch, cha, hasNrm, hasClr, L, defPm);
 
 	PicaGxUniforms u;
 	memset(&u, 0, sizeof u);
@@ -3110,7 +3366,81 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	}
 	u.CS[3] = alphaFromVtx ? 1.f : 0.f;
 	u.CM[3] = alphaFromVtx ? 0.f : float(amat & 0xFF) * k255;
-	u.LD[0] = 0.3f, u.LD[1] = 0.6f, u.LD[2] = 0.74f, u.LD[3] = lit ? 1.f : 0.f;
+	// GX lighting (gxLighting): with normals, in the shader (up to two lights, no specular ones; else
+	// the CPU path); without, the lights' diffuse terms are 0 and the factor is one for the draw.
+	if (!debug && (((cctrl >> 1) & 1) || ((actrl >> 1) & 1))) {
+		if (!lit) {
+			float f[4];
+			const float origin[3] = {0, 0, 0};
+			gxLighting(cctrl, actrl, amb, aamb, origin, nullptr, nullptr, nullptr, f);
+			for (int c = 0; c < 4; c++) u.CS[c] *= f[c], u.CM[c] *= f[c];
+		} else {  // (a part litC / litA leaves out comes out at 1: ambient 1, no lights)
+			const uint32_t maskC = litC ? chanLights(cctrl) : 0, maskA = litA ? chanLights(actrl) : 0;
+			// Why a lit draw goes to the CPU path, once per setup (renderer log).
+			auto lightFail = [&](const char* why, int light) {
+				if (s_verbose) {
+					static uint64_t said[64];
+					static int nSaid;
+					const uint64_t key = uint64_t(cctrl) << 48 ^ uint64_t(actrl) << 32 ^ amb ^ uint64_t(aamb) << 7 ^ uintptr_t(why);
+					bool seen = false;
+					for (int i = 0; i < nSaid; i++) seen |= said[i] == key;
+					if (!seen && nSaid < 64) {
+						said[nSaid++] = key;
+						GxLight l{};
+						if (light >= 0) gxLight(light, l);
+						fprintf(stderr, "[light] CPU path (%s): ctrl %04x/%04x amb %08x %08x, light %d cos %.3g %.3g %.3g dist %.3g %.3g %.3g pos %.4g %.4g %.4g\n",
+						        why, cctrl & 0x7FFF, actrl & 0x7FFF, amb, aamb, light, l.cosa[0], l.cosa[1], l.cosa[2], l.dista[0], l.dista[1],
+						        l.dista[2], l.pos[0], l.pos[1], l.pos[2]);
+					}
+				}
+				return gpuFail(FB_LIGHTS, n);
+			};
+			if (((cctrl >> 6) & 1) && litC) return lightFail("ambient from the vertex colour", -1);
+			if (((actrl >> 6) & 1) && litA) return lightFail("alpha ambient from the vertex colour", -1);
+			for (int c = 0; c < 3; c++) u.AMB[c] = litC ? float((amb >> (24 - 8 * c)) & 0xFF) * k255 : 1.f;
+			u.AMB[3] = litA ? float(aamb & 0xFF) * k255 : 1.f;
+			int nl = 0;
+			const uint8_t* v0 = r_verts + size_t(r_spans ? r_bmin : 0) * r_stride;
+			const float* pmx = xfMtx((hasMtx ? v0[L.mtx] : defPm) * 4);
+			const float org[3] = {pmx[3], pmx[7], pmx[11]};  // the model's origin in view space
+			for (uint32_t m = maskC | maskA; m; m &= m - 1) {
+				const int i = __builtin_ctz(m);
+				GxLight l;
+				gxLight(i, l);
+				const bool inC = (maskC >> i) & 1, inA = (maskA >> i) & 1;
+				if ((!inC || lightNegligible(cctrl, l, org)) && (!inA || lightNegligible(actrl, l, org))) continue;
+				const uint32_t ctrl = inC ? cctrl : actrl;
+				const int flat = gxLightFlat(ctrl, l);  // 1: no attenuation, 0: no light, -1: attenuated
+				if (inC && inA && (chanAttn(cctrl) != chanAttn(actrl) || gxLightFlat(actrl, l) != flat))
+					return lightFail("colour and alpha attenuation differ", i);
+				if (flat == 0) continue;  // (no light from it)
+				if (inC && inA && chanDiffuse(cctrl) != chanDiffuse(actrl)) return lightFail("colour and alpha diffuse differ", i);
+				if (l.col[0] == 0.f && l.col[1] == 0.f && l.col[2] == 0.f && (!inA || l.col[3] == 0.f)) continue;
+				if (nl == 2) return lightFail("more than 2 lights", i);
+				memcpy(u.LP[nl], l.pos, 12);
+				for (int c = 0; c < 3; c++) u.LC[nl][c] = inC ? l.col[c] : 0.f;
+				u.LC[nl][3] = inA ? l.col[3] : 0.f;
+				const uint32_t dfn = chanDiffuse(ctrl);
+				u.LF[nl][0] = dfn == 2 ? 0.f : -1e20f;
+				u.LF[nl][1] = dfn == 0 ? 0.f : 1.f;
+				u.LF[nl][2] = dfn == 0 ? 1.f : 0.f;
+				if (flat < 0) {  // attenuated: a spot light, or a specular one (its term replaces the diffuse one)
+					const bool spec = chanAttn(ctrl) == 1;
+					if (spec && dfn != 0) return lightFail("specular with a diffuse term", i);  // (GXSetChanCtrl never sets it)
+					u.attn |= uint8_t((spec ? 0x10u : 1u) << nl);
+					memcpy(u.LA[nl], l.cosa, 12);
+					memcpy(u.LK[nl], l.dista, 12);
+					memcpy(u.LD[nl], l.dir, 12);
+					const float m = sqrtf(l.dista[0] * l.dista[0] + l.dista[1] * l.dista[1] + l.dista[2] * l.dista[2]);
+					if (spec && dfn != 0 && m > 0.f)
+						for (int k = 0; k < 3; k++) u.LK[nl][k] /= m;
+				}
+				nl++;
+			}
+			u.lit = 1;
+			u.lights = uint8_t(nl);
+		}
+	}
 
 	// View space -> EFB pixels and GameCube depth (homogeneous), as the CPU loop computes them.
 	const float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1), p2 = xff(XFR_PROJ + 2), p3 = xff(XFR_PROJ + 3),
@@ -3145,7 +3475,7 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 		}
 		for (uint32_t m = s_nrmDirty; m; m &= m - 1) {
 			const int r = __builtin_ctz(m);
-			memcpy(s_nrmRows[r], &rs.xfMem[256 + 3 * r], 12);
+			memcpy(s_nrmRows[r], &rs.xfMem[kXfNrm + 3 * r], 12);
 			s_nrmRows[r][3] = 0.f;
 		}
 		s_posDirty = s_nrmDirty = 0;
@@ -3404,13 +3734,15 @@ static void drawTriangles() {
 			uint32_t c0 = 0, c1 = 0;
 			if (r_count && (r_fmt & VF_CLR0)) memcpy(&c0, r_verts + L0.clr[0], 4);
 			if (r_count && (r_fmt & (VF_CLR0 << 1))) memcpy(&c1, r_verts + L0.clr[1], 4);
-			char extra[200];
+			char extra[240];
 			snprintf(extra, sizeof extra,
-			         "clip %s cmode0 %06x zmode %06x alphacmp %06x chans %u ctrl %04x/%04x %04x/%04x mat %08x %08x vtx clr %08x %08x (fmt %x)",
+			         "clip %s cmode0 %06x zmode %06x alphacmp %06x chans %u ctrl %04x/%04x %04x/%04x mat %08x %08x amb %08x %08x "
+			         "vtx clr %08x %08x (fmt %x)",
 			         rs.xfReg[0x05] ? "off" : "on", rs.bp[BP_CMODE0] & 0xFFFFFF, rs.bp[BP_ZMODE] & 0xFFFFFF, rs.bp[BP_ALPHACOMPARE] & 0xFFFFFF,
 			         rs.xfReg[XFR_NUMCHANS] & 3, rs.xfReg[XFR_COLOR0CTRL] & 0x7FFF, rs.xfReg[XFR_ALPHA0CTRL] & 0x7FFF,
 			         rs.xfReg[XFR_COLOR0CTRL + 1] & 0x7FFF, rs.xfReg[XFR_ALPHA0CTRL + 1] & 0x7FFF, rs.xfReg[XFR_MAT0],
-			         rs.xfReg[XFR_MAT0 + 1], __builtin_bswap32(c0), __builtin_bswap32(c1), r_fmt);
+			         rs.xfReg[XFR_MAT0 + 1], rs.xfReg[XFR_AMB0], rs.xfReg[XFR_AMB0 + 1], __builtin_bswap32(c0),
+			         __builtin_bswap32(c1), r_fmt);
 			dumpId = tevDump(tev, st, translated, ptex, pcopy, extra);
 			if (!cached || !s_tevCache[tevKey].dumpId) s_tevCache[tevKey].dumpId = dumpId;
 		}
@@ -3443,6 +3775,7 @@ static void drawTriangles() {
 		perfAdd(PERF_TEV, t3 - perfTev0);
 		s_tevPartTicks[3] += t3 - tevT1;
 	}
+	if (s_skipTev && dumpId >= s_skipTev && dumpId <= s_skipTevTo) return;  // (GX3DS_SetSkipTev: a debugging aid)
 	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
 	s_cpuBatches++;
 	s_fp.valid = false;  // (the CPU path changes the state for its own draw)
@@ -3488,14 +3821,15 @@ static void drawTriangles() {
 	const bool noClip = rs.xfReg[0x05] != 0;
 
 	// The colour channels the TEV stages read (0 or 1) for the rgb and the alpha: material
-	// register or vertex colour; lighting reduced to one fixed light.
+	// register or vertex colour, times GX's lighting where it is on (gxLighting).
 	const int ch = debug ? 0 : tev.rasRgbChan, cha = debug ? 0 : tev.rasAChan;
 	const uint32_t cctrl = rs.xfReg[XFR_COLOR0CTRL + ch], actrl = rs.xfReg[XFR_ALPHA0CTRL + cha], mat = rs.xfReg[XFR_MAT0 + ch],
 	               amat = rs.xfReg[XFR_MAT0 + cha];
 	const bool hasClr = (r_fmt & (VF_CLR0 << ch)) != 0, hasAClr = (r_fmt & (VF_CLR0 << cha)) != 0,
 	           hasNrm = (r_fmt & VF_NRM) != 0, hasMtx = (r_fmt & VF_MTX) != 0;
 	const bool clrFromVtx = (cctrl & 1) && hasClr, alphaFromVtx = (actrl & 1) && hasAClr;
-	const bool lit = ((cctrl >> 1) & 1) && hasNrm;
+	const bool lightOn = ((cctrl >> 1) & 1) || ((actrl >> 1) & 1);
+	const uint32_t amb = rs.xfReg[XFR_AMB0 + ch], aamb = rs.xfReg[XFR_AMB0 + cha];
 	const uint8_t matRGBA[4] = {uint8_t(mat >> 24), uint8_t(mat >> 16), uint8_t(mat >> 8), uint8_t(amat)};
 	const uint32_t defPm = rs.xfReg[XFR_MATIDX_A] & 63;
 	const uint32_t matA = rs.xfReg[XFR_MATIDX_A], matB = rs.xfReg[XFR_MATIDX_B];
@@ -3555,22 +3889,34 @@ static void drawTriangles() {
 		if (st.proj0) o.tc[2][0] = q0;
 
 		const uint8_t* src = debug ? dbg : clrFromVtx ? v + L.clr[ch] : matRGBA;
-		float shade = 1.0f;
-		if (lit || (debug && hasNrm)) {
-			float nrm[3];
-			memcpy(nrm, v + L.nrm, 12);
-			const float* nm = xfMtx(256 + pm * 3);  // normal matrices: 3x3, word 256 + 3 * index
-			float nx = nm[0] * nrm[0] + nm[1] * nrm[1] + nm[2] * nrm[2];
-			float ny = nm[3] * nrm[0] + nm[4] * nrm[1] + nm[5] * nrm[2];
-			float nz = nm[6] * nrm[0] + nm[7] * nrm[1] + nm[8] * nrm[2];
-			float len = sqrtf(nx * nx + ny * ny + nz * nz);
-			float d = len > 0.f ? (0.3f * nx + 0.6f * ny + 0.74f * nz) / len : 1.0f;  // light from up-front
-			shade = 0.35f + 0.65f * (d > 0.f ? d : 0.f);
+		float f[4] = {1.f, 1.f, 1.f, 1.f};
+		if (lightOn || (debug && hasNrm)) {
+			float vn[3];
+			const float* np = nullptr;
+			if (hasNrm) {
+				float nrm[3];
+				memcpy(nrm, v + L.nrm, 12);
+				const float* nm = xfMtx(kXfNrm + pm * 3);  // normal matrices: 3x3, word 0x400 + 3 * index
+				vn[0] = nm[0] * nrm[0] + nm[1] * nrm[1] + nm[2] * nrm[2];
+				vn[1] = nm[3] * nrm[0] + nm[4] * nrm[1] + nm[5] * nrm[2];
+				vn[2] = nm[6] * nrm[0] + nm[7] * nrm[1] + nm[8] * nrm[2];
+				const float len = sqrtf(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
+				for (int k = 0; k < 3; k++) vn[k] = len > 0.f ? vn[k] / len : 0.f;
+				np = vn;
+			}
+			if (debug) {  // debug colours: shaded by one light from up-front
+				const float d = 0.3f * vn[0] + 0.6f * vn[1] + 0.74f * vn[2];
+				f[0] = f[1] = f[2] = 0.35f + 0.65f * (d > 0.f ? d : 0.f);
+			} else {
+				const float vp[3] = {vx, vy, vz};
+				gxLighting(cctrl, actrl, amb, aamb, vp, np, hasClr ? v + L.clr[ch] : nullptr, hasAClr ? v + L.clr[cha] : nullptr,
+				           f);
+			}
 		}
-		o.rgba[0] = clamp255(src[0] * shade);
-		o.rgba[1] = clamp255(src[1] * shade);
-		o.rgba[2] = clamp255(src[2] * shade);
-		o.rgba[3] = alphaFromVtx ? v[L.clr[cha] + 3] : matRGBA[3];
+		o.rgba[0] = clamp255(src[0] * f[0]);
+		o.rgba[1] = clamp255(src[1] * f[1]);
+		o.rgba[2] = clamp255(src[2] * f[2]);
+		o.rgba[3] = clamp255((alphaFromVtx ? v[L.clr[cha] + 3] : matRGBA[3]) * f[3]);
 	}
 	memcpy(oidx, r_idx, size_t(nidx) * 2);
 
@@ -5635,7 +5981,12 @@ void textureInvalidateAll() {}
 void textureInvalidateRange(const void*, uint32_t) {}
 void textureCpuWrote(const void*, uint32_t) {}
 unsigned efbCopyLookup(const void*, int*, int*) { return 0; }
-uint32_t peekColor(int, int) { return 0; }
+// GXPeekARGB: the EFB is not read back here. Its one caller is Mario's occlusion probe
+// (TMario::drawSyncCallback), which takes alpha 0x10 at his screen position for "in view" and
+// anything else for "hidden": with 0 he was hidden every frame, so the silhouette mode stayed on and
+// drew every nearby actor's and item's "?" marker through the ground (TQuestionManager, depth
+// GREATER). Reported in view until the EFB can be peeked (no silhouette behind walls meanwhile).
+uint32_t peekColor(int, int) { return 0x10000000u; }
 uint32_t peekZ(int, int) { return 0; }
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
@@ -5696,6 +6047,10 @@ void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.tx
 void GX3DS_SetGxPoll(int on) { gx::s_gxPoll = on != 0; }  // settings.txt gx_poll
 void GX3DS_SetGamePoll(int on) { gx::s_gamePoll = on != 0; }
 void GX3DS_SetSkipColourCopies(int on) { gx::s_skipColourCopies = on != 0; }
+void GX3DS_SetSkipTev(unsigned id, unsigned to) {
+	gx::s_skipTev = id;
+	gx::s_skipTevTo = to > id ? to : id;
+}
 // The game thread's waits for the GX thread so far (ticks): a free chunk, the frame's end, a drain,
 // a list rewrite (the profiler's game-thread work without phase timers).
 uint64_t GX3DS_GameWaitTicks(void) {

@@ -41,8 +41,8 @@ static C3D_Tex s_efbTex;
 static DVLB_s* s_dvlb;
 static shaderProgram_s s_prog;
 /* Vertex shader uniforms (shaders/gx_pass.v.pica) and the vertex mode they are set up for. */
-static int s_uF, s_uP, s_uN, s_uT, s_uW, s_uCS, s_uCM, s_uLD, s_bCpu;
-static int s_bLit, s_bTu[3], s_bTd[3], s_bPj; /* the GX shader's per-draw shortcuts */
+static int s_uF, s_uP, s_uN, s_uT, s_uW, s_uCS, s_uCM, s_uAMB, s_uLP, s_uLC, s_uLF, s_uLA, s_uLK, s_uLD, s_bCpu;
+static int s_bLit, s_bL[2], s_bA[2], s_bS[2], s_bTu[3], s_bTd[3], s_bPj; /* the GX shader's per-draw shortcuts */
 static C3D_Tex s_projTex; /* unit 0's texture in projection mode (PicaState.proj0) */
 enum { MODE_NONE = -1, MODE_CPU = 0, MODE_GX = 1 };
 static int s_mode = MODE_NONE;
@@ -145,9 +145,21 @@ int pica_init(void)
 		s_uW = shaderInstanceGetUniformLocation(vs, "W");
 		s_uCS = shaderInstanceGetUniformLocation(vs, "CS");
 		s_uCM = shaderInstanceGetUniformLocation(vs, "CM");
+		s_uAMB = shaderInstanceGetUniformLocation(vs, "AMB");
+		s_uLP = shaderInstanceGetUniformLocation(vs, "LP");
+		s_uLC = shaderInstanceGetUniformLocation(vs, "LC");
+		s_uLF = shaderInstanceGetUniformLocation(vs, "LF");
+		s_uLA = shaderInstanceGetUniformLocation(vs, "LA");
+		s_uLK = shaderInstanceGetUniformLocation(vs, "LK");
 		s_uLD = shaderInstanceGetUniformLocation(vs, "LD");
 		s_bCpu = shaderInstanceGetUniformLocation(vs, "cpu");
 		s_bLit = shaderInstanceGetUniformLocation(vs, "lit");
+		s_bL[0] = shaderInstanceGetUniformLocation(vs, "l0");
+		s_bL[1] = shaderInstanceGetUniformLocation(vs, "l1");
+		s_bA[0] = shaderInstanceGetUniformLocation(vs, "a0");
+		s_bA[1] = shaderInstanceGetUniformLocation(vs, "a1");
+		s_bS[0] = shaderInstanceGetUniformLocation(vs, "s0");
+		s_bS[1] = shaderInstanceGetUniformLocation(vs, "s1");
 		s_bPj = shaderInstanceGetUniformLocation(vs, "pj");
 		for (int k = 0; k < 3; k++) {
 			char n[4] = {'t', 'u', (char)('0' + k), 0};
@@ -214,6 +226,7 @@ struct PicaTex {
 	void* vram;           /* non-null: a copy of tex.data in VRAM (vram_copy) */
 	C3D_Tex vtex;         /* tex, pointing at the VRAM copy (bound once vready) */
 	uint8_t vready, vpending, dead, noVram;
+	uint8_t copyLinear;             /* EFB copy textures: in linear FCRAM (no VRAM was left) */
 	uint16_t arenaUnit, arenaUnits; /* EFB copy textures: their run in s_copyArena (0 units: own VRAM) */
 	float wx, wy, ww, wh;           /* EFB copy textures: the EFB window (EFB pixels) of their latest copy */
 	uint32_t lastUse, vramUse, vcopyFrame, vtryFrame; /* frame numbers (s_frameNo) */
@@ -271,12 +284,12 @@ static void release_dead(void)
  * current scene draws with; copies of textures no draw has bound for a while make room
  * (vram_evict), for other textures and for the EFB-copy textures (pica_copy_tex_create). */
 /* VRAM kept free for EFB-copy textures that do not fit in the arena (s_copyArena), or for all of
- * them when it could not be made: at most 6 (the back end's kMaxEfbCopies), one more while a
+ * them when it could not be made: at most 8 (the back end's kMaxEfbCopies), one more while a
  * replaced one waits out its two frames, each at most a whole-EFB texture. */
 #define COPY_TEX_BYTES (EFB_TEX_W * EFB_TEX_H * 4u)
 static uint32_t copy_reserve(void)
 {
-	const int left = 7 - s_copyTexCount;
+	const int left = 9 - s_copyTexCount;
 	return (!s_copyArena && left > 0 ? (uint32_t)left * COPY_TEX_BYTES : 0) + (64u << 10);
 }
 #define VRAM_IDLE 30 /* frames a texture goes unbound before its VRAM copy may go */
@@ -921,6 +934,65 @@ static int ovl_queue_room(void) { return s_ovq[s_ovb].numEntries < OVL_COPY_LIMI
 
 static void readback_arrived(void);
 static void readback_finish(void);
+/* A screenshot (main.cpp: autorun.txt shots): the EFB as the GPU finished the last frame, saved as
+ * sdmc:/sms/shot-<id>.ppm, its 512x256 texels (the texture's first row is the picture's top; 8x8
+ * tiles, Morton order inside each). Taken at the next frame's end,
+ * once that frame's queue has finished and before the next one (with its clear) runs. */
+static volatile int s_shotQ[64];  /* asked for (main thread), saved one a frame (render thread) */
+static volatile unsigned s_shotIn, s_shotOut;
+void pica_request_shot(int id)
+{
+	if (s_shotIn - s_shotOut < 64) {
+		s_shotQ[s_shotIn % 64] = id;
+		__dmb();
+		s_shotIn++;
+	}
+}
+static void shot_save(int id)
+{
+	const C3D_Tex* t = &s_efbTex;
+	const int w = t->width, h = t->height;
+	char path[48];
+	snprintf(path, sizeof path, "sdmc:/sms/shot-%d.ppm", id);
+	FILE* f = fopen(path, "wb");
+	if (!f) return;
+	fprintf(f, "P6 %d %d 255\n", w, h);
+	const uint8_t* src = (const uint8_t*)t->data;
+	uint8_t* row = (uint8_t*)malloc((size_t)w * 3);
+	for (int y = 0; row && y < h; y++) {
+		const int r = y;
+		for (int x = 0; x < w; x++) {
+			const int ix = x & 7, iy = r & 7;
+			const int m = (ix & 1) | (iy & 1) << 1 | (ix & 2) << 1 | (iy & 2) << 2 | (ix & 4) << 2 | (iy & 4) << 3;
+			const uint8_t* p = src + (((size_t)(r >> 3) * (w >> 3) + (x >> 3)) * 64 + m) * 4; /* A B G R */
+			row[x * 3] = p[3];
+			row[x * 3 + 1] = p[2];
+			row[x * 3 + 2] = p[1];
+		}
+		fwrite(row, 3, (size_t)w, f);
+	}
+	free(row);
+	fclose(f);
+	fprintf(stderr, "[pica] screenshot saved: %s\n", path);
+	/* The presented top screen too (240 x 400, the screen's portrait layout): what is shown. */
+	snprintf(path, sizeof path, "sdmc:/sms/shot-%d-top.ppm", id);
+	const uint8_t* top = (const uint8_t*)s_top->frameBuf.colorBuf;
+	if (!top || !(f = fopen(path, "wb"))) return;
+	fprintf(f, "P6 240 400 255\n");
+	uint8_t trow[240 * 3];
+	for (int y = 0; y < 400; y++) {
+		for (int x = 0; x < 240; x++) {
+			const int ix = x & 7, iy = y & 7;
+			const int m = (ix & 1) | (iy & 1) << 1 | (ix & 2) << 1 | (iy & 2) << 2 | (ix & 4) << 2 | (iy & 4) << 3;
+			const uint8_t* p = top + (((size_t)(y >> 3) * 30 + (x >> 3)) * 64 + m) * 4;
+			trow[x * 3] = p[3];
+			trow[x * 3 + 1] = p[2];
+			trow[x * 3 + 2] = p[1];
+		}
+		fwrite(trow, 3, 240, f);
+	}
+	fclose(f);
+}
 static void readback_queue(void);
 /* Readbacks converted after the frame's queue starts (pica_set_readback_late; the profiler's revert
  * steps): first, the GPU waited for them, some 3 ms a frame on the New 3DS (invalidating the
@@ -941,6 +1013,11 @@ static void ovl_frame_end(void)
 	s_where = "waiting for the GPU to finish the previous frame";
 	ovl_wait_running();
 	end_mark(PICA_END_WAIT);
+	if (s_shotOut != s_shotIn) {
+		__dmb();
+		shot_save(s_shotQ[s_shotOut % 64]);
+		s_shotOut++;
+	}
 	/* The previous frame's copies have arrived: converted into the game's memory once this frame's
 	 * queue runs (s_rbLate), else first. */
 	readback_arrived();
@@ -1364,7 +1441,13 @@ static void gx_shortcuts(const PicaGxUniforms* u)
 		}
 		return;
 	}
-	bunif(s_bLit, u->LD[3] != 0.f);
+	bunif(s_bLit, u->lit != 0);
+	bunif(s_bL[0], u->lit && u->lights >= 1);
+	bunif(s_bL[1], u->lit && u->lights >= 2);
+	bunif(s_bA[0], u->lit && u->lights >= 1 && (u->attn & 0x11) == 0x01);
+	bunif(s_bA[1], u->lit && u->lights >= 2 && (u->attn & 0x22) == 0x02);
+	bunif(s_bS[0], u->lit && u->lights >= 1 && (u->attn & 0x10));
+	bunif(s_bS[1], u->lit && u->lights >= 2 && (u->attn & 0x20));
 	for (int k = 0; k < 3; k++) {
 		const float* w0 = u->W[2 * k];
 		const float* w1 = u->W[2 * k + 1];
@@ -1379,29 +1462,19 @@ static void gx_shortcuts(const PicaGxUniforms* u)
 	}
 }
 
-/* The shader's light vectors (gx_pass.v.pica): N[3k] = 0.65 LD.w M_k^T LD / s_k for normal matrix
- * M_k (rows 3k..3k+2) and s_k its scale (the mean of its rows' lengths), so one dp3 with a unit model
- * normal gives the shade's N.LD term. A slot is worked out again only when its rows or LD changed. */
-static float s_lnRows[PICA_GX_MTX_ROWS / 3][9], s_lnLD[4];
+/* The shader's normal matrices (gx_pass.v.pica): matrix k's rows in N[3k..3k+2], uploaded for lit
+ * draws; a matrix is sent again only when its rows changed. */
+static float s_lnRows[PICA_GX_MTX_ROWS / 3][9];
 static uint8_t s_lnValid[PICA_GX_MTX_ROWS / 3];
-static void gx_light_vectors(const float (*nrm_rows)[4], const float LD[4])
+static void gx_normal_rows(const float (*nrm_rows)[4])
 {
-	if (memcmp(LD, s_lnLD, sizeof s_lnLD) != 0) {
-		memcpy(s_lnLD, LD, sizeof s_lnLD);
-		memset(s_lnValid, 0, sizeof s_lnValid);
-	}
-	const float a = 0.65f * LD[3];
 	for (int k = 0; k < PICA_GX_MTX_ROWS / 3; k++) {
 		float m[9];
 		for (int i = 0; i < 3; i++) memcpy(&m[3 * i], nrm_rows[3 * k + i], 12);
 		if (s_lnValid[k] && memcmp(m, s_lnRows[k], sizeof m) == 0) continue;
 		memcpy(s_lnRows[k], m, sizeof m);
 		s_lnValid[k] = 1;
-		const float s = (sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) + sqrtf(m[3] * m[3] + m[4] * m[4] + m[5] * m[5]) +
-		                 sqrtf(m[6] * m[6] + m[7] * m[7] + m[8] * m[8])) / 3.0f;
-		const float f = s > 1e-20f ? a / s : 0.0f;
-		vunif(s_uN + 3 * k, f * (LD[0] * m[0] + LD[1] * m[3] + LD[2] * m[6]), f * (LD[0] * m[1] + LD[1] * m[4] + LD[2] * m[7]),
-		      f * (LD[0] * m[2] + LD[1] * m[5] + LD[2] * m[8]), 0.0f);
+		for (int i = 0; i < 3; i++) vunif(s_uN + 3 * k + i, m[3 * i], m[3 * i + 1], m[3 * i + 2], 0.0f);
 	}
 }
 
@@ -1490,7 +1563,20 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 		}
 		s_gxMatricesLoaded = 1;
 	}
-	if (u->LD[3] != 0.0f) gx_light_vectors(nrm_rows, u->LD);
+	if (u->lit) {
+		gx_normal_rows(nrm_rows);
+		vunif(s_uAMB, u->AMB[0], u->AMB[1], u->AMB[2], u->AMB[3]);
+		for (int i = 0; i < u->lights; i++) {
+			vunif(s_uLP + i, u->LP[i][0], u->LP[i][1], u->LP[i][2], 1.0f);
+			vunif(s_uLC + i, u->LC[i][0], u->LC[i][1], u->LC[i][2], u->LC[i][3]);
+			vunif(s_uLF + i, u->LF[i][0], u->LF[i][1], u->LF[i][2], 0.0f);
+			if (u->attn & (0x11u << i)) {
+				vunif(s_uLA + i, u->LA[i][0], u->LA[i][1], u->LA[i][2], 0.0f);
+				vunif(s_uLK + i, u->LK[i][0], u->LK[i][1], u->LK[i][2], 0.0f);
+				vunif(s_uLD + i, u->LD[i][0], u->LD[i][1], u->LD[i][2], 0.0f);
+			}
+		}
+	}
 	if (s_gpuTest == 2)
 		for (int r = 0; r < 4; r++) vunif(s_uF + r, 0.0f, 0.0f, 0.0f, r == 3 ? 1.0f : 0.0f);
 	else if (s_gpuTest == 4) /* the picture shrunk 8x about the centre: nothing crosses the sides */
@@ -1507,7 +1593,6 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 	}
 	vunif(s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
 	vunif(s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
-	vunif(s_uLD, 1.0f - 0.65f * u->LD[3], 0.0f, 0.0f, u->LD[3]);  /* the shade's offset (gx_light_vectors) */
 	gx_shortcuts(u);
 	set_buffer(verts, L->stride, s_gxEntries, s_gxPerm);
 	return 1;
@@ -1799,6 +1884,11 @@ static void copy_tex_mem_free(PicaTex* t)
 		memset(&s_copyUnitUsed[t->arenaUnit], 0, t->arenaUnits);
 		s_copyUnits -= t->arenaUnits;
 		t->arenaUnits = 0;
+	} else if (t->tex.data && t->copyLinear) {
+		LIN_LOCK();
+		linearFree(t->tex.data);
+		LIN_UNLOCK();
+		t->copyLinear = 0;
 	} else if (t->tex.data) {
 		vramFree(t->tex.data);
 	}
@@ -1868,7 +1958,25 @@ PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
 		mem = vramAlloc(bytes);
 	}
 	if (!mem) {
-		fprintf(stderr, "[pica] no VRAM for a %lux%lu EFB-copy texture (%lu KB free)\n", (unsigned long)tw,
+		/* No VRAM left (the arena full, the scene's textures in use): linear FCRAM, slower to draw
+		 * into and sample but there. Without a texture the copy is lost, and draws that sample it
+		 * read the destination's memory, which the GPU never wrote (Bianco Hills' lake, which shows
+		 * the screen copy, went black for moments when copies were replaced every frame). */
+		LIN_LOCK();
+		mem = linearMemAlign(bytes, 0x80);
+		LIN_UNLOCK();
+		if (mem) {
+			t->copyLinear = 1;
+			static int s_said;
+			if (!s_said) {
+				s_said = 1;
+				fprintf(stderr, "[pica] no VRAM for a %lux%lu EFB-copy texture (%lu KB free): in FCRAM\n",
+				        (unsigned long)tw, (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10));
+			}
+		}
+	}
+	if (!mem) {
+		fprintf(stderr, "[pica] no memory for a %lux%lu EFB-copy texture (%lu KB of VRAM free)\n", (unsigned long)tw,
 		        (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10));
 		free(t);
 		return NULL;
@@ -2428,7 +2536,7 @@ static void selftest_quad56(shaderProgram_s* prog, int gx)
 			for (int r = 0; r < 6; r++) C3D_FVUnifSet(GPU_VERTEX_SHADER, l + r, 0, 0, 0, 0);
 	if ((l = shaderInstanceGetUniformLocation(vs, "CS")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 1, 1, 1, 1);
 	if ((l = shaderInstanceGetUniformLocation(vs, "CM")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 0, 0, 0, 0);
-	if ((l = shaderInstanceGetUniformLocation(vs, "LD")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 0, 0, 0, 0);
+	if ((l = shaderInstanceGetUniformLocation(vs, "AMB")) >= 0) C3D_FVUnifSet(GPU_VERTEX_SHADER, l, 1, 1, 1, 1);
 	set_buffer(vb, 56, 7, 0x6543210);
 	C3D_DrawElements(GPU_TRIANGLES, 6, C3D_UNSIGNED_SHORT, ib);
 }
@@ -2571,10 +2679,20 @@ static void vb_uniforms(float pscale, int lit, int tex)
 	}
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCS, 1, 1, 1, 1);
 	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uCM, 0, 0, 0, 0);
-	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uLD, 0, 0, 1, lit ? 1.0f : 0.0f);
+	/* lit: GX lighting with one light far along +z, as the old fixed shade (0.35 + 0.65 N.L) */
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uAMB, 0.35f, 0.35f, 0.35f, 1.0f);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uLP, 0, 0, 1e6f, 1.0f);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uLC, 0.65f, 0.65f, 0.65f, 0.0f);
+	C3D_FVUnifSet(GPU_VERTEX_SHADER, s_uLF, 0, 1, 0, 0);
 	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bCpu, false);
 	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bPj, false);
 	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bLit, lit != 0);
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bL[0], lit != 0);
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bL[1], false);
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bA[0], false);
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bA[1], false);
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bS[0], false);
+	C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bS[1], false);
 	for (int k = 0; k < 3; k++) {
 		C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bTu[k], tex && k == 0);
 		C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bTd[k], tex && k == 0);

@@ -31,6 +31,8 @@ typedef struct {
 // Main thread, after each hidScanInput(): takes a reading. Game thread: the latest reading.
 void pad3ds_poll(void);
 void pad3ds_read(Pad3DSStatus* out);
+// 3DS KEY_* buttons an autorun script holds now (main.cpp: autorun.txt buttons), as if pressed.
+extern volatile uint32_t pad3ds_script;
 // Set by the main thread when quitting: the game thread stops at its next PADRead.
 extern volatile int pad3ds_quit;
 extern volatile int pad3ds_parked;  // set by the game thread once it stops for the quit

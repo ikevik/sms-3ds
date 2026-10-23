@@ -79,6 +79,40 @@ int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // lite: the lite setting off and on in turn; liteplus: more trims on top of it). It may also give
 // lite (on), as settings.txt does.
 static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
+// autorun.txt buttons = <seconds>:<keys>,... (keys A B X Y L R START SELECT UP DOWN LEFT RIGHT,
+// joined by '+'): those buttons held for 0.25 s from that many seconds after launch (pad_3ds.c,
+// pad3ds_script). shots = <seconds>,...: the frame drawn then saved as sdmc:/sms/shot-<tenths of a
+// second>.ppm (pica_draw.c).
+struct ScriptPress {
+	float at;
+	u32 keys;
+};
+static ScriptPress s_press[64];
+static int s_nPress;
+static float s_shotAt[64];
+static int s_nShot, s_shotNext;
+static float s_cpuPathAt = -1.0f;  // autorun.txt cpu_path_at = <seconds>: the CPU vertex path from then on (comparing the paths)
+static float s_traceAt = -1.0f;  // autorun.txt trace_at = <seconds>: that frame's GX commands traced (sdmc:/sms/trace-N.txt)
+static u64 s_launchMs;
+extern "C" void pica_request_shot(int id);  // pica_draw.c
+static u32 script_keys(const char* s)
+{
+	static const struct {
+		const char* name;
+		u32 key;
+	} kKeys[] = {{"A", KEY_A},         {"B", KEY_B},          {"X", KEY_X},         {"Y", KEY_Y},
+	             {"L", KEY_L},         {"R", KEY_R},          {"START", KEY_START}, {"SELECT", KEY_SELECT},
+	             {"UP", KEY_DUP},      {"DOWN", KEY_DDOWN},   {"LEFT", KEY_DLEFT},  {"RIGHT", KEY_DRIGHT}};
+	u32 keys = 0;
+	while (*s) {
+		size_t n = strcspn(s, "+");
+		for (const auto& k : kKeys)
+			if (strlen(k.name) == n && strncmp(s, k.name, n) == 0) keys |= k.key;
+		s += n;
+		if (*s == '+') s++;
+	}
+	return keys;
+}
 static bool s_statusDraw = true;  // autorun.txt status_screen = off: the bottom screen not redrawn
 extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
 extern "C" void SMS3DS_TimelineReport(void);
@@ -90,6 +124,7 @@ extern "C" int pica_gx_core;  // pica_draw.c: the GX thread's core (autorun.txt 
 extern "C" unsigned SMS3DS_ProfRunsDone;  // prof_3ds.cpp: profile runs finished so far
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
+void GX3DS_SetSkipTev(unsigned id, unsigned to);  // gx3ds_backend.cpp: autorun.txt skip_tev (debugging)
 extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
@@ -671,6 +706,37 @@ static void* game_thread(void*)
 		if (setting_value(kAutoPath, "skip_movies", v, sizeof v) && strcmp(v, "on") == 0)
 			setenv("SMS_SKIP_MOVIES", "1", 1);
 		if (setting_value(kAutoPath, "quit_after", v, sizeof v)) s_quitAfter = atoi(v);
+		// renderer_log = on: the renderer's once-per-kind [tevdump], [tev] and [copy] lines (as holding
+		// X at launch, without the goop map files).
+		if (setting_value(kAutoPath, "renderer_log", v, sizeof v) && strcmp(v, "on") == 0) GX3DS_SetVerboseLog(1);
+		// cpu_path = on: every draw on the CPU vertex path, as B held at launch (comparing the paths)
+		if (setting_value(kAutoPath, "cpu_path", v, sizeof v) && strcmp(v, "on") == 0) {
+			GX3DS_SetGpuTransform(0);
+			pica_set_big_ring(1);
+		}
+		// skip_tev = N or N-M: draws of the renderer log's TEV setups #N (to #M) left out (with
+		// renderer_log; debugging)
+		if (setting_value(kAutoPath, "skip_tev", v, sizeof v)) {
+			unsigned a = 0, b = 0;
+			if (sscanf(v, "%u-%u", &a, &b) < 2) b = a;
+			GX3DS_SetSkipTev(a, b);
+		}
+		{
+			char list[256];
+			if (setting_value(kAutoPath, "buttons", list, sizeof list))
+				for (char* p = strtok(list, ","); p && s_nPress < 64; p = strtok(nullptr, ",")) {
+					char* c = strchr(p, ':');
+					if (!c) continue;
+					*c = 0;
+					s_press[s_nPress++] = ScriptPress{float(atof(p)), script_keys(c + 1)};
+				}
+			if (setting_value(kAutoPath, "shots", list, sizeof list))
+				for (char* p = strtok(list, ","); p && s_nShot < 64; p = strtok(nullptr, ",")) s_shotAt[s_nShot++] = float(atof(p));
+			if (setting_value(kAutoPath, "trace_at", list, sizeof list)) s_traceAt = float(atof(list));
+			if (setting_value(kAutoPath, "cpu_path_at", list, sizeof list)) s_cpuPathAt = float(atof(list));
+			if (s_nPress || s_nShot)
+				fprintf(stderr, "[3ds] autorun.txt: %d scripted button presses, %d screenshots\n", s_nPress, s_nShot);
+		}
 		if (setting_value(kAutoPath, "timeline", v, sizeof v)) s_timelineAt = atoi(v);
 		if (setting_value(kAutoPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
 		if (setting_value(kAutoPath, "draw_state_check", v, sizeof v)) {
@@ -831,6 +897,7 @@ void __libctru_exit(int rc)
 
 int main()
 {
+	s_launchMs = osGetTime();
 	osSetSpeedupEnable(true);
 	gfxInitDefault();
 	// The top screen belongs to the renderer (platform/3ds/pica, citro3d on the game thread);
@@ -1050,6 +1117,22 @@ int main()
 		// presses before hidKeysDown() saw them). START alone is the game's Start button, so quitting
 		// needs START+SELECT.
 		hidScanInput();
+		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_cpuPathAt >= 0.0f) {  // autorun.txt buttons, shots, trace_at, cpu_path_at
+			const float t = float(osGetTime() - s_launchMs) / 1000.0f;
+			if (s_cpuPathAt >= 0.0f && t >= s_cpuPathAt) {
+				GX3DS_SetGpuTransform(0);
+				s_cpuPathAt = -1.0f;
+			}
+			if (s_traceAt >= 0.0f && t >= s_traceAt) {
+				GX3DS_TraceNextFrame();
+				s_traceAt = -1.0f;
+			}
+			u32 keys = 0;
+			for (int i = 0; i < s_nPress; i++)
+				if (t >= s_press[i].at && t < s_press[i].at + 0.25f) keys |= s_press[i].keys;
+			pad3ds_script = keys;
+			while (s_shotNext < s_nShot && t >= s_shotAt[s_shotNext]) pica_request_shot(int(s_shotAt[s_shotNext++] * 10.0f + 0.5f));
+		}
 		pad3ds_poll();  // the game's PADRead takes this reading (pad_3ds.c)
 		static u32 prevHeld = launchHeld;  // buttons held through launch are not presses
 		u32 held = hidKeysHeld(), pressed = held & ~prevHeld, released = prevHeld & ~held;

@@ -9,17 +9,21 @@
 ; cpu = false: GameCube vertices as the GX front half decoded them, transformed here.
 ;   v0 position (x, y, z), v1 normal, v2 the colour channel's colour (0..255), v3-v5 up to three
 ;   texture coordinate attributes (s, t), v6 the position matrix row index (GX PNMTX: 0, 3, ..27).
-;   P: position matrix rows 0-29 (XF memory words 0-119). N[3k]: matrix k's light vector (the
-;   CPU's: the light direction LD taken into model space through normal matrix k, divided by its
-;   scale, times 0.65 LD.w), so N[3k] . normal is 0.65 LD.w (N.LD)/|N| for the unit model normals
-;   of models scaled alike on every axis; N[3k+1], N[3k+2] are unused.
+;   P: position matrix rows 0-29 (XF memory words 0-119). N: normal matrix rows (matrix k's are
+;   N[3k..3k+2], XF words 256 + 3 * row).
 ;   F: view space -> clip (GX projection, viewport and the PICA projection, composed on the CPU).
 ;   Texture unit u: source = W[2u].x pos + W[2u].y normal + W[2u].z v3 + W[2u].w v4 + W[2u+1].x v5,
 ;   coordinate = (T[2u] . source, T[2u+1] . source) (texgen, texture/post matrix, EFB copy rect).
-;   Colour = v2 / 255 * CS + CM, rgb times the shade 1 + LD.w * (0.35 + 0.65 max(N.LD, 0) - 1),
-;   computed as LD.x + max(N[idx] . normal, 0) with LD.x = 1 - 0.65 LD.w (one dp3: the normal's
-;   transform, its normalisation and the shade's 17 dependent instructions cost the GPU ~14 ns an
-;   index, as much as the rest of the shader).
+;   Colour = v2 / 255 * CS + CM (the channel's material), and when lit (lighting on, with normals)
+;   times GX's lighting, clamp(AMB + each light's LC times its diffuse term), the light from LP (its
+;   view-space position) to the vertex and the view-space normal N[idx..idx+2] . normal normalised;
+;   the diffuse term max(N.L, LF.x) * LF.y + LF.z gives GX's clamp (LF 0 1 0), sign (-1e20 1 0) and
+;   none (any 0 1). The rgb and the alpha are lit apart: a channel lighting is off for has AMB 1, LC 0.
+;   l0, l1: lights 0 and 1 used (pica_draw.c leaves draws with more on the CPU path). a0, a1: the
+;   light is a spot light, its term times max(0, LA . (1, c, c^2)) / (LK . (1, d, d^2)), c = max(L . LD,
+;   0) with L the unit vector to the light, d the distance to it (else no attenuation). s0, s1: the
+;   light is a specular one, its term (LA . (1, c, c^2)) / (LK . (1, c, c^2)), c = max(N . LD, 0)
+;   where N . L > 0 (LD the half-angle direction), as Dolphin computes it.
 ;   Per draw, work that would not change the result is skipped (most of the shader's cost): lit
 ;   (the shade, else 1), tuN (texture unit N is used, else its coordinate is 0) and tdN (unit N's
 ;   source is exactly attribute v(3+N), so the coordinate is (T[2N] . v, T[2N+1] . v)).
@@ -31,9 +35,21 @@
 .fvec W[6]
 .fvec CS
 .fvec CM
-.fvec LD
+.fvec AMB
+.fvec LP[2]
+.fvec LC[2]
+.fvec LF[2]
+.fvec LA[2]
+.fvec LK[2]
+.fvec LD[2]
 .bool cpu
 .bool lit
+.bool l0
+.bool l1
+.bool a0
+.bool a1
+.bool s0
+.bool s1
 .bool tu0
 .bool tu1
 .bool tu2
@@ -87,12 +103,113 @@
 		mul r5, CS, r5
 		add r5, CM, r5
 
-		; shade from the view-space normal (one fixed light, as the CPU path)
+		; GX lighting: the material times clamp(AMB + the lights)
 		ifu lit
-			dp3 r4.y, N[a0.x], v1
-			max r4.y, k0.yyyy, r4.y
-			add r4.y, LD.xxxx, r4.y
-			mul r5.xyz, r4.yyy, r5.xyz
+			dp3 r4.x, N[a0.x], v1
+			dp3 r4.y, N[a0.x+1], v1
+			dp3 r4.z, N[a0.x+2], v1
+			dp3 r4.w, r4, r4
+			add r4.w, k1.yyyy, r4.w
+			rsq r4.w, r4.w
+			mul r4.xyz, r4.www, r4.xyz
+			mov r3, AMB
+			ifu l0
+				mov r2, -r1
+				add r2, LP[0], r2
+				dp3 r2.w, r2, r2
+				add r2.w, k1.yyyy, r2.w
+				rsq r6.x, r2.w
+				mul r2.xyz, r6.xxx, r2.xyz
+				dp3 r7.x, r4, r2
+				max r7.x, LF[0].xxxx, r7.x
+				mul r7.x, LF[0].yyyy, r7.x
+				add r7.x, LF[0].zzzz, r7.x
+				ifu a0
+					; r8 = (1, d, d^2): the distance term LK . r8; r9 = (1, c, c^2): the angle term LA . r9
+					mov r8.x, k0.x
+					mul r8.y, r2.w, r6.x
+					mov r8.z, r2.w
+					dp3 r8.w, LK[0], r8
+					max r8.w, k1.yyyy, r8.w
+					rcp r8.w, r8.w
+					mov r9.x, k0.x
+					dp3 r9.y, LD[0], r2
+					max r9.y, k0.yyyy, r9.y
+					mul r9.z, r9.y, r9.y
+					dp3 r9.w, LA[0], r9
+					max r9.w, k0.yyyy, r9.w
+					mul r9.w, r8.w, r9.w
+					mul r7.x, r9.w, r7.x
+				.end
+				ifu s0
+					; r9 = (1, c, c^2)
+					dp3 r8.x, r4, r2
+					slt r8.x, k0.yyyy, r8.x
+					dp3 r9.y, LD[0], r4
+					max r9.y, k0.yyyy, r9.y
+					mul r9.y, r8.x, r9.y
+					mul r9.z, r9.y, r9.y
+					mov r9.x, k0.x
+					dp3 r9.w, LA[0], r9
+					max r9.w, k0.yyyy, r9.w
+					dp3 r8.w, LK[0], r9
+					max r8.w, k1.yyyy, r8.w
+					rcp r8.w, r8.w
+					mul r7.x, r9.w, r8.w
+				.end
+				mul r2, LC[0], r7.xxxx
+				add r3, r3, r2
+			.end
+			ifu l1
+				mov r2, -r1
+				add r2, LP[1], r2
+				dp3 r2.w, r2, r2
+				add r2.w, k1.yyyy, r2.w
+				rsq r6.x, r2.w
+				mul r2.xyz, r6.xxx, r2.xyz
+				dp3 r7.x, r4, r2
+				max r7.x, LF[1].xxxx, r7.x
+				mul r7.x, LF[1].yyyy, r7.x
+				add r7.x, LF[1].zzzz, r7.x
+				ifu a1
+					; r8 = (1, d, d^2): the distance term LK . r8; r9 = (1, c, c^2): the angle term LA . r9
+					mov r8.x, k0.x
+					mul r8.y, r2.w, r6.x
+					mov r8.z, r2.w
+					dp3 r8.w, LK[1], r8
+					max r8.w, k1.yyyy, r8.w
+					rcp r8.w, r8.w
+					mov r9.x, k0.x
+					dp3 r9.y, LD[1], r2
+					max r9.y, k0.yyyy, r9.y
+					mul r9.z, r9.y, r9.y
+					dp3 r9.w, LA[1], r9
+					max r9.w, k0.yyyy, r9.w
+					mul r9.w, r8.w, r9.w
+					mul r7.x, r9.w, r7.x
+				.end
+				ifu s1
+					; r9 = (1, c, c^2)
+					dp3 r8.x, r4, r2
+					slt r8.x, k0.yyyy, r8.x
+					dp3 r9.y, LD[1], r4
+					max r9.y, k0.yyyy, r9.y
+					mul r9.y, r8.x, r9.y
+					mul r9.z, r9.y, r9.y
+					mov r9.x, k0.x
+					dp3 r9.w, LA[1], r9
+					max r9.w, k0.yyyy, r9.w
+					dp3 r8.w, LK[1], r9
+					max r8.w, k1.yyyy, r8.w
+					rcp r8.w, r8.w
+					mul r7.x, r9.w, r8.w
+				.end
+				mul r2, LC[1], r7.xxxx
+				add r3, r3, r2
+			.end
+			max r3, k0.yyyy, r3
+			min r3, k0.xxxx, r3
+			mul r5, r3, r5
 		.end
 		mov outclr, r5
 

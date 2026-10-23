@@ -14,7 +14,7 @@ static int8_t scale_axis(int16_t v)
 static void read_now(Pad3DSStatus* out)
 {
 	memset(out, 0, sizeof(*out));
-	u32 held = hidKeysHeld();
+	u32 held = hidKeysHeld() | pad3ds_script;
 
 	if (held & KEY_DLEFT)  out->button |= P3DS_BUTTON_LEFT;
 	if (held & KEY_DRIGHT) out->button |= P3DS_BUTTON_RIGHT;
@@ -45,6 +45,7 @@ static void read_now(Pad3DSStatus* out)
  * the latest reading (pad3ds_read): HID is touched by one thread only, and never after the main
  * thread starts shutting the services down. */
 static Pad3DSStatus s_latest;
+volatile uint32_t pad3ds_script;
 static LightLock s_lock = 1; /* 1: unlocked */
 volatile int pad3ds_quit;
 volatile int pad3ds_parked;
