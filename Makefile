@@ -81,6 +81,9 @@ SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel16subframeCallbackEv -Wl,--wrap=_ZN8JA
 # back to JAudio's audio thread.
 SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_
 SMSLIBS  += -Wl,--wrap=_ZN8JASystem6Kernel19registerMixCallbackEPFPslEh
+# Every GPU command through platform/3ds/pica/gpucmd_add.c's GPUCMD_Add (libctru's, in fewer
+# instructions: the same words).
+SMSLIBS  += -Wl,--wrap=GPUCMD_Add
 # The game, GX and pc-port platform units use 4-byte enums (GameCube ABI); libctru, newlib
 # and libstdc++ use variable-size ones. Expected, and checked where structs cross over.
 SMSLIBS  += -Wl,--no-enum-size-warning

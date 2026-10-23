@@ -73,6 +73,7 @@ int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // director in its play state, drawing a scene. It may also give perf_timers and draw_state_check,
 // as settings.txt does, and gx_detail (on: the GX thread's commands timed, as in profile runs).
 static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
+static bool s_statusDraw = true;  // autorun.txt status_screen = off: the bottom screen not redrawn
 extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
 extern "C" void SMS3DS_TimelineReport(void);
 // autorun.txt game_thread_core (profiling in Azahar, whose debugger stub reads fresh registers only
@@ -439,6 +440,8 @@ extern "C" void GXPC_SetStateBlockOps(int mode);  // patch 0038: state resets as
 extern "C" int SMS3DS_ResetTexOnce;  // decomp patch 3ds-0024: the lights' reset loads its textures once
 extern "C" int SMS3DS_TelopClip;     // decomp patch 3ds-0026: the ticker's glyphs outside its window left out
 extern "C" int SMS3DS_NameCache;     // decomp patch 3ds-0029: the event watcher's name lookups cached
+extern "C" int SMS3DS_RankCheck;     // decomp patch 3ds-0031: the scene sound's reused distances checked
+extern "C" void GX3DS_StartZoneSampler(void);  // gx3ds_backend.cpp: autorun.txt gx_zones
 extern "C" void GX3DS_SetPerfTimers(int on);  // gx3ds_backend.cpp: the [perf] breakdown by phase timed
 extern "C" void GX3DS_SetDrawStateCheck(int on);  // ... draws taking the last draw's setup checked
 extern "C" int GXPC_Detail;  // patch 0027: the GX thread's command timing, as in profile runs
@@ -614,7 +617,10 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "name_cache", v, sizeof v))
 			SMS3DS_NameCache = strcmp(v, "off") == 0 ? 0 : strcmp(v, "verify") == 0 ? 2 : 1;
 		if (setting_value(kSettingsPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
-		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
+		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) {
+			GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
+			SMS3DS_RankCheck = strcmp(v, "on") == 0;
+		}
 		static const char kAutoPath[] = SMS_DIR "/autorun.txt";
 		if (setting_value(kAutoPath, "boot_stage", v, sizeof v)) {
 			int stage = -1, scenario = 0;
@@ -628,8 +634,14 @@ static void* game_thread(void*)
 		if (setting_value(kAutoPath, "quit_after", v, sizeof v)) s_quitAfter = atoi(v);
 		if (setting_value(kAutoPath, "timeline", v, sizeof v)) s_timelineAt = atoi(v);
 		if (setting_value(kAutoPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
-		if (setting_value(kAutoPath, "draw_state_check", v, sizeof v)) GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
+		if (setting_value(kAutoPath, "draw_state_check", v, sizeof v)) {
+			GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
+			SMS3DS_RankCheck = strcmp(v, "on") == 0;
+		}
 		if (setting_value(kAutoPath, "gx_detail", v, sizeof v) && strcmp(v, "on") == 0) GXPC_Detail = 1;
+		if (setting_value(kAutoPath, "status_screen", v, sizeof v) && strcmp(v, "off") == 0) s_statusDraw = false;
+		// gx_zones = on: the GX thread's zones sampled (a GX library built with GX_ZONES=1).
+		if (setting_value(kAutoPath, "gx_zones", v, sizeof v) && strcmp(v, "on") == 0) GX3DS_StartZoneSampler();
 		if (setting_value(kAutoPath, "profile_auto", v, sizeof v)) s_profAuto = atoi(v);
 		if (setting_value(kAutoPath, "profile_auto_quit", v, sizeof v)) s_profAutoQuit = strcmp(v, "on") == 0;
 		if (SMS3DS_DemoStage >= 0 || s_profAuto > 0 || s_quitAfter > 0)
@@ -733,7 +745,7 @@ static void status_thread(void*) {
 		if (!s_statusRun) break;
 		uint32_t s[7];
 		GX3DS_GetStats(s);
-		draw_status(s);
+		if (s_statusDraw) draw_status(s);
 		static unsigned n;
 		if (++n % 2 == 0) flush_log();  // the log's SD write, once a second, off the game's core too
 	}

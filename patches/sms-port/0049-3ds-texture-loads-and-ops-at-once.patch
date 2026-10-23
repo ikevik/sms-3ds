@@ -1,0 +1,150 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -2354,9 +2354,31 @@
+ void GXInitTexObjUserData(GXTexObj* obj, void* user) { reinterpret_cast<TexObjInt*>(obj)->user = user; }
+ void* GXGetTexObjUserData(const GXTexObj* obj) { return reinterpret_cast<const TexObjInt*>(obj)->user; }
+ 
++#if defined(__3DS__)
++// 3DS port: J3D and the game load the same null texture into all eight maps before many draws
++// (J3DSys::reinitTexture, ReInitTexture: ~40% of the game thread's BP writes on Delfino Plaza),
++// nearly always what each map holds already. When the write filter would leave out every register
++// such a load writes, they are left out here at once, as apiBP leaves each out (the API's copy
++// set, the count kept): the same bytes in the stream, without four calls of apiBP.
++static bool texLoadFiltered(const TexObjInt* t, int map) {
++    if (!fltActive() || s_fltCheck || s_fltMaskNext || s_sbVirtual || apiMuted() || t->isCI) return false;
++    const uint32_t r[4] = {bpTexReg(BP_TX_MODE0, map), bpTexReg(BP_TX_MODE1, map), bpTexReg(BP_TX_IMAGE0, map),
++                           bpTexReg(BP_TX_IMAGE3, map)};
++    const uint32_t v[4] = {t->mode0 & 0xFFFFFF, t->mode1 & 0xFFFFFF, t->image0 & 0xFFFFFF,
++                           (ptrToPhys(t->image) >> 5) & 0xFFFFFF};
++    for (int k = 0; k < 4; k++)
++        if (s_genOfBP[r[k]] != s_genBP || s_fltBP[r[k]] != v[k]) return false;
++    for (int k = 0; k < 4; k++) GA.bp[r[k]] = v[k];
++    GXPC_FilterDropped[0] += 4;
++    return true;
++}
++#endif
+ void GXLoadTexObjPreLoaded(GXTexObj* obj, GXTexRegion*, GXTexMapID id) {
+     const TexObjInt* t = reinterpret_cast<const TexObjInt*>(obj);
+     int map = int(id) & 7;
++#if defined(__3DS__)
++    if (texLoadFiltered(t, map)) goto image;
++#endif
+     apiBP(bpTexReg(BP_TX_MODE0, map), t->mode0);
+     apiBP(bpTexReg(BP_TX_MODE1, map), t->mode1);
+     apiBP(bpTexReg(BP_TX_IMAGE0, map), t->image0);
+@@ -2369,6 +2391,7 @@
+     }
+     if (!s_recording && !g_gxStream) GA.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
+ #if defined(__3DS__)
++image:
+     if (!s_recording && g_gxStream) {  // (the same on the GX thread: BP_TX_IMAGE3 cannot hold it)
+         uint8_t a[5];
+         a[0] = uint8_t(map);
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -1109,10 +1109,21 @@
+     if (!src) return;
+     uint32_t words[16];
+     bool be = g.arrayBigEndian[slot];
++#if defined(__3DS__)
++    // 3DS port: a word at a time (an unaligned load where it must be; ARMv6K), the little-endian
++    // elements (the matrices the port works out in host order, most of these loads) as they are,
++    // not built from four byte loads: the same words, read once each into this copy.
++    if (be) {
++        for (uint32_t k = 0; k < cnt; k++) words[k] = be32(src + k * 4);
++    } else {
++        for (uint32_t k = 0; k < cnt; k++) memcpy(&words[k], src + k * 4, 4);
++    }
++#else
+     for (uint32_t k = 0; k < cnt; k++)
+         words[k] = be ? be32(src + k * 4)
+                       : (uint32_t(src[k * 4]) | uint32_t(src[k * 4 + 1]) << 8 | uint32_t(src[k * 4 + 2]) << 16 |
+                          uint32_t(src[k * 4 + 3]) << 24);
++#endif
+ #if defined(__3DS__)
+     // values from memory: a game-side filter cannot know them, wherever the load came from
+     if (wrStudy())
+@@ -1637,8 +1648,41 @@
+ #endif
+     const uint8_t* start = p;
+     const uint8_t* end = p + n;
++#if defined(__3DS__)
++    // 3DS port: the register writes (most commands) go straight to their writers while none of the
++    // tests below would do anything: no list being recorded, no native J3D registers to hand over,
++    // no J3D exit to count, no profile counters (GXPC_Detail). Those change only in the other
++    // commands (the stream's ops, list calls, special BP registers), after each of which `plain`
++    // is worked out again.
++    bool plain = false;
++#endif
+     while (p < end) {
+         uint8_t op = p[0];
++#if defined(__3DS__)
++        if (plain) {
++            if (op == 0x61 && !s_bpSpecial.is[p[1]]) {
++                if (end - p < 5) break;
++                CMD_COUNT(4);
++                writeBP(be32(p + 1));
++                p += 5;
++                continue;
++            }
++            if (op == 0x08) {
++                if (end - p < 6) break;
++                CMD_COUNT(5);
++                writeCP(p[1], be32(p + 2));
++                p += 6;
++                continue;
++            }
++            if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) {
++                if (end - p < 5) break;
++                CMD_COUNT(3);
++                loadIndexedXF(op, be16(p + 1), be16(p + 3));
++                p += 5;
++                continue;
++            }
++        }
++#endif
+         uint32_t avail = uint32_t(end - p);
+         uint32_t len;
+         if (op == 0x00 || op == 0x48 || op == 0x44) {  // NOP, invalidate vtx cache, unknown sync
+@@ -1760,6 +1804,7 @@
+                 GXPC_OpTimed[k]++;
+             }
+         }
++        plain = !s_dlRec && !s_np.any && !s_j3dExit && !GXPC_Detail;
+ #endif
+         p += len;
+         continue;
+@@ -3585,8 +3630,33 @@
+ #endif
+ 
+ #if defined(__3DS__)
++}  // namespace gx
++// 3DS port: set by the GX thread (gx3ds_backend.cpp) while it waits for the next chunk.
++extern "C" {
++volatile int GXPC_GxIdle;
++}
++namespace gx {
+ // Streamed GX: settings the GX thread reads go through the stream, in order with the draws.
+ static void streamOp(uint8_t op, const uint8_t* args, uint32_t n) {
++    // 3DS port: the op and its arguments straight into the buffer when they fit (nearly always):
++    // the same bytes, without two pipePut calls and a memcpy of one byte (the game thread sends
++    // thousands a frame: list calls, texture images).
++    if (g_gxStream && !s_mute && s_pipeLen + 1 + n <= GXPC_PipeFast) {
++        uint8_t* p = s_pipeBuf + s_pipeLen;
++        p[0] = op;
++        if (n <= 8) {
++            for (uint32_t i = 0; i < n; i++) p[1 + i] = args[i];
++        } else {
++            memcpy(p + 1, args, n);
++        }
++        s_pipeLen += 1 + n;
++        GXPC_StreamPuts += n ? 2 : 1;  // (as the two pipePut calls count)
++        // While the GX thread waits for work (each frame's start, where the game's first draws
++        // come slowly and an 8 KB chunk took ~2 ms to fill, on the frame's critical path in
++        // Azahar), what is here goes to it at once: the same commands, handed over sooner.
++        if (GXPC_GxIdle && s_pipeLen >= 512) streamSwap();
++        return;
++    }
+     pipePut(&op, 1);
+     if (n) pipePut(args, n);
+ }

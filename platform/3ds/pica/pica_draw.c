@@ -1143,7 +1143,7 @@ int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
 	return 1;
 }
 
-static void apply_state(const PicaState* st);
+static void apply_state(const PicaState* st, uint32_t same);
 static void second_pass(GPU_Primitive_t prim, int count, const void* idx, const PicaState* st);
 static void gpu_check(const char* kind, const PicaGxLayout* L, uint32_t nidx, const PicaState* st);
 
@@ -1340,16 +1340,33 @@ static void gx_light_vectors(const float (*nrm_rows)[4], const float LD[4])
 
 /* The setup a GX-mode draw needs (attribute loaders, state, uniforms, shortcuts, buffer): 0 when the
  * layout cannot be expressed. */
+/* pica_draw_same (pica_draw.h), taken once by each draw: the number the caller gave with the state
+ * object s_last was set from (apply_state: s_sameSrc, s_sameState) and with the layout gx_setup
+ * last took (s_sameLayout). */
+uint32_t pica_draw_same;
+static const PicaState* s_sameSrc;
+static uint32_t s_sameState, s_sameLayout;
+
+/* Field by field (no padding: the bytes memcmp compared), without a call. */
+static inline int gx_layout_same(const PicaGxLayout* a, const PicaGxLayout* b)
+{
+	return a->stride == b->stride && a->off_nrm == b->off_nrm && a->off_clr == b->off_clr && a->off_tex[0] == b->off_tex[0] &&
+	       a->off_tex[1] == b->off_tex[1] && a->off_tex[2] == b->off_tex[2] && a->off_mtx == b->off_mtx &&
+	       a->fixed_idx == b->fixed_idx;
+}
+
 static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, uint32_t matrices_dirty,
-                    const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st);
+                    const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st, uint32_t same);
 
 int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
                  const PicaGxUniforms* u, uint32_t matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
                  const PicaState* st)
 {
 	(void)nverts;
+	const uint32_t same = pica_draw_same;
+	pica_draw_same = 0;
 	if (!s_in_frame || nidx == 0) return 1;
-	if (!gx_setup(verts, L, u, matrices_dirty, pos_rows, nrm_rows, st)) return 0;
+	if (!gx_setup(verts, L, u, matrices_dirty, pos_rows, nrm_rows, st, same)) return 0;
 	if (s_gpuTest == 3) return 1;  /* the setup without the draw */
 	s_frameDraws++;
 	s_stat[ST_DRAW]++;
@@ -1361,7 +1378,7 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 }
 
 static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, uint32_t matrices_dirty,
-                    const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st)
+                    const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st, uint32_t same)
 {
 	static PicaGxLayout s_posOnly;
 	if (s_gpuTest == 6) { /* only the position and the matrix index fetched */
@@ -1370,7 +1387,10 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 		for (int k = 0; k < 3; k++) s_posOnly.off_tex[k] = -1;
 		L = &s_posOnly;
 	}
-	if (s_mode != MODE_GX || !s_gxLayoutValid || memcmp(L, &s_gxLayout, sizeof *L) != 0) {
+	/* (same: the layout is as when gx_setup last took it, with the same number) */
+	const int layoutSame = same && same == s_sameLayout;
+	s_sameLayout = same;
+	if (s_mode != MODE_GX || !s_gxLayoutValid || (!layoutSame && !gx_layout_same(L, &s_gxLayout))) {
 		u64 perm;
 		int n = gx_attribs(L, &perm);
 		if (!n) {
@@ -1388,7 +1408,7 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 		}
 		if (!s_gxMatricesLoaded) matrices_dirty = (1u << PICA_GX_MTX_ROWS) - 1;
 	}
-	apply_state(st);
+	apply_state(st, same);
 	if (!s_gxMatricesLoaded) memset(s_lnValid, 0, sizeof s_lnValid);  /* uniforms set elsewhere (self-test, [vbench]) */
 	if (matrices_dirty || !s_gxMatricesLoaded) {
 		/* the rows whose XF words changed (bit r), or all of them when the uniforms were set elsewhere:
@@ -1489,8 +1509,13 @@ static void set_stage(int i, const PicaTevStage* s)
 	env->color = s->color;
 }
 
-static void apply_state(const PicaState* st)
+static void apply_state(const PicaState* st, uint32_t same)
 {
+	/* the caller's number (pica_draw_same): *st is what it was when s_last was set from it
+	 * (s_last = *st, below, or the compare found them equal), so the compare would again */
+	if (same && s_last_valid && st == s_sameSrc && same == s_sameState) return;
+	s_sameSrc = st;
+	s_sameState = same;
 	const PicaState* L = s_last_valid ? &s_last : NULL;
 	if (L && memcmp(st, L, sizeof *st) == 0) return;
 	if (s_skipOff) L = NULL;
@@ -1591,8 +1616,10 @@ static void apply_state(const PicaState* st)
 
 void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nidx, const PicaState* st)
 {
+	const uint32_t same = pica_draw_same;
+	pica_draw_same = 0;
 	if (!s_in_frame || nidx == 0) return;
-	apply_state(st);
+	apply_state(st, same);
 	cpu_mode();
 	set_buffer(verts, sizeof(PicaVtx), 5, 0x43210);
 	s_frameDraws++;
@@ -2205,6 +2232,15 @@ int pica_gx_thread_start(void (*fn)(void*), void* arg)
 }
 void pica_event_wait(int i) { LightEvent_Wait(&s_evt[i]); }
 void pica_event_signal(int i) { LightEvent_Signal(&s_evt[i]); }
+/* A thread polling for another core's work, between checks: an address arbitration nobody waits
+ * on. It does nothing on hardware but a kernel call; in Azahar, which runs the cores in turn, a
+ * slice at a time, it ends the caller's slice there, so the other cores' work shows up at once
+ * instead of at the slice's end (the game thread polled up to ~2 ms for the GX thread's frame). */
+void pica_poll_pause(void)
+{
+	static s32 nobody;
+	syncArbitrateAddress(&nobody, ARBITRATION_SIGNAL, 1);
+}
 
 /* ---- hardware self-test ------------------------------------------------------------------ */
 /* Runs the pieces of a game frame one frame at a time and logs each: a piece the GPU never
@@ -2269,7 +2305,7 @@ static void selftest_quad56(shaderProgram_s* prog, int gx)
 	st.blend_src = st.blend_asrc = GPU_ONE;
 	st.blend_dst = st.blend_adst = GPU_ZERO;
 	s_last_valid = 0;
-	apply_state(&st);
+	apply_state(&st, 0);
 	C3D_AttrInfo* ai = C3D_GetAttrInfo();
 	AttrInfo_Init(ai);
 	AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3);
@@ -2491,7 +2527,7 @@ static void vb_run(const char* name, const void* verts, int stride, const struct
 	st.blend_src = st.blend_asrc = GPU_ONE;
 	st.blend_dst = st.blend_adst = GPU_ZERO;
 	s_last_valid = 0;
-	apply_state(&st);
+	apply_state(&st, 0);
 	vb_uniforms(pscale, lit, tex);
 	s_bufValid = 0;
 	set_buffer(verts, stride, nf, perm);
@@ -2565,7 +2601,7 @@ static void vb_run_min(const char* name, const void* verts, const uint16_t* idx,
 	st.blend_src = st.blend_asrc = GPU_ONE;
 	st.blend_dst = st.blend_adst = GPU_ZERO;
 	s_last_valid = 0;
-	apply_state(&st);
+	apply_state(&st, 0);
 	s_bufValid = 0;
 	set_buffer(verts, 16, 2, 0x10);
 	for (int r = 0; r < reps; r++) C3D_DrawElements(GPU_TRIANGLES, nidx, C3D_UNSIGNED_SHORT, idx);

@@ -63,6 +63,11 @@ static uint64_t s_reuse[2 + kRunStat], s_reuse0[2 + kRunStat];
 // not XF memory, the matrices), the draws that came with none since the last draw, and the draws
 // that took the last draw's setup (drawTriangles), for the [perf] lines.
 static uint32_t s_rsGen, s_rsGenLastDraw, s_drawsSameState, s_drawsCounted, s_drawsFast;
+// The draw state's generation (pica_draw_same, pica_draw.h): changed whenever drawTriangles works
+// the PICA state out afresh for a change (not for a draw_state_check rebuild of an unchanged one,
+// which the check compares) or a CPU-path draw changes its projection flag; so a draw with the same
+// number gives pica_draw the same state and layout as the last, and its compares are skipped.
+static uint32_t s_stGen = 1;
 // settings.txt draw_state_check (GX3DS_SetDrawStateCheck): the draws that could take the last draw's
 // setup work it out, compared with it (checked, differing).
 static bool s_fpCheck;
@@ -196,6 +201,18 @@ static uint32_t s_rFrames;         // display copies the render side has done
 // kPerfFrames frames for the status screen and logged as [perf] lines. "other" is the rest of the
 // frame: game logic, the GX front half (command parsing, vertex decoding) and waiting.
 extern "C" void SMS3DS_TimelineEvent(int who, int what);  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
+extern "C" unsigned SMS3DS_RankStats[2];  // prof_3ds.cpp: decomp patch 3ds-0031's check (checked, differing)
+extern "C" int GXPC_FastListCheck;  // gx_fifo.cpp: state lists' register words checked (with draw_state_check)
+extern "C" uint32_t GXPC_FastListStats[2];  // ... lists checked, differing
+extern "C" volatile int GXPC_GxIdle;  // gx_fifo.cpp: the game thread hands over partial chunks while set
+// The GX thread's zone (gx_internal.h, GX_ZONES builds), sampled by a thread on core 2 every 100 us
+// (prof_3ds.cpp, autorun.txt gx_zones): the samples by zone, for the [perf] lines.
+extern "C" {
+volatile uint8_t GXPC_Zone;
+volatile uint32_t GX3DS_ZoneHist[gx::GZ_COUNT];
+extern const int GX3DS_ZoneCount = gx::GZ_COUNT;
+int GX3DS_ZoneSampling;  // prof_3ds.cpp: the sampler runs
+}  // prof_3ds.cpp: decomp patch 3ds-0031's check (checked, differing)
 extern "C" uint64_t svcGetSystemTick(void);
 // The "other" breakdown: GX command parsing and display-list calls (gx_fifo.cpp, patch 0006; it
 // includes our draw work done inside them), the emulated OS's idle time (no game thread runnable:
@@ -433,9 +450,14 @@ static void perfFrameEnd() {
 		        double(s_tevClears - c0) / frames, unsigned(s_tevEntries), part[0], part[1], part[2], part[3],
 		        double(s_drawsSameState - sd0) / frames, double(s_drawsCounted - dc0) / frames,
 		        double(s_drawsFast - df0) / frames);
-		if (s_fpCheck)
+		if (s_fpCheck) {
 			fprintf(stderr, "[perf]   draw state check: %lu draws so far worked out where the last draw's setup would have "
 			        "been taken, %lu differing\n", (unsigned long)s_fpChecked, (unsigned long)s_fpDiffer);
+			fprintf(stderr, "[perf]   scene sound ranking check: %u distances so far reused and worked out again, %u "
+			        "differing\n", SMS3DS_RankStats[0], SMS3DS_RankStats[1]);
+			fprintf(stderr, "[perf]   state lists' register words check: %u lists so far replayed both ways, %u differing\n",
+			        (unsigned)GXPC_FastListStats[0], (unsigned)GXPC_FastListStats[1]);
+		}
 		sd0 = s_drawsSameState;
 		dc0 = s_drawsCounted;
 		df0 = s_drawsFast;
@@ -3142,6 +3164,7 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 		}
 	}
 	PerfScope ps(PERF_SUBMIT);
+	pica_draw_same = s_stGen;
 	if (!pica_draw_gx(vb, n, &lay, ib, nidx, &u, dirty, s_posRows, s_nrmRows, &st)) {
 		if (dirty) {  // the rows' uniforms were not compared: again at the next draw
 			s_posDirty |= dirty;
@@ -3223,6 +3246,7 @@ static void drawTriangles() {
 		s_drawsFast++;
 	} else {
 		if (same) s_fpOld = s_fp;
+		else if (++s_stGen == 0) s_stGen = 1;
 		memset(ptex, 0, sizeof ptex);
 		memset(pcopy, 0, sizeof pcopy);
 		translated = true;
@@ -3408,7 +3432,11 @@ static void drawTriangles() {
 	// it shows the wrong part of the screen. q travels in unit 2's coordinate, so unit 2 must be free.
 	if (utex[0] && !utex[2]) {
 		const uint32_t tg0 = rs.xfReg[XFR_TEXGEN + ucoord[0]];
-		st.proj0 = ((tg0 >> 1) & 1) && ((tg0 >> 4) & 7) == 0;
+		const bool proj0 = ((tg0 >> 1) & 1) && ((tg0 >> 4) & 7) == 0;
+		if (st.proj0 != proj0) {
+			st.proj0 = proj0;
+			if (++s_stGen == 0) s_stGen = 1;
+		}
 	}
 	PicaVtx* out;
 	uint16_t* oidx;
@@ -3597,7 +3625,10 @@ static void drawTriangles() {
 	perfAdd(PERF_XFORM, perfTick() - perfXform0);
 	{
 		PerfScope ps(PERF_SUBMIT);
-		if (submit) pica_draw_triangles(out, oidx, nidx, &st);
+		if (submit) {
+			pica_draw_same = s_stGen;
+			pica_draw_triangles(out, oidx, nidx, &st);
+		}
 	}
 }
 
@@ -3924,6 +3955,7 @@ static void writeState(uint8_t* dst) {
 }
 
 static void emitState() {
+	GX_ZONE(GZ_STATE_REC);
 	const uint32_t n = stateBytes();
 	if (!n) return;
 	const uint32_t size = (uint32_t(sizeof(RecHdr)) + n + 7) & ~7u;
@@ -4157,6 +4189,7 @@ void j3dBatchNative(bool native) {
 	s_bNative = native;
 }
 void j3dStateOut() {
+	GX_ZONE(GZ_J3D_OUT);
 	rcInit();
 	if (!stateBytes()) return;
 	if (batchHasVertices()) flushBatch();
@@ -4324,6 +4357,7 @@ static void renderMain(void*) {
 
 void flushBatch() {
 	if (!s_ready) return;
+	GX_ZONE(GZ_DRAW_REC);
 	PerfScopeExcl ps(PERF_BATCH);
 	if (batchHasVertices()) {
 		rcInit();
@@ -4353,6 +4387,7 @@ static inline void cutCheck() {
 }
 
 uint8_t* primitiveBegin(uint8_t op, uint32_t n, uint32_t fmt, uint32_t stride) {
+	GX_ZONE(GZ_PRIM_BEGIN);
 	PrimClass cls = primClass(op);
 	cutCheck();
 	if (batchHasVertices() && (cls != s_bclass || fmt != s_bfmt || s_bArena)) flushBatch();
@@ -4413,6 +4448,7 @@ uint32_t primitiveIndices(uint8_t op, uint32_t n, uint32_t base, uint32_t* w) {
 }
 
 void primitiveEnd(uint8_t op, uint32_t n) {
+	GX_ZONE(GZ_PRIM_END);
 	if (s_decodeT0) {
 		perfAdd(PERF_DECODE, svcGetSystemTick() - s_decodeT0);
 		s_decodeT0 = 0;
@@ -4917,6 +4953,13 @@ static uint32_t s_sFramesSent;                         // ... and the game threa
 static bool s_gxWanted = true, s_streamOn;
 static std::atomic<uint64_t> s_sWait[4];  // game thread waiting: a free chunk, the frame's end, a drain, a list rewrite
 static std::atomic<uint64_t> s_sBusy{0}, s_sIdle{0};  // GX thread: parsing, waiting for chunks
+// 3DS port: each thread signals the other's event only while that one waits on it (GXPC_GxIdle for the
+// GX thread, s_gameWaits for the game thread): a signal is a kernel call, which costs a lot in Azahar,
+// and there were two a chunk. Each sets its flag, then (a full fence between) tests its condition
+// again before it waits; the other publishes its change, then (a fence) tests the flag: one of the
+// two sees the other's write, so no wake-up is lost (the events are one-shot: a spare signal only
+// ends one wait early, and every wait is in a loop).
+static std::atomic<int> s_gameWaits{0};
 enum { EV_GX = 2, EV_GAME = 3 };
 
 // Game thread: waits until ready() (the GX thread signals EV_GAME as it releases chunks and frames).
@@ -4925,7 +4968,21 @@ static void streamWait(std::atomic<uint64_t>& acc, F ready) {
 	if (ready()) return;
 	const uint64_t t0 = svcGetSystemTick();
 	SMS3DS_SampWaiting = int(&acc - s_sWait) + 1;
-	while (!ready()) pica_event_wait(EV_GAME);
+	// Polled for up to 2 ms before it sleeps, a pause between checks (pica_poll_pause): Azahar runs the
+	// cores in turn, a slice at a time, and the game thread saw the GX thread's frame done only at its
+	// slice's end, 1.2-1.4 ms after the signal at each frame's end, sleeping or not.
+	for (uint32_t i = 1;; i++) {
+		if (ready()) break;
+		pica_poll_pause();
+		if ((i & 15) == 0 && svcGetSystemTick() - t0 > uint64_t(2.0 * kTicksPerMs)) break;
+	}
+	for (;;) {
+		s_gameWaits.store(1, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		if (ready()) break;
+		pica_event_wait(EV_GAME);
+	}
+	s_gameWaits.store(0, std::memory_order_relaxed);
 	SMS3DS_SampWaiting = 0;
 	acc += svcGetSystemTick() - t0;
 }
@@ -4946,7 +5003,8 @@ static uint8_t* streamSwap(uint8_t* buf, uint32_t len, uint32_t* cap) {
 		s_sBytesSent += len;
 		s_sLen[s_sHead.load(std::memory_order_relaxed) % kStreamChunks] = len;
 		s_sHead.fetch_add(1, std::memory_order_release);
-		pica_event_signal(EV_GX);
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		if (GXPC_GxIdle) pica_event_signal(EV_GX);  // (only while the GX thread waits: see s_gameWaits)
 	}
 	const uint32_t h = s_sHead.load(std::memory_order_relaxed);
 	streamWait(s_sWait[0], [h] { return h - s_sTail.load(std::memory_order_acquire) < kStreamChunks; });
@@ -4983,6 +5041,15 @@ static uint8_t* streamSwap(uint8_t* buf, uint32_t len, uint32_t* cap) {
 static uint32_t* s_dlMark;  // per 32-byte block of MEM1: 1 + the chunk of its last call (0: none)
 static uint8_t* s_dlRw;     // per 32-byte block of MEM1: rwStamp of its last GDInitGDLObj (0: never)
 static uint32_t s_dlBlocks, s_dlWaits, s_dlCopies, s_dlCopyBytes;
+// 3DS port: the same by 4 KB page, so that the lists in pages no list was ever written in (the
+// models' shapes, hundreds of blocks a call) cost a store a page, not one a block. A page's block
+// marks are kept only once a list in it has been written (s_dlPageRw): until then its page mark
+// stands for each of its blocks (conservatively: a write waits for any call in the page), and its
+// first write starts its blocks at the page mark. In a page never written every s_dlRw is 0, so
+// streamCopyList's answer there is known without its blocks.
+static uint32_t* s_dlPageMark;  // per page: 1 + the chunk of the last call in it (0: none)
+static uint8_t* s_dlPageRw;     // per page: 1 once a list in it was written (GDInitGDLObj)
+static const uint32_t kDlPageShift = 7;  // 128 blocks a page
 static const uint32_t kDlCopyMax = 16u << 10, kDlCopyFrames = 4;
 static bool s_dlCopyOn = true;  // off (SELECT held at launch): every rewrite waits, as before copies
 static uint8_t rwStamp(uint32_t frame) { return uint8_t(frame % 255u + 1u); }
@@ -4999,14 +5066,19 @@ static void streamNoteDL(const void* list, uint32_t n) {
 	uint32_t b0, b1;
 	if (!mem1Blocks(list, n, b0, b1)) return;
 	const uint32_t mark = s_sHead.load(std::memory_order_relaxed) + 1;
-	uint32_t b = b0;
-	for (; b + 3 <= b1; b += 4) {  // (four a step: a shape's list spans hundreds of blocks)
-		s_dlMark[b] = mark;
-		s_dlMark[b + 1] = mark;
-		s_dlMark[b + 2] = mark;
-		s_dlMark[b + 3] = mark;
+	for (uint32_t pg = b0 >> kDlPageShift; pg <= b1 >> kDlPageShift; pg++) {
+		s_dlPageMark[pg] = mark;
+		if (!s_dlPageRw[pg]) continue;
+		uint32_t b = std::max(b0, pg << kDlPageShift);
+		const uint32_t e = std::min(b1, ((pg + 1) << kDlPageShift) - 1);
+		for (; b + 3 <= e; b += 4) {  // (four a step)
+			s_dlMark[b] = mark;
+			s_dlMark[b + 1] = mark;
+			s_dlMark[b + 2] = mark;
+			s_dlMark[b + 3] = mark;
+		}
+		for (; b <= e; b++) s_dlMark[b] = mark;
 	}
-	for (; b <= b1; b++) s_dlMark[b] = mark;
 }
 // Game thread, before it writes [p, p + n).
 static void streamBeforeWrite(const void* p, uint32_t n) {
@@ -5014,7 +5086,14 @@ static void streamBeforeWrite(const void* p, uint32_t n) {
 	if (!s_streamOn || !mem1Blocks(p, n, b0, b1)) return;
 	const uint32_t tail = s_sTail.load(std::memory_order_acquire);
 	int32_t ahead = 0;  // the latest call's chunk + 1, past the GX thread's
-	for (uint32_t b = b0; b <= b1; b++) ahead = std::max(ahead, int32_t(s_dlMark[b] - tail));
+	for (uint32_t pg = b0 >> kDlPageShift; pg <= b1 >> kDlPageShift; pg++) {
+		if (!s_dlPageRw[pg]) {
+			ahead = std::max(ahead, int32_t(s_dlPageMark[pg] - tail));
+			continue;
+		}
+		const uint32_t e = std::min(b1, ((pg + 1) << kDlPageShift) - 1);
+		for (uint32_t b = std::max(b0, pg << kDlPageShift); b <= e; b++) ahead = std::max(ahead, int32_t(s_dlMark[b] - tail));
+	}
 	if (ahead <= 0) return;  // read already (or never called)
 	const uint32_t mark = tail + uint32_t(ahead);
 	if (mark - 1 == s_sHead.load(std::memory_order_relaxed)) GXPC_StreamFlush();  // still being filled
@@ -5025,6 +5104,12 @@ static void streamBeforeWrite(const void* p, uint32_t n) {
 static void streamNoteRewrite(const void* p, uint32_t n) {
 	uint32_t b0, b1;
 	if (!s_streamOn || !mem1Blocks(p, n, b0, b1)) return;
+	for (uint32_t pg = b0 >> kDlPageShift; pg <= b1 >> kDlPageShift; pg++) {
+		if (s_dlPageRw[pg]) continue;
+		s_dlPageRw[pg] = 1;  // its blocks kept from here on, from its page mark
+		const uint32_t e = std::min(s_dlBlocks, (pg + 1) << kDlPageShift);
+		for (uint32_t b = pg << kDlPageShift; b < e; b++) s_dlMark[b] = s_dlPageMark[pg];
+	}
 	memset(s_dlRw + b0, rwStamp(s_sFramesSent), b1 - b0 + 1);
 }
 // Game thread, GXCallDisplayList: true when the call should carry the list's bytes.
@@ -5038,6 +5123,10 @@ static bool streamCopyList(const void* list, uint32_t n) {
 		if (age < 0) age += 255;
 		return uint32_t(age) <= kDlCopyFrames;
 	};
+	// Pages no list was ever written in: none of their blocks is recent.
+	uint32_t pg = b0 >> kDlPageShift;
+	while (pg <= b1 >> kDlPageShift && !s_dlPageRw[pg]) pg++;
+	if (pg > b1 >> kDlPageShift) return false;
 	// Blocks never rewritten (almost all) four at a time: a shape's list spans hundreds of blocks.
 	uint32_t b = b0;
 	bool hit = false;
@@ -5088,15 +5177,28 @@ static void streamTokenPoll() {
 static void gxMain(void*) {
 	std::vector<uint8_t> carry;  // a command the last chunk cut, and its whole length
 	uint32_t carryNeed = 0;
+	uint64_t woke = svcGetSystemTick();  // (busy time is counted up to each wait: the clock read only there)
 	for (;;) {
-		const uint64_t t0 = svcGetSystemTick();
-		const bool waits = s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire);
-		if (waits) SMS3DS_TimelineEvent(1, 0);
-		while (s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire)) pica_event_wait(EV_GX);
-		if (waits) SMS3DS_TimelineEvent(2, 0);
-		const uint64_t t1 = svcGetSystemTick();
-		s_sIdle += t1 - t0;
-		GX3DS_GxWaitTicks += t1 - t0;
+		if (s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire)) {
+			const uint64_t t0 = svcGetSystemTick();
+			s_sBusy += t0 - woke;
+			SMS3DS_TimelineEvent(1, 0);
+			GXPC_GxIdle = 1;  // (the game thread hands over what it has, and signals: streamOp, streamSwap)
+			GX_ZONE_SET(GZ_IDLE);
+			std::atomic_thread_fence(std::memory_order_seq_cst);
+			// polled for up to 2 ms first, as the game thread's waits (streamWait)
+			for (uint32_t i = 1; s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire); i++) {
+				pica_poll_pause();
+				if ((i & 15) == 0 && svcGetSystemTick() - t0 > uint64_t(2.0 * kTicksPerMs)) break;
+			}
+			while (s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire)) pica_event_wait(EV_GX);
+			GXPC_GxIdle = 0;
+			GX_ZONE_SET(GZ_CARRY);
+			SMS3DS_TimelineEvent(2, 0);
+			woke = svcGetSystemTick();
+			s_sIdle += woke - t0;
+			GX3DS_GxWaitTicks += woke - t0;
+		}
 		const uint32_t t = s_sTail.load(std::memory_order_relaxed);
 		const uint32_t buf = s_sBufOf[t % kStreamChunks];
 		const uint8_t* p = s_sChunk[buf];
@@ -5122,8 +5224,8 @@ static void gxMain(void*) {
 		}
 		s_sFree.fetch_or(1u << buf, std::memory_order_release);  // (before the chunk is marked done)
 		s_sTail.store(t + 1, std::memory_order_release);
-		pica_event_signal(EV_GAME);
-		s_sBusy += svcGetSystemTick() - t1;
+		std::atomic_thread_fence(std::memory_order_seq_cst);
+		if (s_gameWaits.load(std::memory_order_relaxed)) pica_event_signal(EV_GAME);  // (only while it waits)
 	}
 }
 
@@ -5140,7 +5242,10 @@ static void streamStart() {
 	s_dlBlocks = port_mem1_size >> 5;
 	s_dlMark = static_cast<uint32_t*>(calloc(s_dlBlocks, sizeof(uint32_t)));
 	s_dlRw = static_cast<uint8_t*>(calloc(s_dlBlocks, 1));
-	if (!s_dlMark || !s_dlRw) {
+	const uint32_t pages = (s_dlBlocks + (1u << kDlPageShift) - 1) >> kDlPageShift;
+	s_dlPageMark = static_cast<uint32_t*>(calloc(pages, sizeof(uint32_t)));
+	s_dlPageRw = static_cast<uint8_t*>(calloc(pages, 1));
+	if (!s_dlMark || !s_dlRw || !s_dlPageMark || !s_dlPageRw) {
 		fprintf(stderr, "[gx3ds] no memory for the GX thread's display-list marks: GX on the game thread\n");
 		return;
 	}
@@ -5182,6 +5287,26 @@ static void streamPerf(uint64_t& gameWait, double perMs, bool print) {
 	        double(w[1]) * perMs, double(w[2]) * perMs, double(w[3]) * perMs, unsigned(s_dlWaits - dlWaits0),
 	        unsigned(s_sHead.load() - s_sTail.load()), (s_dlCopies - dlCopies0) * perFrame,
 	        (s_dlCopyBytes - dlCopyBytes0) * perFrame / 1024.0);
+	if (GX3DS_ZoneSampling) {  // the zone sampler's shares since the last line
+		static const char* const kZone[gx::GZ_COUNT] = {
+		    "parse", "idle", "BP", "CP", "XF", "indexed XF", "list check", "list state", "list runs", "list uncached",
+		    "list record", "vertices", "state record", "draw record", "J3D material", "J3D shape", "J3D hand-over",
+		    "state block", "stream op", "copy", "chunk start", "vertex setup", "primitive begin", "primitive end",
+		    "J3D matrices", "J3D runs", "J3D state out"};
+		uint32_t h[gx::GZ_COUNT], all = 0;
+		for (int z = 0; z < gx::GZ_COUNT; z++) {
+			h[z] = GX3DS_ZoneHist[z];
+			GX3DS_ZoneHist[z] = 0;
+			all += h[z];
+		}
+		if (all) {
+			char line[700];
+			int at = 0;
+			for (int z = 0; z < gx::GZ_COUNT; z++)
+				if (h[z]) at += snprintf(line + at, sizeof line - at, "%s %s %.1f%%", at ? " |" : "", kZone[z], 100.0 * h[z] / all);
+			fprintf(stderr, "[perf]   GX thread by zone (%u samples):%s\n", all, line);
+		}
+	}
 	{
 		// Its top-level commands by kind (patch 0020): count a frame and estimated ms a frame, from
 		// the one in 16 timed.
@@ -5288,6 +5413,7 @@ static FrameHook s_frameHook;
 // render thread is still a frame behind.
 void executeCopy(uint32_t ctrl) {
 	if (!s_ready) return;
+	GX_ZONE(GZ_COPY);
 	flushBatch();
 	rcInit();
 	emitState();
@@ -5533,7 +5659,10 @@ void GXPC_StreamDrain(void) {
 // Off before the first frame: GX runs on the game thread (no GX thread).
 void GX3DS_SetGxThread(int on) { gx::s_gxWanted = on != 0; }
 void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.txt perf_timers
-void GX3DS_SetDrawStateCheck(int on) { gx::s_fpCheck = on != 0; }  // settings.txt draw_state_check
+void GX3DS_SetDrawStateCheck(int on) {  // settings.txt draw_state_check
+	gx::s_fpCheck = on != 0;
+	gx::GXPC_FastListCheck = on != 0;
+}
 void GX3DS_SetListCopies(int on) { gx::s_dlCopyOn = on != 0; }
 
 // 0: material, 1: debug colours, 2: opaque (material colours, no blending or alpha test).

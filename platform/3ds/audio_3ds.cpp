@@ -293,6 +293,14 @@ __thread bool t_turn;               // this is the turn's thread
 Thread s_driver;
 LightEvent s_blockDue;
 volatile bool s_driverRun;
+// With audio_thread = core2 the voices' decoding moves to core 2 too (feed_main): ndsp's thread runs
+// on the game's core, above the game thread, and its frame callback's decoding took ~1.2 ms of every
+// game frame there. The callback counts the DSP frames due; this thread on core 2 works through
+// them in turn, each as the callback did (pace, refill, write-back), and is the only one that does.
+Thread s_feeder;
+LightEvent s_feedDue;
+volatile bool s_feedRun;
+volatile u32 s_feedFrames, s_feedDone;  // DSP frames given to the feeder, and done
 volatile u32 s_turnTicks, s_turnWaitTicks, s_emuWaitTicks, s_turnBlocks, s_serialBlocks, s_handoffs;
 volatile u32 s_thpLate;             // turns' blocks a movie's sound started in (left silent)
 u32 s_hookCalls;                    // the game's side: calls into its sound code (the lock hooks)
@@ -654,10 +662,11 @@ void pace()
 	for (int c = 0; c < kHwChans; c++) apply_chan(c, ch[c]);
 }
 
+void feed_frame(u32 n);
 void ndsp_frame(void*)
 {
 	const u32 t0 = ticks();
-	s_dspFrames++;
+	if (s_dspFrames++ == 0) fprintf(stderr, "[audio] the ndsp thread's frame callback runs on core %d\n", (int)svcGetProcessorID());
 	if (s_sinkStarted) {
 		const int q = port_audio_out_queued();
 		if (q < kSinkTarget) {
@@ -668,16 +677,41 @@ void ndsp_frame(void*)
 		}
 		if (!q) s_sinkDry++;
 	}
+	if (s_feeder) {  // the feeder on core 2 does the rest
+		s_feedFrames++;
+		LightEvent_Signal(&s_feedDue);
+		s_cbTicks += ticks() - t0;
+		return;
+	}
+	feed_frame(s_dspFrames);
+	s_cbTicks += ticks() - t0;
+}
+
+// DSP frame n's work on the voices' buffers: the next snapshot's channel changes, the buffers topped
+// up, the new ones written back.
+void feed_frame(u32 n)
+{
 	pace();
 	const u32 t1 = ticks();
-	const bool due = s_dspFrames % kRefillEvery == 0;
+	const bool due = n % kRefillEvery == 0;
 	for (int c = 0; c < kHwChans; c++) refill(c, due);
 	const u32 t2 = ticks();
 	flush_pending();
 	const u32 t3 = ticks();
 	s_decodeTicks += t2 - t1;
 	s_flushTicks += t3 - t2;
-	s_cbTicks += t3 - t0;
+}
+
+void feed_main(void*)
+{
+	while (s_feedRun) {
+		LightEvent_Wait(&s_feedDue);
+		while (s_feedRun && s_feedDone != s_feedFrames) {
+			const u32 t0 = ticks();
+			feed_frame(++s_feedDone);
+			s_cbTicks += ticks() - t0;
+		}
+	}
 }
 
 // --- the audio thread (emulated CPU held) ------------------------------------------------------
@@ -1502,6 +1536,13 @@ void SMS3DS_AudioSetUpdateInterval(int subframes)
 void SMS3DS_AudioExit(void)
 {
 	if (!s_ready) return;
+	if (s_feeder) {  // (finished before ndsp's callback works the frames itself again)
+		s_feedRun = false;
+		LightEvent_Signal(&s_feedDue);
+		threadJoin(s_feeder, 200000000ull);
+		threadFree(s_feeder);
+		s_feeder = NULL;
+	}
 	if (s_driver) {
 		s_driverRun = false;
 		LightEvent_Signal(&s_blockDue);
@@ -1735,6 +1776,13 @@ void SMS3DS_AudioSetThread(int core2)
 	}
 	fprintf(stderr, "[audio] audio_thread = core2: JAudio's blocks run on core 2 (priority 0x%lx); the game's sound "
 	        "code takes the audio lock\n", (unsigned long)prio);
+	// The voices' decoding, at ndsp's own thread's priority (0x18), from the next DSP frame on.
+	LightEvent_Init(&s_feedDue, RESET_ONESHOT);
+	s_feedRun = true;
+	s_feedFrames = s_feedDone = s_dspFrames;
+	__dmb();
+	s_feeder = threadCreate(feed_main, NULL, 16u << 10, 0x18, 2, false);
+	fprintf(stderr, "[audio] the voices' decoding %s\n", s_feeder ? "runs on core 2" : "stays in ndsp's thread (no thread on core 2)");
 }
 
 // The lock hooks in the game's sound code (scripts/build_game_lib.sh).

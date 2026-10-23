@@ -23,6 +23,11 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DECOMP="${DECOMP:-$ROOT/build/decomp-patched}"
 PCPORT="${PCPORT:-$ROOT/ext/sms-pc-port}"
+# The headers the game's units include (port_compat.h, the GX API's inline writers, port_fma.h)
+# come from the patched copy that the GX and platform libraries are built from
+# (scripts/prepare_pcport.sh), so patches/sms-port's changes to them reach the game too: the
+# inline vertex and pipe writers, and the raw command bytes that tell the write filter.
+PCPORT_INC="${PCPORT_INC:-$ROOT/build/pcport-3ds}"
 OBJ="${OBJ:-$ROOT/build/obj}"
 JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 2)"
 [ "${1:-}" = "-j" ] && JOBS="${2:-$JOBS}"
@@ -63,7 +68,8 @@ TOTAL=$(wc -l < "$ROOT/build/units.tsv")
 [ -n "${LIMIT:-}" ] && head -n "$LIMIT" "$ROOT/build/units.tsv" > "$ROOT/build/units.limit.tsv" && mv "$ROOT/build/units.limit.tsv" "$ROOT/build/units.tsv"
 echo "units: $(wc -l < "$ROOT/build/units.tsv") of $TOTAL, jobs: $JOBS, compiler: $CXX"
 
-INCS="-I$PCPORT/src/port_include -I$PCPORT/src -I$PCPORT/platform/gx/port_include -I$PCPORT/platform/gx/include -I$DECOMP/include"
+[ -d "$PCPORT_INC/platform" ] || { echo "run scripts/prepare_pcport.sh first (no $PCPORT_INC)"; exit 1; }
+INCS="-I$PCPORT_INC/src/port_include -I$PCPORT_INC/src -I$PCPORT_INC/platform/gx/port_include -I$PCPORT_INC/platform/gx/include -I$DECOMP/include"
 for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
 # GameCube ABI: enums are 4 bytes and plain char is signed (MWCC). arm-none-eabi defaults to
 # variable-size enums and unsigned char, which breaks every struct read straight from game
@@ -73,7 +79,7 @@ GC_ABI="-fno-short-enums -fsigned-char"
 # SAMPLE=1: each function's entry and exit call prof_3ds.cpp's hooks (inline ones from headers
 # are left out), for the profile run's sampler. A measurement build: the hooks cost time.
 INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h"
-COMMON="$ARCHFLAGS $OPT $INSTR -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT/src/port_compat.h"
+COMMON="$ARCHFLAGS $OPT $INSTR -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT_INC/src/port_compat.h"
 CXXF="$COMMON -std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics"
 CF="$COMMON -std=gnu99 -fcommon"
 CP932=""

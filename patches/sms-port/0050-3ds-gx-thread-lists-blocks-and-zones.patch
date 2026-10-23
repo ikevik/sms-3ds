@@ -1,0 +1,390 @@
+--- a/platform/gx/src/gx_internal.h
++++ b/platform/gx/src/gx_internal.h
+@@ -396,6 +396,32 @@
+ uint64_t hashBytes(const void* data, size_t n, uint64_t seed = 0);
+ [[noreturn]] void fatal(const char* fmt, ...);
+ void logmsg(const char* fmt, ...);
++
++#if defined(__3DS__)
++// 3DS port: profile builds (GX_ZONES=1, scripts/build_gx_lib.sh's OPT): what the GX thread is doing
++// in one byte, which a thread on another core samples (gx3ds_backend.cpp, autorun.txt gx_zones),
++// for a profile of it in Azahar, where reading the tick counter costs too much to time its parts.
++// The innermost zone counts: a zone entered inside another is that one's until it ends.
++enum GxZoneId : uint8_t {
++    GZ_PARSE, GZ_IDLE, GZ_BP, GZ_CP, GZ_XF, GZ_XFIDX, GZ_DL_CHECK, GZ_DL_STATE, GZ_DL_RUNS, GZ_DL_UNCACHED,
++    GZ_DL_RECORD, GZ_PRIM, GZ_STATE_REC, GZ_DRAW_REC, GZ_J3D_MAT, GZ_J3D_SHAPE, GZ_J3D_HANDOVER, GZ_BLOCK,
++    GZ_STREAMOP, GZ_COPY, GZ_CARRY, GZ_PRIM_SETUP, GZ_PRIM_BEGIN, GZ_PRIM_END, GZ_J3D_XF, GZ_J3D_RUNS, GZ_J3D_OUT,
++    GZ_COUNT
++};
++extern "C" volatile uint8_t GXPC_Zone;
++#if GX_ZONES
++struct GxZone {
++    uint8_t prev;
++    explicit GxZone(uint8_t z) : prev(GXPC_Zone) { GXPC_Zone = z; }
++    ~GxZone() { GXPC_Zone = prev; }
++};
++#define GX_ZONE(z) ::gx::GxZone gx_zone_(z)
++#define GX_ZONE_SET(z) (GXPC_Zone = (z))
++#else
++#define GX_ZONE(z) ((void)0)
++#define GX_ZONE_SET(z) ((void)0)
++#endif
++#endif
+ 
+ }  // namespace gx
+ 
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -504,7 +504,7 @@
+             while (mem[last] == words[last]) last--;
+             onStateChange();
+             changed = true;
+-            memmove(mem + first, words + first, (last - first + 1) * 4);
++            for (uint32_t i = first; i <= last; i++) mem[i] = words[i];  // (the words never lie in g.xfMem)
+             for (uint32_t b = (addr + first) >> 4, e = (addr + last) >> 4; b <= e; b++) xfTouched(b << 4);
+         }
+         addr += n;
+@@ -720,8 +720,26 @@
+ // clr0 u8x4 | clr1 u8x4 | tex0..7 f32x2 | matrix indices u8x12.
+ const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) {
+     static std::unordered_map<uint32_t, VtxFmtLayout> cache;
++#if defined(__3DS__)
++    // 3DS port: the last layouts found, by a hash of the format, each thread its own (both the GX
++    // and the render thread ask): the map's lookup divides by its bucket count, a library call on the
++    // ARM11, and every draw record asked. Its elements stay where they are, so the pointers hold.
++    struct Seen {
++        uint32_t fmt;
++        const VtxFmtLayout* l;
++    };
++    static thread_local Seen t_seen[64];
++    Seen& sn = t_seen[(fmt * 0x9E3779B1u) >> 26];
++    if (sn.l && sn.fmt == fmt) return *sn.l;
+     auto it = cache.find(fmt);
++    if (it != cache.end()) {
++        sn = Seen{fmt, &it->second};
++        return it->second;
++    }
++#else
++    auto it = cache.find(fmt);
+     if (it != cache.end()) return it->second;
++#endif
+     VtxFmtLayout l;
+     memset(&l, 0, sizeof(l));
+     uint16_t o = 12;
+@@ -1061,12 +1079,19 @@
+ static struct DlEntry* s_dlRec = nullptr;  // the display list being recorded into the cache
+ 
+ static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t count, const VtxLayout& L, int vat) {
++#if defined(__3DS__)
++    GX_ZONE(GZ_PRIM);
++#endif
+     s_vertsLoaded += count;
+     static DecSetup s_setup[8];
+     DecSetup& S = s_setup[vat];
+     if (S.layoutGen != L.gen || S.arrayGen != g_arrayGen || S.matA != g.xfReg[XFR_MATIDX_A] ||
+-        S.matB != g.xfReg[XFR_MATIDX_B])
++        S.matB != g.xfReg[XFR_MATIDX_B]) {
++#if defined(__3DS__)
++        GX_ZONE(GZ_PRIM_SETUP);
++#endif
+         buildSetup(S, L);
++    }
+     if (S.fmt & VF_MTX) {
+         memcpy(s_mtxDefault, S.mtxDefault, 12);
+         s_mtxPresent = S.mtxPresent;
+@@ -1103,6 +1128,7 @@
+ static inline bool wrStudy() { return GXPC_WR_STUDY && GXPC_Detail; }
+ #endif
+ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
++    GX_ZONE(GZ_XFIDX);
+     uint32_t addr = v & 0xFFF, cnt = (v >> 12) + 1;
+     int slot = 12 + ((op - 0x20) >> 3);
+     const uint8_t* src = arrayElem(slot, idx);
+@@ -1373,8 +1399,15 @@
+             break;
+         }
+         case 1: writeCP(uint8_t(d.reg[i]), w); break;
+-        default: writeXF(d.reg[i], 1, &w); break;
++        default: {  // 3DS port: a value held already left out here (writeXF would change nothing)
++            const uint32_t a = d.reg[i];
++            if (a < XF_MEM_WORDS ? g.xfMem[a] == w
++                                 : a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT && g.xfReg[a - XF_REG_BASE] == w)
++                break;
++            writeXF(uint16_t(a), 1, &w);
++            break;
+         }
++        }
+     }
+ }
+ 
+@@ -1499,6 +1532,7 @@
+ static void natOp(const uint8_t* p);
+ static void natHandOver();
+ static void streamOpRun(const uint8_t* p) {
++    GX_ZONE(p[0] == kStreamOpBlock ? GZ_BLOCK : GZ_STREAMOP);
+     switch (p[0]) {
+     case kStreamOpCallDL:
+         callDisplayList(reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 1))), be32(p + 5));
+@@ -1643,6 +1677,7 @@
+ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
+     GXPC_CMD_TIMER;
+ #if defined(__3DS__)
++    GX_ZONE(GZ_PARSE);
+     ParseDepth parseDepth;
+     const bool streamTop = s_streamParse && s_parseDepth == 1;
+ #endif
+@@ -1663,6 +1698,7 @@
+             if (op == 0x61 && !s_bpSpecial.is[p[1]]) {
+                 if (end - p < 5) break;
+                 CMD_COUNT(4);
++                GX_ZONE(GZ_BP);
+                 writeBP(be32(p + 1));
+                 p += 5;
+                 continue;
+@@ -1670,6 +1706,7 @@
+             if (op == 0x08) {
+                 if (end - p < 6) break;
+                 CMD_COUNT(5);
++                GX_ZONE(GZ_CP);
+                 writeCP(p[1], be32(p + 2));
+                 p += 6;
+                 continue;
+@@ -1725,6 +1762,7 @@
+ #endif
+             writeCP(p[1], be32(p + 2));
+         } else if (op == 0x10) {
++            GX_ZONE(GZ_XF);
+             CMD_COUNT(2);
+             if (avail < 5) { len = 5; break; }
+             uint32_t hdr = be32(p + 1);
+@@ -1881,6 +1919,7 @@
+ struct FastOp {
+     uint32_t* reg;  // the word of g it writes; null: run ops[v]
+     uint32_t v;     // the value it writes there
++    uint32_t mask;  // the bits of it written (a BP write after a BP mask), else all
+ };
+ #endif
+ struct DlArray {  // the part of an attribute array the list reads
+@@ -2279,25 +2318,35 @@
+ extern "C" void GXPC_SetFastStateLists(int on) { s_fastStateLists = on != 0; }
+ 
+ // Puts a state-only list's ops as register words (e.fast), each write exactly what writeBP,
+-// writeCP or writeXF would do with an unchanged value: nothing. Left empty for a list with a BP
+-// mask (the write after it merges), a draw-sync token or EFB copy (they run game code or much of
+-// the back end), or a call to another list.
++// writeCP or writeXF would do with an unchanged value: nothing. A BP mask and the BP write after it
++// are one masked word (3DS port: J3D's material lists set their konst selections so), merged as
++// writeBPImpl merges them, when that register is one writeBP only stores (s_bpSpecial). Left empty
++// for a list with another BP mask (pending at its end, or before a register with effects of its
++// own), a draw-sync token or EFB copy (they run game code or much of the back end), or a call to
++// another list.
+ static void dlCompileFast(DlEntry& e) {
+     std::vector<FastOp> f;
+     for (size_t i = 0; i < e.ops.size(); i++) {
+         const StateOp& s = e.ops[i];
+         if (s.type == 0x61) {
+             const uint32_t reg = s.v >> 24, data = s.v & 0xFFFFFF;
+-            if (reg == BP_MASK || reg == BP_PE_TOKEN_INT || reg == BP_COPY_EXEC) return;
++            if (reg == BP_MASK) {
++                const StateOp* t = i + 1 < e.ops.size() ? &e.ops[i + 1] : nullptr;
++                if (!t || t->type != 0x61 || s_bpSpecial.is[t->v >> 24]) return;
++                f.push_back({&g.bp[t->v >> 24], t->v & 0xFFFFFF, data});
++                i++;
++                continue;
++            }
++            if (reg == BP_PE_TOKEN_INT || reg == BP_COPY_EXEC) return;
+             if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) {
+-                f.push_back({&g.kreg[reg & 7], data});
++                f.push_back({&g.kreg[reg & 7], data, ~0u});
+                 continue;
+             }
+             const bool texImage = (reg >= BP_TX_IMAGE3 && reg < BP_TX_IMAGE3 + 4) ||
+                                   (reg >= BP_TX_IMAGE3 + 0x20 && reg < BP_TX_IMAGE3 + 0x24);
+             if (reg != BP_PE_TOKEN && reg != BP_DRAWDONE && reg != BP_LOADTLUT1 && reg != BP_TEXINVALIDATE &&
+                 reg != BP_COPY_DST && !texImage) {  // these always do something
+-                f.push_back({&g.bp[reg], data});
++                f.push_back({&g.bp[reg], data, ~0u});
+                 continue;
+             }
+         } else if (s.type == 0x08) {
+@@ -2319,21 +2368,21 @@
+             default: continue;  // a register writeCP ignores
+             }
+             if (r) {
+-                f.push_back({r, v});
++                f.push_back({r, v, ~0u});
+                 continue;
+             }
+         } else if (s.type == 0x10) {
+             for (uint32_t k = 0; k < s.n; k++) {
+                 const uint16_t a = uint16_t(s.a + k);
+-                if (a < XF_MEM_WORDS) f.push_back({&g.xfMem[a], e.words[s.v + k]});
++                if (a < XF_MEM_WORDS) f.push_back({&g.xfMem[a], e.words[s.v + k], ~0u});
+                 else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT)
+-                    f.push_back({&g.xfReg[a - XF_REG_BASE], e.words[s.v + k]});
++                    f.push_back({&g.xfReg[a - XF_REG_BASE], e.words[s.v + k], ~0u});
+             }
+             continue;
+         } else if (s.type == 0x40) {
+             return;
+         }
+-        f.push_back({nullptr, uint32_t(i)});
++        f.push_back({nullptr, uint32_t(i), ~0u});
+     }
+     e.fast.swap(f);
+ }
+@@ -2351,13 +2400,58 @@
+ }
+ #endif
+ 
++#if defined(__3DS__)
++// Check mode (settings.txt draw_state_check, GXPC_FastListCheck): each list replayed as register
++// words is replayed again command by command from the registers as they were, and the words it
++// wrote are compared (lists checked, lists differing).
++extern "C" {
++int GXPC_FastListCheck;
++uint32_t GXPC_FastListStats[2];
++}
++static void dlFastCheck(const DlEntry& e) {
++    static std::vector<uint32_t> before, after;
++    before.clear();
++    after.clear();
++    for (const FastOp& f : e.fast)
++        if (f.reg) before.push_back(*f.reg);
++    for (const FastOp& f : e.fast) {  // as dlReplayState's fast form
++        if (!f.reg) {
++            dlReplayOp(e, e.ops[f.v]);
++            continue;
++        }
++        const uint32_t v = (*f.reg & ~f.mask) | (f.v & f.mask);
++        if (*f.reg != v) dlFastWrite(f.reg, v);
++    }
++    for (const FastOp& f : e.fast)
++        if (f.reg) after.push_back(*f.reg);
++    size_t k = before.size();  // back as they were (in reverse: a word written twice ends as before)
++    for (size_t i = e.fast.size(); i-- > 0;)
++        if (e.fast[i].reg) *e.fast[i].reg = before[--k];
++    for (const StateOp& s : e.ops) dlReplayOp(e, s);  // the commands themselves
++    bool differs = g.bpMask != 0xFFFFFF;
++    k = 0;
++    for (const FastOp& f : e.fast)
++        if (f.reg && *f.reg != after[k++]) differs = true;
++    GXPC_FastListStats[0]++;
++    if (differs && GXPC_FastListStats[1]++ < 8) logmsg("fast state list %p replayed differently from its commands", static_cast<const void*>(&e));
++}
++#endif
++
+ static void dlReplayState(const DlEntry& e) {
+ #if defined(__3DS__)
+     // Not with a BP mask pending: the list's first BP write takes it.
+     if (!e.fast.empty() && s_fastStateLists && g.bpMask == 0xFFFFFF && !wrStudy()) {
++        if (GXPC_FastListCheck) {
++            dlFastCheck(e);
++            return;
++        }
+         for (const FastOp& f : e.fast) {
+-            if (!f.reg) dlReplayOp(e, e.ops[f.v]);
+-            else if (*f.reg != f.v) dlFastWrite(f.reg, f.v);
++            if (!f.reg) {
++                dlReplayOp(e, e.ops[f.v]);
++                continue;
++            }
++            const uint32_t v = (*f.reg & ~f.mask) | (f.v & f.mask);  // (a masked word: merged as writeBPImpl)
++            if (*f.reg != v) dlFastWrite(f.reg, v);
+         }
+         if (GXPC_Detail) GXPC_DlFineCount[7]++;
+         return;
+@@ -2381,8 +2475,10 @@
+     GXPC_DL_COUNT(GXPC_DlCalls++);
+ #if defined(__3DS__)
+     s_dlSeq++;
++    GX_ZONE(GZ_DL_CHECK);
+ #endif
+     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
++        GX_ZONE_SET(GZ_DL_UNCACHED);
+         GXPC_DL_COUNT(GXPC_DlUncached++);
+         GXPC_DL_COUNT(s_uncachedDepth++);
+         runCommands(data, size);
+@@ -2398,6 +2494,7 @@
+     dlFineAdd(0, ft);
+ #endif
+     if (e.skip) {
++        GX_ZONE_SET(GZ_DL_UNCACHED);
+         GXPC_DL_TO(dlt, 3);
+         GXPC_DL_COUNT(GXPC_DlUncached++);
+         e.skip--;
+@@ -2412,6 +2509,7 @@
+         GXPC_DL_COUNT(GXPC_DlVerts += e.verts);
+         if (e.stateOnly) {
+ #if defined(__3DS__)
++            GX_ZONE_SET(GZ_DL_STATE);
+             ft = dlFineNow();
+             const uint64_t fo = GX3DS_OursTicks;
+ #endif
+@@ -2428,6 +2526,7 @@
+         }
+         const bool arena = arenaEnabled() && !traceFile();  // traces list the batch's own vertices
+ #if defined(__3DS__)
++        GX_ZONE_SET(GZ_DL_RUNS);
+         if (GXPC_Detail) GXPC_DlFineCount[2]++;
+ #endif
+         for (DlRun& r : e.runs) {
+@@ -2465,6 +2564,9 @@
+         return;
+     }
+     // (re)record; a list that keeps changing is left alone for a while
++#if defined(__3DS__)
++    GX_ZONE_SET(GZ_DL_RECORD);
++#endif
+     GXPC_DL_TO(dlt, 2);
+     GXPC_DL_COUNT(GXPC_DlRecords++);
+     GXPC_DL_COUNT(if (!e.valid && !e.size && !e.misses) GXPC_DlNew++);
+@@ -2617,6 +2719,7 @@
+ 
+ // Hands the native ops' registers over to g (see above): just before a command that is not one.
+ static void natHandOver() {
++    GX_ZONE(GZ_J3D_HANDOVER);
+     if (!s_np.any || s_npCheck) return;
+     uint64_t t = GXPC_Detail || GXPC_J3DSampleOn ? svcGetSystemTick() : 0;
+     flushBatch();  // the open batch's draws are native ones
+@@ -2953,10 +3056,12 @@
+     const uint8_t* base = static_cast<const uint8_t*>(physToPtr(ptrToPhys(reinterpret_cast<const void*>(uintptr_t(baseHost)))));
+     const bool be = natBE(base);
+     const uint8_t* src = base + size_t(idx) * stride;
+-    for (uint32_t k = 0; k < n; k++)
+-        out[k] = be ? be32(src + k * 4)
+-                    : (uint32_t(src[k * 4]) | uint32_t(src[k * 4 + 1]) << 8 | uint32_t(src[k * 4 + 2]) << 16 |
+-                       uint32_t(src[k * 4 + 3]) << 24);
++    // (a word at a time, as loadIndexedXF: the little-endian matrices the port works out as they are)
++    if (be) {
++        for (uint32_t k = 0; k < n; k++) out[k] = be32(src + k * 4);
++    } else {
++        for (uint32_t k = 0; k < n; k++) memcpy(&out[k], src + k * 4, 4);
++    }
+ }
+ 
+ // The shape's calls, replayed (the old path).
+@@ -2987,6 +3092,7 @@
+ // The XF words a shape group sets: its matrix indices and its vertex-format list's (first group),
+ // its matrices. Sent to the render thread (the open batch drawn first) when one differs.
+ static void natGroupXF(const J3DImage::Xf* xf, uint32_t nxf, const SMS3DSJ3DShapeOp& op, uint32_t gi) {
++    GX_ZONE(GZ_J3D_XF);
+     static uint32_t pairs[2 * (64 + 2 + 10 * 21)];
+     uint32_t n = 0;
+     auto add = [&](uint32_t a, uint32_t v) {
+@@ -3318,6 +3424,7 @@
+         natGroupXF(k->xf, k->nxf, op, gi);
+         if (GXPC_J3DVerify) natVerifySig();
+         njAdd(5, t);
++        GX_ZONE(GZ_J3D_RUNS);
+         for (uint32_t r = k->run0[gi]; r < k->run0[gi + 1]; r++) {
+             const NatPkgRun& x = k->runs[r];
+             if (natBoxOffscreen(x.hasBox, x.box, x.nverts)) continue;
+@@ -3482,6 +3589,7 @@
+             s_njSample = false;
+         }
+     } done{t0};
++    GX_ZONE(p[0] == kStreamOpJ3DMat ? GZ_J3D_MAT : GZ_J3D_SHAPE);
+     if (p[0] == kStreamOpJ3DMat) {
+         natMaterial(reinterpret_cast<const uint8_t*>(uintptr_t(be32(p + 1))), be32(p + 5), p[9] != 0);
+     } else if (p[0] == kStreamOpJ3DShape) {

@@ -179,6 +179,10 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 
 /* Draws triangles from the last pica_alloc. */
 void pica_draw_triangles(const PicaVtx* verts, const uint16_t* idx, uint32_t nidx, const PicaState* st);
+/* The caller's promise for the next pica_draw_gx or pica_draw_triangles (0: none): its state (and
+ * for pica_draw_gx its layout) is as it was the last time the caller gave this same number with
+ * the same state object. The draw then skips comparing them with what was sent last. */
+extern uint32_t pica_draw_same;
 
 /* Clears colour (0xRRGGBBAA) and depth (24-bit) of the frame in progress, or of the next one. */
 void pica_clear(uint32_t rgba, uint32_t depth24);
@@ -226,6 +230,7 @@ int pica_thread_start(void (*fn)(void*), void* arg);
 int pica_gx_thread_start(void (*fn)(void*), void* arg);
 void pica_event_wait(int i);
 void pica_event_signal(int i);
+void pica_poll_pause(void);  /* between a polling thread's checks (ends its slice in Azahar) */
 int pica_overlap(void);
 /* GPU completions the frame-start watchdog had to supply (the hardware never reported them). */
 uint32_t pica_lost_completions(void);

@@ -1,0 +1,74 @@
+--- a/src/MSound/MSoundScene.cpp
++++ b/src/MSound/MSoundScene.cpp
+@@ -5,6 +5,35 @@
+ 
+ // rogue includes needed for matching sinit & bss
+ #include <MSound/MSSetSound.hpp>
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0031): sortMaxTrans ranks frameLoop's positions by their distance from
++// the camera, working out two distances at each step and the same ones again for the next position:
++// each one three of MSL's powf and a sqrtf, thousands a frame in Delfino Plaza. frameLoop's positions
++// are one array that nothing changes while it ranks them, and the camera stays where it is, so each
++// position's distance is worked out once, the first time it is wanted, and reused: the same values,
++// compared in the same order.
++// With draw_state_check = on (SMS3DS_RankCheck) each reused distance is worked out again and compared.
++#include <string.h>
++extern "C" int SMS3DS_RankCheck;
++extern "C" unsigned SMS3DS_RankStats[2];  // checked, differing
++static Vec* sms3ds_rankBase;  // frameLoop's positions while it ranks them, else null
++static u32 sms3ds_rankPass, sms3ds_rankStamp[256];
++static f32 sms3ds_rankDist[256];
++static f32 sms3ds_rankDistFromCamera(Vec* pos)
++{
++	const u32 i = (u32)(pos - sms3ds_rankBase);
++	if (sms3ds_rankStamp[i] != sms3ds_rankPass) {
++		sms3ds_rankStamp[i] = sms3ds_rankPass;
++		sms3ds_rankDist[i] = MSGMSound->getDistFromCamera(pos);
++	} else if (SMS3DS_RankCheck) {
++		const f32 d = MSGMSound->getDistFromCamera(pos);
++		SMS3DS_RankStats[0]++;
++		if (memcmp(&d, &sms3ds_rankDist[i], sizeof d) != 0)
++			SMS3DS_RankStats[1]++;
++	}
++	return sms3ds_rankDist[i];
++}
++#endif
+ #include <MSound/MSoundBGM.hpp>
+ 
+ // Only the map's size (0xc00) and the leading .bss position are evidence: the
+@@ -113,8 +142,20 @@
+ 			}
+ 
+ 			u8 rank = 0;
++#if defined(__3DS__)
++			if (i == 0) {
++				sms3ds_rankBase = trans;
++				if (++sms3ds_rankPass == 0) {  // (a stamp of 0 would match)
++					memset(sms3ds_rankStamp, 0, sizeof sms3ds_rankStamp);
++					sms3ds_rankPass = 1;
++				}
++			}
++#endif
+ 			sortMaxTrans(mTrans[i], direction, rank);
+ 		}
++#if defined(__3DS__)
++		sms3ds_rankBase = nullptr;
++#endif
+ 
+ 		for (u8 i = 0; i < DIRECTION_NUM; ++i) {
+ 			u8 num;
+@@ -156,8 +197,14 @@
+ 		return;
+ 	}
+ 
++#if defined(__3DS__)
++	if (sms3ds_rankBase ? sms3ds_rankDistFromCamera(mMaxTrans[direction][rank]) >= sms3ds_rankDistFromCamera(trans)
++	                    : MSGMSound->getDistFromCamera(mMaxTrans[direction][rank])
++	                          >= MSGMSound->getDistFromCamera(trans)) {
++#else
+ 	if (MSGMSound->getDistFromCamera(mMaxTrans[direction][rank])
+ 	    >= MSGMSound->getDistFromCamera(trans)) {
++#endif
+ 		if (rank + 1 < MAX_TRANS_NUM)
+ 			sortMaxTrans(mMaxTrans[direction][rank], direction, rank + 1);
+ 		mMaxTrans[direction][rank] = trans;

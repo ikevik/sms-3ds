@@ -154,6 +154,19 @@ void SMS3DS_TimelineReport(void);
 unsigned SMS3DS_NameTreeGen;
 int SMS3DS_NameCache = 1;
 unsigned SMS3DS_NameCacheStats[5];
+// The scene sound's ranking of positions by distance (decomp patch 3ds-0031), each distance worked
+// out once: with draw_state_check = on (main.cpp) each reused one is worked out again and compared
+// (checked, differing; gx3ds_backend.cpp reports them with the draw state check).
+int SMS3DS_RankCheck;
+unsigned SMS3DS_RankStats[2];
+// The GX thread's zone sampler (autorun.txt gx_zones, main.cpp): every 100 us a thread on core 2
+// counts the zone the GX thread is in (gx3ds_backend.cpp keeps the counts; gx_internal.h's zones,
+// in a GX library built with GX_ZONES=1).
+extern volatile uint8_t GXPC_Zone;
+extern volatile uint32_t GX3DS_ZoneHist[];
+extern int GX3DS_ZoneSampling;
+extern const int GX3DS_ZoneCount;
+void GX3DS_StartZoneSampler(void);
 // J3D's material entries (decomp patch 3ds-0029, J3DJoint::entryIn) in profile runs: time by part
 // for the materials timed (one in four), and the counts (seen, timed, unlocked, entered).
 unsigned long long SMS3DS_J3DEntryTicks[4];
@@ -1940,4 +1953,20 @@ void SMS3DS_ProfFrame(void) {
 		}
 		return;
 	}
+}
+
+// autorun.txt gx_zones (main.cpp): the GX thread's zone sampled (see GX3DS_ZoneHist above).
+static void zoneSampler(void*) {
+	for (;;) {
+		svcSleepThread(100000);
+		const uint8_t z = GXPC_Zone;
+		GX3DS_ZoneHist[z < GX3DS_ZoneCount ? z : 0]++;
+	}
+}
+extern "C" void GX3DS_StartZoneSampler(void) {
+	static Thread t;
+	if (!t) t = threadCreate(zoneSampler, nullptr, 4u << 10, 0x18, 2, true);
+	GX3DS_ZoneSampling = t != nullptr;
+	fprintf(stderr, "[prof] GX zone sampler %s (zones only in a GX library built with GX_ZONES=1)\n",
+	        t ? "on core 2, every 100 us" : "could not start");
 }

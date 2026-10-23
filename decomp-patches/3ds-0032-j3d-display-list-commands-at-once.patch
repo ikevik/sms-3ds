@@ -1,0 +1,103 @@
+--- a/libs/JSystem/include/JSystem/JRenderer.hpp
++++ b/libs/JSystem/include/JSystem/JRenderer.hpp
+@@ -7,6 +7,35 @@
+ 
+ inline void J3DGDWrite_u8(u8 param) { __GDWrite(param); }
+ 
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0032): the same bytes, each command's written at once. __GDWrite stores
++// a byte through __GDCurrentDL->ptr, and a byte store may alias both, so every byte reloaded them
++// and stored the pointer back: ~6 instructions a byte, in the material display lists J3D rebuilds
++// every frame. Here the pointer moves once a command and its words go out byte-swapped (the list
++// is big-endian), stored unaligned as the ARM11 allows.
++#include <string.h>
++static inline u8* J3DGDTake(u32 n)
++{
++	GDLObj* dl = __GDCurrentDL;
++	u8* p = dl->ptr;
++	dl->ptr = p + n;
++	return p;
++}
++static inline void J3DGDPut32(u8* p, u32 v)
++{
++	v = __builtin_bswap32(v);
++	memcpy(p, &v, 4);
++}
++static inline void J3DGDPut16(u8* p, u16 v)
++{
++	p[0] = (u8)(v >> 8);
++	p[1] = (u8)v;
++}
++
++inline void J3DGDWrite_u16(u16 param) { J3DGDPut16(J3DGDTake(2), param); }
++
++static inline void J3DGDWrite_u32(u32 param) { J3DGDPut32(J3DGDTake(4), param); }
++#else
+ inline void J3DGDWrite_u16(u16 param)
+ {
+ 	__GDWrite((u8)(param >> 8));
+@@ -20,6 +49,7 @@
+ 	__GDWrite((u8)((param >> 8) & 0xff));
+ 	__GDWrite((u8)((param >> 0) & 0xff));
+ }
++#endif
+ 
+ inline void J3DGDWrite_f32(f32 param)
+ {
+@@ -31,8 +61,48 @@
+ 	J3DGDWrite_u32(fid.u);
+ }
+ 
++#if defined(__3DS__)
+ inline void J3DGDWriteBPCmd(u32 cmd)
+ {
++	u8* p = J3DGDTake(5);
++	p[0] = GX_CMD_LOAD_BP_REG;
++	J3DGDPut32(p + 1, cmd);
++}
++
++// Made up
++inline void J3DGDWriteBPCmdCheck(u32 cmd)
++{
++	GDOverflowCheck(5);
++	J3DGDWriteBPCmd(cmd);
++}
++
++inline void J3DGDWriteCPCmd(u8 cmd, u32 param)
++{
++	u8* p = J3DGDTake(6);
++	p[0] = GX_CMD_LOAD_CP_REG;
++	p[1] = cmd;
++	J3DGDPut32(p + 2, param);
++}
++
++inline void J3DGDWriteXFCmd(u16 cmd, u32 param)
++{
++	u8* p = J3DGDTake(9);
++	p[0] = GX_CMD_LOAD_XF_REG;
++	J3DGDPut16(p + 1, 0);
++	J3DGDPut16(p + 3, cmd);
++	J3DGDPut32(p + 5, param);
++}
++
++inline void J3DGDWriteXFCmdHdr(u16 cmd, u8 len)
++{
++	u8* p = J3DGDTake(5);
++	p[0] = GX_CMD_LOAD_XF_REG;
++	J3DGDPut16(p + 1, (u16)(len - 1));
++	J3DGDPut16(p + 3, cmd);
++}
++#else
++inline void J3DGDWriteBPCmd(u32 cmd)
++{
+ 	J3DGDWrite_u8(GX_CMD_LOAD_BP_REG);
+ 	J3DGDWrite_u32(cmd);
+ }
+@@ -66,6 +136,7 @@
+ 	J3DGDWrite_u16(len - 1);
+ 	J3DGDWrite_u16(cmd);
+ }
++#endif
+ 
+ /**
+  * The functions below set the same graphics state as the GX library.
