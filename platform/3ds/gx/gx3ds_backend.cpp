@@ -1011,6 +1011,9 @@ static inline void copyMap(const EfbCopy* c, float& as, float& bs, float& at, fl
 // A profiler ceiling (profile_steps = trades): the texture copies of colour formats left out, with
 // their clears (the mirror's and the screen texture's in Delfino Plaza); one-byte maps still copied.
 static volatile int s_skipColourCopies;
+// A profiler step (profile_steps = lighting): 1 the shader's lights drawn without attenuation, 2 no
+// lighting in the shader (each lit draw's factor flat, as without normals).
+static volatile int s_lightMode;
 
 static EfbCopy* findEfbCopy(const void* p) {
 	for (EfbCopy& c : s_efbCopies)
@@ -3256,7 +3259,7 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	const uint32_t amb = rs.xfReg[XFR_AMB0 + ch], aamb = rs.xfReg[XFR_AMB0 + cha];
 	const bool litC = ((cctrl >> 1) & 1) && !chanSaturated(cctrl, amb, false),
 	           litA = ((actrl >> 1) & 1) && !chanSaturated(actrl, aamb, true);
-	const bool lit = !debug && (litC || litA) && hasNrm;
+	const bool lit = !debug && (litC || litA) && hasNrm && s_lightMode < 2;
 	if (s_verbose && ((cctrl >> 1) & 1)) logLighting(ch, cha, hasNrm, hasClr, L, defPm);
 
 	PicaGxUniforms u;
@@ -3439,6 +3442,7 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 			}
 			u.lit = 1;
 			u.lights = uint8_t(nl);
+			if (s_lightMode == 1) u.attn = 0;
 		}
 	}
 
@@ -6047,6 +6051,7 @@ void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.tx
 void GX3DS_SetGxPoll(int on) { gx::s_gxPoll = on != 0; }  // settings.txt gx_poll
 void GX3DS_SetGamePoll(int on) { gx::s_gamePoll = on != 0; }
 void GX3DS_SetSkipColourCopies(int on) { gx::s_skipColourCopies = on != 0; }
+void GX3DS_SetLightMode(int mode) { gx::s_lightMode = mode; }
 void GX3DS_SetSkipTev(unsigned id, unsigned to) {
 	gx::s_skipTev = id;
 	gx::s_skipTevTo = to > id ? to : id;

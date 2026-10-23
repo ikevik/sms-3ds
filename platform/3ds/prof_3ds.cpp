@@ -111,6 +111,7 @@ void GX3DS_SetGxPoll(int on);
 int GX3DS_GxPoll(void);
 void SMS3DS_AudioFeedHere(int on);
 void GX3DS_SetSkipColourCopies(int on);  // gx3ds_backend.cpp: colour texture copies left out (trades)
+void GX3DS_SetLightMode(int mode);       // ... the shader's lights unattenuated (1), no lighting in it (2)
 extern float GXPC_CullFar;               // gx_fifo.cpp (sms-port patch 0051): draws farther than this left out
 void pica_set_cache_way(int way);  // pica_draw.c: the frame's cache work in kernel calls (0), through GSP (1), ...
 int pica_cache_way(void);
@@ -956,6 +957,29 @@ const GameStep kLitePlusSteps[kLitePlusN] = {
     kStdSteps[kGsChecks],
 };
 #undef SMS3DS_STEP
+// autorun.txt profile_steps = lighting (main.cpp, SMS3DS_ProfLightingSteps): what GX lighting in
+// the vertex shader costs. Between windows of this build: the shader's attenuated lights drawn
+// without attenuation, and no lighting in the shader (each lit draw's factor flat, as without
+// normals: no normal matrices or per-vertex lights). The lite setting as set (autorun.txt
+// lite = plus for the play settings). Phases untimed; then every check.
+enum { kLpNoAttn = 128, kLpFlatLight = 256 };
+#define SMS3DS_STEP(name, plus, role) \
+	{name, 0, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1, 0, 0, 0, 0, 0, plus}
+enum { kLightingN = 11 };
+const GameStep kLightingSteps[kLightingN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, kRoleWarm),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("lights not attenuated", kLpNoAttn, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("no lighting in the shader", kLpFlatLight, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("lights not attenuated", kLpNoAttn, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    SMS3DS_STEP("no lighting in the shader", kLpFlatLight, kRoleCeiling),
+    SMS3DS_STEP("this build", 0, kRoleNormal),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
 int s_trade;  // this window's kTr* (SMS3DS_ProfSkip)
 void litePlusApply(int plus);  // more trims on top of the lite setting (below)
 double s_gameOwn[32], s_gameWaitMs[32], s_gameIdleMs[32];  // untimed steps: the game thread's own work, waits, pacing
@@ -968,7 +992,8 @@ double s_gameSkips[32];  // each step's performs left out a frame
 enum { kStepMax2 = kGpuN > kGsN ? kGpuN : kGsN, kStepMax3 = kRvN > kStepMax2 ? kRvN : kStepMax2,
        kStepMax4 = kCacheN > kStepMax3 ? kCacheN : kStepMax3, kStepMax5 = kFixedN > kStepMax4 ? kFixedN : kStepMax4,
        kStepMax6 = kTradeN > kStepMax5 ? kTradeN : kStepMax5, kStepMax7 = kLiteN > kStepMax6 ? kLiteN : kStepMax6,
-       kGameStepMax = kLitePlusN > kStepMax7 ? kLitePlusN : kStepMax7 };
+       kStepMax8 = kLitePlusN > kStepMax7 ? kLitePlusN : kStepMax7,
+       kGameStepMax = kLightingN > kStepMax8 ? kLightingN : kStepMax8 };
 static_assert(kGameStepMax <= 32, "s_gameSkips");
 // The run's steps: the standard ones, or the GPU's ceilings.
 const GameStep* s_steps = kStdSteps;
@@ -1044,6 +1069,7 @@ void setGameStep(int k) {
 	s_trade = g ? g->trade : 0;
 	liteApply(g && g->lite ? g->lite == 2 : s_liteOn);
 	if (g && g->litePlus) litePlusApply(g->litePlus);
+	GX3DS_SetLightMode(g && (g->litePlus & kLpFlatLight) ? 2 : g && (g->litePlus & kLpNoAttn) ? 1 : 0);
 	skipGate();
 	GX3DS_SetSkipColourCopies(s_trade & kTrMirror);
 	GXPC_CullFar = g && g->farCull ? float(g->farCull) : SMS3DS_LiteFar;
@@ -2369,6 +2395,12 @@ extern "C" void SMS3DS_ProfLitePlusSteps(void) {
 	s_steps = kLitePlusSteps;
 	s_stepN = kLitePlusN;
 	s_stepVerify = kLitePlusN - 1;
+}
+// autorun.txt profile_steps = lighting (main.cpp): GX lighting's cost (kLightingSteps).
+extern "C" void SMS3DS_ProfLightingSteps(void) {
+	s_steps = kLightingSteps;
+	s_stepN = kLightingN;
+	s_stepVerify = kLightingN - 1;
 }
 // autorun.txt profile_steps = lite (main.cpp): the lite setting off and on in turn (kLiteSteps).
 extern "C" void SMS3DS_ProfLiteSteps(void) {

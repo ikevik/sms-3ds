@@ -492,6 +492,7 @@ extern "C" void SMS3DS_ProfLiteSteps(void);     // ... profile_steps = lite
 extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist);  // prof_3ds.cpp: settings.txt lite
 extern "C" void SMS3DS_SetLiteParts(int particles, int seaStep, int actorDist, int shineOff);
 extern "C" void SMS3DS_ProfLitePlusSteps(void);  // ... profile_steps = liteplus
+extern "C" void SMS3DS_ProfLightingSteps(void);  // ... profile_steps = lighting
 extern "C" void GX3DS_SetGxPoll(int on);        // gx3ds_backend.cpp: settings.txt gx_poll
 extern "C" void GX3DS_SetPerfTimers(int on);  // gx3ds_backend.cpp: the [perf] breakdown by phase timed
 extern "C" void GX3DS_SetDrawStateCheck(int on);  // ... draws taking the last draw's setup checked
@@ -759,6 +760,7 @@ static void* game_thread(void*)
 			if (strcmp(v, "trades") == 0) SMS3DS_ProfTradeSteps();
 			if (strcmp(v, "lite") == 0) SMS3DS_ProfLiteSteps();
 			if (strcmp(v, "liteplus") == 0) SMS3DS_ProfLitePlusSteps();
+			if (strcmp(v, "lighting") == 0) SMS3DS_ProfLightingSteps();
 		}
 		if (setting_value(kAutoPath, "profile_auto_quit", v, sizeof v)) s_profAutoQuit = strcmp(v, "on") == 0;
 		if (SMS3DS_DemoStage >= 0 || s_profAuto > 0 || s_quitAfter > 0)
