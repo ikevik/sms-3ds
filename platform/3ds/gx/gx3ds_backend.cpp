@@ -2862,6 +2862,7 @@ struct TevCacheEntry {
 	PicaState st;
 	bool translated;
 	unsigned dumpId;
+	uint32_t usedFrame;  // the render frame it was last found in (s_rFrames)
 };
 static std::unordered_map<uint64_t, TevCacheEntry> s_tevCache;
 static const size_t kTevCacheMax = 1024;
@@ -3184,22 +3185,14 @@ static void drawTriangles() {
 	// which give PICA texture units to the pairs they use (none in debug-colour mode).
 	const bool debug = s_debugColors;
 	uint64_t perfTev0 = perfTick(), tevT1 = perfTev0;
-	TevSetup tev;
-	PicaTex* ptex[kMaxPairs] = {};
-	const EfbCopy* pcopy[kMaxPairs] = {};
-	bool pwhite[kMaxPairs];
-	PicaState st;
-	bool translated = true;
-	unsigned dumpId = 0;
-	PicaTex* utex[PICA_MAX_TEX] = {};
-	const EfbCopy* ucopy[PICA_MAX_TEX] = {};
-	int ucoord[PICA_MAX_TEX] = {};
 	// A draw that comes with no change to anything worked out below (the BP, XF and konst registers,
 	// the TLUTs, the texture images and the EFB copies: s_rsGen; the vertex format; the frame, as
 	// the textures are checked once a frame; the colour modes) takes the last draw's TEV setup,
 	// textures and PICA state as they were: in Delfino Plaza 42% of the draws (a material's shapes
-	// after its first), each saving the TEV read, the texture lookups, the state and its key.
-	static struct {
+	// after its first), each saving the TEV read, the texture lookups, the state and its key. They
+	// are worked out in place (s_fp), so taking them copies nothing; the CPU path, which changes the
+	// state for its own draw, leaves them invalid.
+	struct FastState {
 		bool valid, debug, opaque;
 		uint32_t gen, fmt, frame;
 		TevSetup tev;
@@ -3212,22 +3205,31 @@ static void drawTriangles() {
 		PicaTex* utex[PICA_MAX_TEX];
 		const EfbCopy* ucopy[PICA_MAX_TEX];
 		int ucoord[PICA_MAX_TEX];
-	} s_fp;
+	};
+	static FastState s_fp, s_fpOld;  // (s_fpOld: draw_state_check's copy)
+	TevSetup& tev = s_fp.tev;
+	PicaTex*(&ptex)[kMaxPairs] = s_fp.ptex;
+	const EfbCopy*(&pcopy)[kMaxPairs] = s_fp.pcopy;
+	bool(&pwhite)[kMaxPairs] = s_fp.pwhite;
+	PicaState& st = s_fp.st;
+	bool& translated = s_fp.translated;
+	unsigned& dumpId = s_fp.dumpId;
+	PicaTex*(&utex)[PICA_MAX_TEX] = s_fp.utex;
+	const EfbCopy*(&ucopy)[PICA_MAX_TEX] = s_fp.ucopy;
+	int(&ucoord)[PICA_MAX_TEX] = s_fp.ucoord;
 	const bool same = s_fp.valid && s_fp.gen == s_rsGen && s_fp.fmt == r_fmt && s_fp.frame == s_rFrames &&
 	                  s_fp.debug == debug && s_fp.opaque == s_opaque && !s_verbose && !s_tracing;
 	if (same && !s_fpCheck) {
-		tev = s_fp.tev;
-		memcpy(ptex, s_fp.ptex, sizeof ptex);
-		memcpy(pcopy, s_fp.pcopy, sizeof pcopy);
-		memcpy(pwhite, s_fp.pwhite, sizeof pwhite);
-		st = s_fp.st;
-		translated = s_fp.translated;
-		dumpId = s_fp.dumpId;
-		memcpy(utex, s_fp.utex, sizeof utex);
-		memcpy(ucopy, s_fp.ucopy, sizeof ucopy);
-		memcpy(ucoord, s_fp.ucoord, sizeof ucoord);
 		s_drawsFast++;
 	} else {
+		if (same) s_fpOld = s_fp;
+		memset(ptex, 0, sizeof ptex);
+		memset(pcopy, 0, sizeof pcopy);
+		translated = true;
+		dumpId = 0;
+		memset(utex, 0, sizeof utex);
+		memset(ucopy, 0, sizeof ucopy);
+		memset(ucoord, 0, sizeof ucoord);
 		readTev(tev);
 		{
 			const uint64_t t = perfTick() - perfTev0;
@@ -3269,6 +3271,7 @@ static void drawTriangles() {
 		}
 		const bool cached = hitEntry != nullptr;
 		if (cached) {
+			const_cast<TevCacheEntry*>(hitEntry)->usedFrame = s_rFrames;
 			tev = hitEntry->tev;
 			st = hitEntry->st;
 			translated = hitEntry->translated;
@@ -3310,10 +3313,16 @@ static void drawTriangles() {
 			s_tevPartTicks[2] += t2 - tevT1;
 			tevT1 = t2;
 			if (s_tevCache.size() >= kTevCacheMax) {
-				s_tevCache.clear();
+				// The entries not found in the last two frames go (animated TEV colours make new keys
+				// every frame); emptying the whole cache made every material miss again after it.
+				for (auto it = s_tevCache.begin(); it != s_tevCache.end();)
+					it = it->second.usedFrame + 2 < s_rFrames ? s_tevCache.erase(it) : std::next(it);
+				if (s_tevCache.size() >= kTevCacheMax) s_tevCache.clear();
+				s_lastTevEntry = nullptr;
 				s_tevClears++;
 			}
 			TevCacheEntry& e = s_tevCache[tevKey];
+			e.usedFrame = s_rFrames;
 			s_lastTevKey = tevKey;
 			s_lastTevEntry = &e;
 			s_tevEntries = uint32_t(s_tevCache.size());
@@ -3366,11 +3375,12 @@ static void drawTriangles() {
 		// setup works it out, and each part is compared with what it would have taken.
 		if (same) {
 			s_fpChecked++;
-			const bool differs = memcmp(&tev, &s_fp.tev, sizeof tev) != 0 || memcmp(ptex, s_fp.ptex, sizeof ptex) != 0 ||
-			                     memcmp(pcopy, s_fp.pcopy, sizeof pcopy) != 0 ||
-			                     memcmp(pwhite, s_fp.pwhite, sizeof pwhite) != 0 || memcmp(&st, &s_fp.st, sizeof st) != 0 ||
-			                     translated != s_fp.translated || memcmp(utex, s_fp.utex, sizeof utex) != 0 ||
-			                     memcmp(ucopy, s_fp.ucopy, sizeof ucopy) != 0 || memcmp(ucoord, s_fp.ucoord, sizeof ucoord) != 0;
+			const bool differs = memcmp(&tev, &s_fpOld.tev, sizeof tev) != 0 || memcmp(ptex, s_fpOld.ptex, sizeof ptex) != 0 ||
+			                     memcmp(pcopy, s_fpOld.pcopy, sizeof pcopy) != 0 ||
+			                     memcmp(pwhite, s_fpOld.pwhite, sizeof pwhite) != 0 || memcmp(&st, &s_fpOld.st, sizeof st) != 0 ||
+			                     translated != s_fpOld.translated || memcmp(utex, s_fpOld.utex, sizeof utex) != 0 ||
+			                     memcmp(ucopy, s_fpOld.ucopy, sizeof ucopy) != 0 ||
+			                     memcmp(ucoord, s_fpOld.ucoord, sizeof ucoord) != 0;
 			if (differs) s_fpDiffer++;
 		}
 		s_fp.valid = true;
@@ -3379,16 +3389,6 @@ static void drawTriangles() {
 		s_fp.frame = s_rFrames;
 		s_fp.debug = debug;
 		s_fp.opaque = s_opaque;
-		s_fp.tev = tev;
-		memcpy(s_fp.ptex, ptex, sizeof ptex);
-		memcpy(s_fp.pcopy, pcopy, sizeof pcopy);
-		memcpy(s_fp.pwhite, pwhite, sizeof pwhite);
-		s_fp.st = st;
-		s_fp.translated = translated;
-		s_fp.dumpId = dumpId;
-		memcpy(s_fp.utex, utex, sizeof utex);
-		memcpy(s_fp.ucopy, ucopy, sizeof ucopy);
-		memcpy(s_fp.ucoord, ucoord, sizeof ucoord);
 	}
 	{
 		const uint64_t t3 = perfTick();
@@ -3397,6 +3397,7 @@ static void drawTriangles() {
 	}
 	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
 	s_cpuBatches++;
+	s_fp.valid = false;  // (the CPU path changes the state for its own draw)
 	if (r_spans) {
 		flattenSpans();
 		n = r_count;
@@ -3667,6 +3668,11 @@ static uint32_t s_dBp[8], s_dXm[4], s_dTlut[32];  // BP registers, 16-word XF me
 // population count of all 44 words cost the GX thread ~7% of its time (the ARM11 has no popcount
 // instruction).
 static uint32_t s_dNbp, s_dNxm, s_dNt;
+// The XF registers written since the last state record (bit r: register r), and their number: a
+// record carries only these (it carried all 88 whenever one changed). The render side gives every
+// register its last sent value again where native J3D changed it since (renderState), as copying
+// all 88 did.
+static uint32_t s_dXrMask[3], s_dNxr;
 static bool s_dXr, s_dAny, s_dAll = true;
 static const uint32_t kXmBlocks = XF_MEM_WORDS / 16, kTlutBlocks = TMEM_TLUT_SIZE / 512;
 // Profiler. Game side: waits, queue use. Render side: busy and idle time, and the game side's
@@ -3732,6 +3738,13 @@ void xfTouched(uint32_t addr) {
 		s_dNxm += (w & bit) == 0;
 		w |= bit;
 	} else {
+		const uint32_t r = addr - XF_REG_BASE;
+		if (r < XF_REG_COUNT) {
+			uint32_t& w = s_dXrMask[r >> 5];
+			const uint32_t bit = 1u << (r & 31);
+			s_dNxr += (w & bit) == 0;
+			w |= bit;
+		}
 		s_dXr = true;
 	}
 	s_dAny = true;
@@ -3845,7 +3858,7 @@ static inline uint32_t popcount(const uint32_t* m, int words) {
 // The registers written since the last state record, as one. Layout after the header: flags (bit
 // 0: XF registers follow, bit 1: XF memory blocks, bit 2: TLUT blocks), BP mask (8 words) and the
 // registers it names, then if flagged the XF memory block mask (4) and the blocks, the TLUT block
-// mask (32) and the blocks, and the XF registers. (The masks of no blocks are left out: TLUTs
+// mask (32) and the blocks, and the XF register mask (3) and the registers it names. (The masks of no blocks are left out: TLUTs
 // change a few times a frame, and copying and scanning their 32-word mask in every record cost the
 // GX and render threads more than the registers.)
 // Bytes of the registers written since the last state record (0: none).
@@ -3858,12 +3871,14 @@ static uint32_t stateBytes() {
 		s_dNbp = popcount(s_dBp, 8);
 		s_dNxm = popcount(s_dXm, 4);
 		s_dNt = popcount(s_dTlut, 32);
+		for (uint32_t r = 0; r < XF_REG_COUNT; r++) s_dXrMask[r >> 5] |= 1u << (r & 31);
+		s_dNxr = XF_REG_COUNT;
 		s_dXr = s_dAny = true;
 		s_dAll = false;
 	}
 	if (!s_dAny) return 0;
 	return 4 + 32 + s_dNbp * 4 + (s_dNxm ? 16 + s_dNxm * 64 : 0) + (s_dNt ? 128 + s_dNt * 512 : 0) +
-	       (s_dXr ? XF_REG_COUNT * 4 : 0);
+	       (s_dXr ? 12 + s_dNxr * 4 : 0);
 }
 
 // Writes them (stateBytes() bytes) and starts over.
@@ -3895,7 +3910,14 @@ static void writeState(uint8_t* dst) {
 			}
 		memset(s_dTlut, 0, sizeof s_dTlut);
 	}
-	if (s_dXr) memcpy(w, g.xfReg, XF_REG_COUNT * 4);
+	if (s_dXr) {
+		memcpy(w, s_dXrMask, 12);
+		w += 3;
+		for (int k = 0; k < 3; k++)
+			for (uint32_t m = s_dXrMask[k]; m; m &= m - 1) *w++ = g.xfReg[k * 32 + __builtin_ctz(m)];
+		memset(s_dXrMask, 0, sizeof s_dXrMask);
+		s_dNxr = 0;
+	}
 	memset(s_dBp, 0, sizeof s_dBp);
 	s_dNbp = s_dNxm = s_dNt = 0;
 	s_dXr = s_dAny = false;
@@ -3941,6 +3963,8 @@ static void rcBatchRoom(size_t bytes) {
 	if (end > s_qSpan) s_qSpan = end;
 }
 
+static uint32_t s_xrSent[XF_REG_COUNT];  // render side: each XF register's last value sent
+static uint32_t s_xrNative[3];            // ... the registers native J3D changed since (bit r)
 static void renderState(const uint8_t* p) {
 	const uint32_t* w = reinterpret_cast<const uint32_t*>(p);
 	const uint32_t flags = *w++;
@@ -3970,7 +3994,24 @@ static void renderState(const uint8_t* p) {
 				w += 128;
 			}
 	}
-	if (flags & 1) memcpy(rs.xfReg, w, XF_REG_COUNT * 4);
+	if (flags & 1) {
+		// The XF registers sent, then the last sent value again for each register native J3D
+		// changed since: what copying all 88 from the GX thread's set did.
+		uint32_t m3[3];
+		memcpy(m3, w, 12);
+		w += 3;
+		for (int k = 0; k < 3; k++)
+			for (uint32_t b = m3[k]; b; b &= b - 1) {
+				const int r = k * 32 + __builtin_ctz(b);
+				rs.xfReg[r] = s_xrSent[r] = *w++;
+			}
+		for (int k = 0; k < 3; k++)
+			for (uint32_t b = s_xrNative[k]; b; b &= b - 1) {
+				const int r = k * 32 + __builtin_ctz(b);
+				rs.xfReg[r] = s_xrSent[r];
+			}
+		memset(s_xrNative, 0, sizeof s_xrNative);
+	}
 }
 
 static void enqueueDraw() {
@@ -4149,7 +4190,9 @@ static void renderXFWord(uint32_t a, uint32_t v) {
 		rs.xfMem[a] = v;
 		xfMemChanged(a, a);
 	} else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT && rs.xfReg[a - XF_REG_BASE] != v) {
-		rs.xfReg[a - XF_REG_BASE] = v;
+		const uint32_t r = a - XF_REG_BASE;
+		rs.xfReg[r] = v;
+		s_xrNative[r >> 5] |= 1u << (r & 31);
 		s_rsGen++;
 	}
 }

@@ -38,7 +38,7 @@
      writeBPImpl(value);
      if (g.bp[reg] != before) bpTouched(reg);
  #else
-@@ -462,7 +487,50 @@
+@@ -462,6 +487,45 @@
  }
  
  void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
@@ -47,7 +47,7 @@
 +    // flushes a pending batch, so later calls did nothing) and the renderer's dirty mark once per
 +    // 16-word block from the first changed word to the last (it marks blocks; one with no change in
 +    // between sends the same values again), not a compare, a hook and a mark per word: the GX
-+    // thread's biggest item in Azahar. The registers word by word, marked once (as a whole).
++    // thread's biggest item in Azahar. The registers word by word, each marked.
 +    bool changed = false;
 +    if (addr < XF_MEM_WORDS) {
 +        const uint32_t n = count < uint32_t(XF_MEM_WORDS - addr) ? count : uint32_t(XF_MEM_WORDS - addr);
@@ -66,8 +66,7 @@
 +        words += n;
 +        count -= n;
 +    }
-+    bool regMarked = false;
-     for (uint32_t i = 0; i < count; i++, addr++) {
++    for (uint32_t i = 0; i < count; i++, addr++) {
 +        const uint32_t v = words[i];
 +        if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
 +            uint32_t r = addr - XF_REG_BASE;
@@ -77,19 +76,15 @@
 +                    changed = true;
 +                }
 +                g.xfReg[r] = v;
-+                if (!regMarked) {
-+                    regMarked = true;
-+                    xfTouched(addr);
-+                }
++                xfTouched(addr);  // (each one: the renderer is sent the registers that changed)
 +            }
 +        }
 +    }
 +#else
-+    for (uint32_t i = 0; i < count; i++, addr++) {
+     for (uint32_t i = 0; i < count; i++, addr++) {
          uint32_t v = words[i];
          if (addr < XF_MEM_WORDS) {
-             if (g.xfMem[addr] != v) {
-@@ -479,6 +547,7 @@
+@@ -479,6 +543,7 @@
              }
          }
      }
@@ -97,7 +92,7 @@
  }
  
  void writeXFf(uint16_t addr, uint32_t count, const float* f) {
-@@ -1592,7 +1661,19 @@
+@@ -1592,7 +1657,19 @@
          const bool opTimed = streamTop && GXPC_Detail && ((++s_opSample & 15) == 0);
          const uint64_t opT0 = opTimed ? svcGetSystemTick() : 0;
  #endif
@@ -118,10 +113,11 @@
              len = 6;
              if (avail < len) break;
              CMD_COUNT(5);
-@@ -1644,17 +1725,6 @@
+@@ -1643,18 +1720,7 @@
+                 s_dlDepth++;
                  runCommands(dl, sz);
                  s_dlDepth--;
-             }
+-            }
 -        } else if (op == 0x61) {
 -            len = 5;
 -            if (avail < len) break;
@@ -130,13 +126,13 @@
 -            if (wrStudy()) {
 -                if (streamTop) wrCountBP(0, be32(p + 1));
 -                else wrFromList(0, p[1]);
--            }
+             }
 -#endif
 -            writeBP(be32(p + 1));
          } else if (op >= 0x80 && op < 0xC0) {
              CMD_COUNT(0);
  #if defined(__3DS__)
-@@ -1686,7 +1756,7 @@
+@@ -1686,7 +1752,7 @@
              continue;
          }
  #if defined(__3DS__)

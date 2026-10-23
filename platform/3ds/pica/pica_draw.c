@@ -2191,6 +2191,7 @@ int pica_thread_start(void (*fn)(void*), void* arg)
 }
 /* The GX back end's GX thread: on core 1 (the system core, up to 80% of its time for the
  * application), just above the thread that starts it; events 2 and 3. Returns 1, or -1. */
+int pica_gx_core = 1; /* autorun.txt gx_thread_core (profiling in Azahar): another core for it */
 int pica_gx_thread_start(void (*fn)(void*), void* arg)
 {
 	LightEvent_Init(&s_evt[2], RESET_ONESHOT);
@@ -2198,6 +2199,7 @@ int pica_gx_thread_start(void (*fn)(void*), void* arg)
 	s32 prio = 0x30;
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 	if (prio > 0x19) prio--;
+	if (pica_gx_core != 1 && threadCreate(fn, arg, 256u << 10, prio, pica_gx_core, true)) return 1;
 	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)) && threadCreate(fn, arg, 256u << 10, prio, 1, true)) return 1;
 	return -1;
 }

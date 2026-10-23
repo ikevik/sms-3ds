@@ -79,6 +79,7 @@ extern "C" void SMS3DS_TimelineReport(void);
 // for the threads of its later cores): the game thread made on that core with threadCreate (as
 // libctru makes pthreads: priority 0x3F) instead of pthread_create's core 0. -1: as normal.
 static int s_gameCore = -1;
+extern "C" int pica_gx_core;  // pica_draw.c: the GX thread's core (autorun.txt gx_thread_core, profiling)
 extern "C" unsigned SMS3DS_ProfRunsDone;  // prof_3ds.cpp: profile runs finished so far
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
@@ -946,6 +947,7 @@ int main()
 	{
 		char v[16];
 		if (setting_value(SMS_DIR "/autorun.txt", "game_thread_core", v, sizeof v)) s_gameCore = atoi(v);
+		if (setting_value(SMS_DIR "/autorun.txt", "gx_thread_core", v, sizeof v)) pica_gx_core = atoi(v);
 	}
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
