@@ -271,6 +271,7 @@ extern "C" uint32_t GXPC_CullFarRuns, GXPC_CullFarVerts;
 static uint32_t s_perfCullRuns0, s_perfCullVerts0;
 extern "C" size_t GXPC_DlCacheBytes(void);
 extern "C" uint32_t GXPC_DlEntryCount(void);
+extern "C" int GXPC_DlCacheClearNow(void);  // gx_fifo.cpp (sms-port patch 0052)
 extern "C" uint32_t GXPC_DlFail[7];  // patch 0009: why cached lists could not be reused
 static uint32_t s_perfDlFail0[7];
 extern "C" uint32_t GXPC_CmdCount[7];  // patch 0010: commands parsed, by kind
@@ -360,7 +361,7 @@ static size_t arenaPageCount();
 static size_t arenaBytes();
 static uint32_t arenaResets();
 static uint32_t arenaFullCount();
-static void arenaFrameEnd();
+static void arenaFrameEnd(bool force = false);
 static int debugColorMode();  // SELECT's mode: 0 material, 1 debug colours, 2 opaque
 static bool renderThreaded();    // the render thread runs (else records are drawn as they are queued)
 static uint64_t gameWaitTicks(); // the profiler window's game-thread wait for the render thread
@@ -4885,6 +4886,7 @@ static uint32_t s_agen = 1;
 static bool s_arenaOn = true, s_aresetDue, s_apagesInit;
 static size_t s_abytes;
 static uint32_t s_aresetFrame, s_aresets, s_afull;
+static std::atomic<bool> s_newStage(false);  // GX3DS_NewStage: the main thread saw a new stage load
 static const uint32_t kArenaPage = 256u << 10;
 static const size_t kArenaMax = size_t(8) << 20;
 static const uint32_t kArenaReserve = 3u << 20;  // linear memory left for textures and the rest
@@ -5276,12 +5278,13 @@ static size_t arenaBytes() { return s_abytes; }
 static uint32_t arenaResets() { return s_aresets; }
 static uint32_t arenaFullCount() { return s_afull; }
 
-// After a frame went to the GPU: empty the pages once uploads have stopped for lack of room.
-// Game side, after a display copy was queued: the render thread and the GPU are let finish first.
-static void arenaFrameEnd() {
+// After a frame went to the GPU: empty the pages once uploads have stopped for lack of room (or
+// at once for a new stage: force). Game side, after a display copy was queued: the render thread
+// and the GPU are let finish first.
+static void arenaFrameEnd(bool force) {
 	if (!s_aresetDue) return;
 	s_aresetDue = false;
-	if (g_displayFrames - s_aresetFrame < kArenaResetGap && s_aresets) return;
+	if (!force && g_displayFrames - s_aresetFrame < kArenaResetGap && s_aresets) return;
 	if (s_rtCore >= 0) gameWaitFor(s_gWait[2], [] { return s_tail.load() == s_wpos; });
 	pica_gpu_idle();  // every queued frame done with the pages
 	for (const ArenaPage& p : s_apages) pica_linear_free_block(p.base);
@@ -5822,7 +5825,19 @@ void executeCopy(uint32_t ctrl) {
 			s_sFramesDone.store(g_displayFrames, std::memory_order_release);
 			pica_event_signal(EV_GAME);
 		}
-		arenaFrameEnd();
+		// A new stage (GX3DS_NewStage): the display-list cache and the resident vertex pages start
+		// over, here between two frames (kept, the stages left behind filled the heap).
+		bool fresh = false;
+		if (s_newStage.load(std::memory_order_relaxed)) {
+			const uint32_t n = GXPC_DlEntryCount(), kb = uint32_t(GXPC_DlCacheBytes() >> 10);
+			if (GXPC_DlCacheClearNow()) {
+				s_newStage.store(false);
+				s_aresetDue = fresh = true;
+				fprintf(stderr, "[gx] new stage: the display-list cache (%lu lists, %lu KB) and the resident vertex pages (%lu KB) emptied\n",
+				        (unsigned long)n, (unsigned long)kb, (unsigned long)(s_abytes >> 10));
+			}
+		}
+		arenaFrameEnd(fresh);
 		if (s_rtCore >= 0) gameWaitFor(s_gWait[1], [] { return s_gFrames - s_rDone.load() <= 1; });
 	}
 }
@@ -6052,6 +6067,7 @@ void GX3DS_SetGxPoll(int on) { gx::s_gxPoll = on != 0; }  // settings.txt gx_pol
 void GX3DS_SetGamePoll(int on) { gx::s_gamePoll = on != 0; }
 void GX3DS_SetSkipColourCopies(int on) { gx::s_skipColourCopies = on != 0; }
 void GX3DS_SetLightMode(int mode) { gx::s_lightMode = mode; }
+void GX3DS_NewStage(void) { gx::s_newStage.store(true); }
 void GX3DS_SetSkipTev(unsigned id, unsigned to) {
 	gx::s_skipTev = id;
 	gx::s_skipTevTo = to > id ? to : id;

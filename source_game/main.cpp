@@ -91,6 +91,8 @@ static ScriptPress s_press[64];
 static int s_nPress;
 static float s_shotAt[64];
 static int s_nShot, s_shotNext;
+static float s_newStageAt[16];  // autorun.txt new_stage_at = <seconds>,...: the renderer told a new stage loads (testing)
+static int s_nNewStage, s_newStageNext;
 static float s_cpuPathAt = -1.0f;  // autorun.txt cpu_path_at = <seconds>: the CPU vertex path from then on (comparing the paths)
 static float s_traceAt = -1.0f;  // autorun.txt trace_at = <seconds>: that frame's GX commands traced (sdmc:/sms/trace-N.txt)
 static u64 s_launchMs;
@@ -125,6 +127,7 @@ extern "C" unsigned SMS3DS_ProfRunsDone;  // prof_3ds.cpp: profile runs finished
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
 void GX3DS_SetSkipTev(unsigned id, unsigned to);  // gx3ds_backend.cpp: autorun.txt skip_tev (debugging)
+void GX3DS_NewStage(void);  // gx3ds_backend.cpp: a new stage loads (the renderer's caches of the last go)
 extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
 int GX3DS_GetGpuTransform(void);
 void GX3DS_GetPathStats(uint32_t out[2]);
@@ -262,6 +265,9 @@ static void log_scene(uint32_t frames, uint32_t batches)
 	SceneState s = read_scene();
 	u64 now      = osGetTime();
 	bool changed = !have_last || memcmp(&s, &last, sizeof s) != 0;
+	// Another stage or scenario: a new stage loads, and the display lists cached for the last one
+	// go (the stages left behind filled the heap: crash dump 41).
+	if (have_last && (s.curr_stage != last.curr_stage || s.curr_scen != last.curr_scen)) GX3DS_NewStage();
 	if (!changed && now - last_ms < 1000)
 		return;
 	fprintf(stderr,
@@ -735,6 +741,9 @@ static void* game_thread(void*)
 				for (char* p = strtok(list, ","); p && s_nShot < 64; p = strtok(nullptr, ",")) s_shotAt[s_nShot++] = float(atof(p));
 			if (setting_value(kAutoPath, "trace_at", list, sizeof list)) s_traceAt = float(atof(list));
 			if (setting_value(kAutoPath, "cpu_path_at", list, sizeof list)) s_cpuPathAt = float(atof(list));
+			if (setting_value(kAutoPath, "new_stage_at", list, sizeof list))
+				for (char* p = strtok(list, ","); p && s_nNewStage < 16; p = strtok(nullptr, ","))
+					s_newStageAt[s_nNewStage++] = float(atof(p));
 			if (s_nPress || s_nShot)
 				fprintf(stderr, "[3ds] autorun.txt: %d scripted button presses, %d screenshots\n", s_nPress, s_nShot);
 		}
@@ -877,6 +886,39 @@ static void status_thread(void*) {
 // render thread, then the retrace timer). When nothing runs in this process afterwards (no loader
 // return address), the heaps are left to svcExitProcess, which stops every thread before it frees
 // the process's memory; a loader that returns into the process gets them back first, as there.
+// A fatal error on another thread (abort(): OSPanic, the GX layer's fatal(), a thread that could
+// not be made; or exit()) ends the process through libctru's __appExit with the main loop still
+// running, and libctru's own version lost the error: abort() does not flush stdio, so its message
+// was still in the log's buffer when the SD card was closed, and hidExit unmapped HID's shared
+// memory under the main loop, whose next hidScanInput faulted (crash dump 41, on the way back to
+// Delfino Plaza after Bianco Hills' first episode). Here the log is written first, with the
+// thread and the code addresses on its stack, and HID stays mapped (the process's end frees it).
+static u32 s_mainThreadId;
+extern "C" char __start__[], __exidx_start[];  // 3dsx.ld: code and read-only data
+extern "C" void __appExit(void)
+{
+	u32 id = 0;
+	svcGetThreadId(&id, CUR_THREAD_HANDLE);
+	if (id != s_mainThreadId) {
+		fprintf(stderr, "[3ds] the process is ending from thread %lu, not the main thread (%lu): a fatal error there\n",
+		        (unsigned long)id, (unsigned long)s_mainThreadId);
+		// Words on this thread's stack that point into code or read-only data, nearest first: its
+		// callers among them (build/elf-archive's ELF, addr2line).
+		const u32* sp = (const u32*)__builtin_frame_address(0);
+		const u32 lo = (u32)(uintptr_t)__start__, hi = (u32)(uintptr_t)__exidx_start;
+		fprintf(stderr, "[3ds]   code addresses on its stack:");
+		for (int i = 0, shown = 0; i < 256 && shown < 40; i++)
+			if (sp[i] >= lo && sp[i] < hi && !(sp[i] & 3)) fprintf(stderr, " %08lx", (unsigned long)sp[i]), shown++;
+		fputc('\n', stderr);
+		dump_os_threads("at the fatal error");
+	}
+	flush_log();
+	archiveUnmountAll();
+	fsExit();
+	aptExit();
+	srvExit();
+}
+
 extern "C" {
 extern u32 __ctru_heap, __ctru_heap_size, __ctru_linear_heap, __ctru_linear_heap_size;
 extern void (*__system_retAddr)(void);
@@ -900,6 +942,7 @@ void __libctru_exit(int rc)
 int main()
 {
 	s_launchMs = osGetTime();
+	svcGetThreadId(&s_mainThreadId, CUR_THREAD_HANDLE);  // (__appExit: who ended the process)
 	osSetSpeedupEnable(true);
 	gfxInitDefault();
 	// The top screen belongs to the renderer (platform/3ds/pica, citro3d on the game thread);
@@ -1119,8 +1162,9 @@ int main()
 		// presses before hidKeysDown() saw them). START alone is the game's Start button, so quitting
 		// needs START+SELECT.
 		hidScanInput();
-		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_cpuPathAt >= 0.0f) {  // autorun.txt buttons, shots, trace_at, cpu_path_at
+		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_cpuPathAt >= 0.0f || s_nNewStage) {  // autorun.txt timed keys
 			const float t = float(osGetTime() - s_launchMs) / 1000.0f;
+			while (s_newStageNext < s_nNewStage && t >= s_newStageAt[s_newStageNext]) s_newStageNext++, GX3DS_NewStage();
 			if (s_cpuPathAt >= 0.0f && t >= s_cpuPathAt) {
 				GX3DS_SetGpuTransform(0);
 				s_cpuPathAt = -1.0f;

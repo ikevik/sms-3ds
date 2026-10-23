@@ -1,0 +1,61 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -2012,6 +2012,14 @@
+     s_dlIndex.clear();
+     s_dlCacheBytes = 0;
+ }
++#if defined(__3DS__)
++// 3DS port: the heap holds some 86 MB in all, so the cache starts over long before upstream's
++// 96 MB (GXPC_DlCacheMax), and the back end empties it when a new stage loads
++// (GXPC_DlCacheClearNow). Kept, the lists of the stages left behind added up: its 13 MB of runs
++// took some 19 MB of heap after Delfino Plaza and Bianco Hills, and the game ended at the next
++// movie's start with 83 of 86 MB in use (crash dump 41).
++static int s_dlActive;  // callDisplayListAt calls running (a cached list may be mid-replay)
++#endif
+ static uint32_t s_dlLo[16], s_dlHi[16], s_dlElem[16];  // while recording: index range per array
+ FILE* traceFile();
+ 
+@@ -2070,6 +2078,18 @@
+ #if defined(__3DS__)
+ }  // namespace gx
+ extern "C" size_t GXPC_DlCacheBytes(void) { return gx::s_dlCacheBytes; }
++#if defined(__3DS__)
++extern "C" {
++size_t GXPC_DlCacheMax = size_t(12) << 20;  // bytes of runs and state commands kept at most
++}
++// The front half's thread, between two commands: empties the cache unless a list is being called
++// (1: emptied).
++extern "C" int GXPC_DlCacheClearNow(void) {
++    if (gx::s_dlActive) return 0;
++    gx::dlClear();
++    return 1;
++}
++#endif
+ extern "C" uint32_t GXPC_DlEntryCount(void) { return uint32_t(gx::s_dlEntries.size()); }
+ namespace gx {
+ #endif
+@@ -2487,6 +2507,10 @@
+     GXPC_DL_TIMER(dlt, 3);
+     GXPC_DL_COUNT(GXPC_DlCalls++);
+ #if defined(__3DS__)
++    struct Active {
++        Active() { s_dlActive++; }
++        ~Active() { s_dlActive--; }
++    } active;
+     s_dlSeq++;
+     GX_ZONE(GZ_DL_CHECK);
+ #endif
+@@ -2603,8 +2627,13 @@
+ #else
+     if (misses >= 3) e.skip = 4u << (misses - 3 < 8 ? misses - 3 : 8);
+ #endif
++#if defined(__3DS__)
++    if (s_dlCacheBytes > GXPC_DlCacheMax) {  // keep the cache bounded: start over
++        if (s_dlActive == 1) dlClear();  // (not while a list that called this one is replayed)
++#else
+     if (s_dlCacheBytes > (size_t(96) << 20)) {  // keep the cache bounded: start over
+         dlClear();
++#endif
+         runCommands(data, size);
+         return;
+     }
