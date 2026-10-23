@@ -2342,16 +2342,17 @@ extern "C" void SMS3DS_ProfGpuSteps(void) {
 	s_stepN = kGpuN;
 	s_stepVerify = kGpuN - 1;
 }
-// settings.txt lite = on (main.cpp): the lite setting, with its draw distance and its shadows'
-// distance (game units; 0 or less: the defaults, 4000 and 2000).
+// settings.txt lite = on (main.cpp): the lite setting, with its draw distance (game units; 0: no
+// limit; negative: the default, 4000) and its shadows' distance (0: Mario's and Yoshi's only;
+// negative: the default, 2000).
 extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist) {
-	if (drawDist > 0) s_liteFar = float(drawDist);
+	if (drawDist >= 0) s_liteFar = float(drawDist);
 	if (shadowDist >= 0) s_liteShadowDist = float(shadowDist);
 	s_liteOn = on != 0;
 	liteApply(s_liteOn);
 	if (s_liteOn)
 		fprintf(stderr, "[3ds] lite: on (shadows only within %.0f besides Mario's and Yoshi's, one particle in %d, nothing "
-		        "drawn wholly past %.0f, no mirror, NPCs and objects clipped past %.0f (0: the game's), the sea's grid every "
+		        "drawn wholly past %.0f (0: no limit), no mirror, NPCs and objects clipped past %.0f (0: the game's), the sea's grid every "
 		        "%d, the Shine's shadow %s)\n", double(s_liteShadowDist), s_liteParticles, double(s_liteFar),
 		        double(s_liteActorFar), s_liteSeaStep, s_liteShine ? "drawn" : "not drawn");
 }

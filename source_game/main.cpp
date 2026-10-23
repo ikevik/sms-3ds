@@ -637,19 +637,21 @@ static void* game_thread(void*)
 		// lite = on: console-only quality trades for frame rate (prof_3ds.cpp, SMS3DS_SetLite): shadows near
 		// the camera only (lite_shadow_distance, default 2000; 0: Mario's and Yoshi's only), one particle
 		// in lite_particles (default 2),
-		// nothing drawn past lite_draw_distance (default 4000), no mirror; and if given, NPCs and objects
+		// nothing drawn past lite_draw_distance (default 4000; 0: no limit), no mirror; and if given, NPCs and objects
 		// clipped past lite_actor_distance, the sea's grid every lite_sea_step, lite_shine_shadow = off.
-		// lite = plus: all of those, as measured on a New 3DS in Delfino Plaza (36 -> ~33 ms a frame on
-		// top of lite): Mario's and Yoshi's shadows only, one particle in 4, nothing drawn past 3000,
-		// NPCs and objects clipped past 2500, the sea's grid every 2, the Shine's shadow not drawn. Each
-		// lite_* key still overrides. autorun.txt's lite before settings.txt's.
+		// lite = plus: more of those, as measured on a New 3DS in Delfino Plaza (~36 -> ~33 ms a frame on
+		// top of lite): Mario's and Yoshi's shadows only, one particle in 4, the sea's grid every 2, the
+		// Shine's shadow not drawn, and no draw distance limit, NPCs and objects clipped as the game does
+		// (shorter ones looked unfinished, and moving through Plaza they saved nothing measurable). Each
+		// lite_* key still overrides (lite_draw_distance = 0: no limit). autorun.txt's lite before
+		// settings.txt's.
 		if (setting_value(SMS_DIR "/autorun.txt", "lite", v, sizeof v) || setting_value(kSettingsPath, "lite", v, sizeof v)) {
 			const bool plus = strcmp(v, "plus") == 0, on = plus || strcmp(v, "on") == 0;
-			const int dd = setting_value(kSettingsPath, "lite_draw_distance", v, sizeof v) ? atoi(v) : plus ? 3000 : 0;
+			const int dd = setting_value(kSettingsPath, "lite_draw_distance", v, sizeof v) ? atoi(v) : plus ? 0 : -1;
 			const int sd = setting_value(kSettingsPath, "lite_shadow_distance", v, sizeof v) ? atoi(v) : plus ? 0 : -1;
 			const int pn = setting_value(kSettingsPath, "lite_particles", v, sizeof v) ? atoi(v) : plus ? 4 : -1;
 			const int ss = setting_value(kSettingsPath, "lite_sea_step", v, sizeof v) ? atoi(v) : plus ? 2 : -1;
-			const int ad = setting_value(kSettingsPath, "lite_actor_distance", v, sizeof v) ? atoi(v) : plus ? 2500 : -1;
+			const int ad = setting_value(kSettingsPath, "lite_actor_distance", v, sizeof v) ? atoi(v) : -1;
 			const int so = setting_value(kSettingsPath, "lite_shine_shadow", v, sizeof v) ? strcmp(v, "off") == 0 : plus ? 1 : -1;
 			SMS3DS_SetLiteParts(pn, ss, ad, so);
 			SMS3DS_SetLite(on, dd, sd);
