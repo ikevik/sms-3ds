@@ -65,6 +65,21 @@ extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 #endif
 extern "C" int SMS3DS_DemoStage, SMS3DS_DemoScenario;
 int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
+// Unattended runs, driven from a computer (as in Azahar): sdmc:/sms/autorun.txt may give
+// boot_stage (<stage>-<scenario>: booted into and returned to, as a demo build's), skip_movies
+// (on: the movies skipped, as settings.txt's skip_movies), profile_auto (seconds of free play
+// before the low touch's run starts by itself; 0 off), profile_auto_quit (on: quit once that run
+// is done) and quit_after (seconds of free play before quitting; 0 off). Free play: the stage's
+// director in its play state, drawing a scene. It may also give perf_timers and draw_state_check,
+// as settings.txt does, and gx_detail (on: the GX thread's commands timed, as in profile runs).
+static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
+extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
+extern "C" void SMS3DS_TimelineReport(void);
+// autorun.txt game_thread_core (profiling in Azahar, whose debugger stub reads fresh registers only
+// for the threads of its later cores): the game thread made on that core with threadCreate (as
+// libctru makes pthreads: priority 0x3F) instead of pthread_create's core 0. -1: as normal.
+static int s_gameCore = -1;
+extern "C" unsigned SMS3DS_ProfRunsDone;  // prof_3ds.cpp: profile runs finished so far
 void pica_request_stop(void);
 void GX3DS_SetVerboseLog(int on);
 extern volatile uint64_t GX3DS_MainBusyTicks;  // gx3ds_backend.cpp: the [perf] "status screen" share
@@ -377,6 +392,12 @@ static const char kDefaultSettings[] =
     "# search (slower).\n"
     "name_cache = on\n"
     "\n"
+    "# The [perf] lines' breakdown of the renderer's time by phase (tex, tev, xform, submit, decode,\n"
+    "# batch, append), timed (on) or not (off). It reads the clock thousands of times a frame: about\n"
+    "# 2 ms a frame on a New 3DS and far more in Azahar. The frame and the threads' times are always\n"
+    "# timed.\n"
+    "# perf_timers = off\n"
+    "\n"
     "# What touching the bottom right of the bottom screen low down runs: the game thread's steps\n"
     "# (steps) or the game thread by object (objects). Higher up it starts the whole profile run.\n"
     "profile_low_touch = steps\n";
@@ -413,6 +434,9 @@ extern "C" void GXPC_SetStateBlockOps(int mode);  // patch 0038: state resets as
 extern "C" int SMS3DS_ResetTexOnce;  // decomp patch 3ds-0024: the lights' reset loads its textures once
 extern "C" int SMS3DS_TelopClip;     // decomp patch 3ds-0026: the ticker's glyphs outside its window left out
 extern "C" int SMS3DS_NameCache;     // decomp patch 3ds-0029: the event watcher's name lookups cached
+extern "C" void GX3DS_SetPerfTimers(int on);  // gx3ds_backend.cpp: the [perf] breakdown by phase timed
+extern "C" void GX3DS_SetDrawStateCheck(int on);  // ... draws taking the last draw's setup checked
+extern "C" int GXPC_Detail;  // patch 0027: the GX thread's command timing, as in profile runs
 extern "C" void GXPC_SetStateBlockCompiled(int on);  // patch 0039 (gx_state_block_compiled)
 extern "C" void pica_set_heap_flush(int on);  // pica_draw.c (heap_flush)
 extern "C" void SMS3DS_ProfSetLowTouch(int part);  // prof_3ds.cpp (settings.txt profile_low_touch)
@@ -529,7 +553,8 @@ static void* game_thread(void*)
 	{
 		char v[16];
 		int mode = SMS3DS_AUDIO_DEFAULT, cycle = 0;
-		if (setting_value(kSettingsPath, "audio", v, sizeof v))
+		// (autorun.txt's audio, for an unattended run, before settings.txt's)
+		if (setting_value(SMS_DIR "/autorun.txt", "audio", v, sizeof v) || setting_value(kSettingsPath, "audio", v, sizeof v))
 			mode = strcmp(v, "off") == 0 ? 0 : strcmp(v, "on") == 0 ? 1 : strcmp(v, "software") == 0 ? 2
 			     : strcmp(v, "silent") == 0 ? 3 : SMS3DS_AUDIO_DEFAULT;
 		if (setting_value(kSettingsPath, "audio_cycle", v, sizeof v)) cycle = atoi(v);
@@ -578,6 +603,31 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "ticker_clipped", v, sizeof v)) SMS3DS_TelopClip = strcmp(v, "off") != 0;
 		if (setting_value(kSettingsPath, "name_cache", v, sizeof v))
 			SMS3DS_NameCache = strcmp(v, "off") == 0 ? 0 : strcmp(v, "verify") == 0 ? 2 : 1;
+		if (setting_value(kSettingsPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
+		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
+		static const char kAutoPath[] = SMS_DIR "/autorun.txt";
+		if (setting_value(kAutoPath, "boot_stage", v, sizeof v)) {
+			int stage = -1, scenario = 0;
+			if (sscanf(v, "%d-%d", &stage, &scenario) >= 1) {
+				SMS3DS_DemoStage = stage;
+				SMS3DS_DemoScenario = scenario;
+			}
+		}
+		if (setting_value(kAutoPath, "skip_movies", v, sizeof v) && strcmp(v, "on") == 0)
+			setenv("SMS_SKIP_MOVIES", "1", 1);
+		if (setting_value(kAutoPath, "quit_after", v, sizeof v)) s_quitAfter = atoi(v);
+		if (setting_value(kAutoPath, "timeline", v, sizeof v)) s_timelineAt = atoi(v);
+		if (setting_value(kAutoPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
+		if (setting_value(kAutoPath, "draw_state_check", v, sizeof v)) GX3DS_SetDrawStateCheck(strcmp(v, "on") == 0);
+		if (setting_value(kAutoPath, "gx_detail", v, sizeof v) && strcmp(v, "on") == 0) GXPC_Detail = 1;
+		if (setting_value(kAutoPath, "profile_auto", v, sizeof v)) s_profAuto = atoi(v);
+		if (setting_value(kAutoPath, "profile_auto_quit", v, sizeof v)) s_profAutoQuit = strcmp(v, "on") == 0;
+		if (SMS3DS_DemoStage >= 0 || s_profAuto > 0 || s_quitAfter > 0)
+			fprintf(stderr,
+			        "[3ds] autorun.txt: boot stage %d-%d, movies %s, the low touch's run after %d s of free play%s, "
+			        "quit after %d s of it\n",
+			        SMS3DS_DemoStage, SMS3DS_DemoScenario, getenv("SMS_SKIP_MOVIES") ? "skipped" : "played", s_profAuto,
+			        s_profAutoQuit ? " (then quit)" : "", s_quitAfter);
 		fprintf(stderr, "[3ds] the sea: %s (sea_precomputed)\n", SMS3DS_WaveMode ? "worked out once per column and row" : "vertex by vertex");
 		if (setting_value(kSettingsPath, "profile_low_touch", v, sizeof v))
 			SMS3DS_ProfSetLowTouch(strcmp(v, "objects") == 0 ? 5 : 4);
@@ -893,11 +943,22 @@ int main()
 	}
 	flush_log();
 
+	{
+		char v[16];
+		if (setting_value(SMS_DIR "/autorun.txt", "game_thread_core", v, sizeof v)) s_gameCore = atoi(v);
+	}
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setstacksize(&attr, 4u << 20);  // the game's call chains are deep
 	pthread_t th;
 	if (!gpuOk) {
+	} else if (s_gameCore >= 0) {
+		if (!threadCreate([](void* a) { game_thread(a); }, NULL, 4u << 20, 0x3F, s_gameCore, true)) {
+			printf("cannot start the game thread\n");
+			fprintf(stderr, "[3ds] threadCreate on core %d failed\n", s_gameCore);
+		} else {
+			fprintf(stderr, "[3ds] the game thread on core %d (autorun.txt game_thread_core)\n", s_gameCore);
+		}
 		// A hung GPU would only stop the game at its first frame again.
 	} else if (pthread_create(&th, &attr, game_thread, NULL) != 0) {
 		printf("cannot start the game thread\n");
@@ -921,6 +982,52 @@ int main()
 		prevHeld = held;
 		if ((held & (KEY_START | KEY_SELECT)) == (KEY_START | KEY_SELECT))
 			break;
+		// Unattended runs (autorun.txt), checked once a second. Free play: the stage's director in its
+		// play state (TMarDirector state 4) drawing a scene (100 or more draw batches a frame; an
+		// arrival movie draws a few quads). The low touch's run starts after profile_auto seconds of
+		// it, and the app quits once that run is done or after quit_after seconds of it.
+		if ((s_profAuto > 0 || s_profAutoQuit || s_quitAfter > 0) && g_phase == 2) {
+			static unsigned autoTick, autoSecs, playSecs, autoFrames0, autoBatches0;
+			static bool autoStarted;
+			if (++autoTick % 60 == 0) {
+				const SceneState sc = read_scene();
+				uint32_t st[7];
+				GX3DS_GetStats(st);
+				const uint32_t df = st[0] - autoFrames0, db = st[1] - autoBatches0;
+				autoFrames0 = st[0];
+				autoBatches0 = st[1];
+				const bool freePlay = sc.state == 5 && sc.mar_state == 4 && df && db >= 100 * df;  // (THP plays as world textures)
+				if (freePlay) playSecs++;
+				// The frame timeline (autorun.txt timeline): phases timed for a sixth of a second
+				// after that many seconds of free play, then its report.
+				static int timelineState;
+				if (s_timelineAt > 0 && timelineState == 0 && playSecs >= (unsigned)s_timelineAt && !SMS3DS_ProfOn) {
+					SMS3DS_ProfOn = 2;
+					SMS3DS_TimelineOn = 1;
+					timelineState = 1;
+				} else if (timelineState == 1) {
+					SMS3DS_TimelineOn = 0;
+					SMS3DS_ProfOn = 0;
+					SMS3DS_TimelineReport();
+					timelineState = 2;
+				}
+				if (s_quitAfter > 0 && playSecs >= (unsigned)s_quitAfter) {
+					fprintf(stderr, "[3ds] autorun: %u s of free play, quitting\n", playSecs);
+					break;
+				}
+				if (s_profAuto > 0 && !autoStarted) {
+					autoSecs = freePlay ? autoSecs + 1 : 0;
+					if (autoSecs >= (unsigned)s_profAuto) {
+						autoStarted = true;
+						fprintf(stderr, "[3ds] autorun: the low touch's run starts after %u s of gameplay\n", autoSecs);
+						SMS3DS_ProfRequestGame();
+					}
+				} else if (s_profAutoQuit && SMS3DS_ProfRunsDone) {  // also after a run started by touch
+					fprintf(stderr, "[3ds] autorun: the run is done, quitting\n");
+					break;
+				}
+			}
+		}
 		// SELECT on its own cycles the colours (material, debug, opaque), on its release, so the
 		// first half of a START+SELECT quit pressed SELECT first does not switch them.
 		static bool selectAlone;

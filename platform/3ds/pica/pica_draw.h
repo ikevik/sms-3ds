@@ -170,11 +170,11 @@ int pica_alloc_raw(uint32_t vbytes, uint32_t nidx, void** verts, uint16_t** idx)
 /* F for GX-mode draws: the PICA projection applied after o (view space -> EFB pixels and
  * GameCube depth, homogeneous; rows). */
 void pica_gx_projection(const float o[4][4], PicaGxUniforms* u);
-/* Draws GX-mode triangles. pos_rows/nrm_rows are XF matrix rows 0-29 (normal rows padded),
- * uploaded when matrices_dirty. Returns 0 when the layout cannot be expressed (draw it in CPU
- * mode instead). */
+/* Draws GX-mode triangles. pos_rows/nrm_rows are XF matrix rows 0-29 (normal rows padded); the
+ * position rows in matrices_dirty (bit r: row r changed since the last call) are uploaded again,
+ * where they differ. Returns 0 when the layout cannot be expressed (draw it in CPU mode instead). */
 int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
-                 const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
+                 const PicaGxUniforms* u, uint32_t matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
                  const PicaState* st);
 
 /* Draws triangles from the last pica_alloc. */

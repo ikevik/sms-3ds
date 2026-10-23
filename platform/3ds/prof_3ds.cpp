@@ -28,12 +28,17 @@
 // (state blocks against their separate writes, the sea against its original vertices). It ends
 // with the batch's saving, a scorecard of the frame's limits, and the drawing routines' table
 // (draw zones, also timed with phases only). A run that sets a direction instead has ceilings, each
-// compared with the normal windows either side (kRoleCeiling). This one's batch is the event
-// watcher's name cache (decomp patch 3ds-0029, SMS3DS_NameCache: off, then on), with draw zones
-// 37-48 inside the game logic's biggest callers (decomp patch 3ds-0028) and J3D's material entries
-// timed by part in every window (J3DJoint::entryIn, SMS3DS_J3DEntryTicks); the checks window has
-// every answer from the cache checked against a full search. Earlier runs' steps, kept as settings
-// in the table: the drill-down run's GPU test windows (SMS3DS_ProfDrawSkip) put the Shine's shadow
+// compared with the normal windows either side (kRoleCeiling). This one has no batch: this
+// build's own windows, then every check (as used in Azahar, where runs start themselves:
+// autorun.txt, main.cpp). Earlier runs' steps, kept as settings in the table: in Azahar, the maths
+// in plain single precision saved the game thread 1.4 ms at most and its GX writes dropped at the
+// API 3.7; the sky's model timed in parts (draw zones 49-59, decomp patch 3ds-0030) showed its
+// 3.4 ms "entry" to be the audio thread's turns landing there (the sky's model left out saved the
+// game thread 0.5 ms); J3D's entries timed whole and by material (one in four each, a sample
+// dropped if another emulated thread or an interrupt source ran inside it: SMS3DS_PortEvents);
+// the event watcher's name cache (decomp patch 3ds-0029) took its lookups 1.32 -> 0.02
+// ms a frame and the frame 51.4 -> 50.4, 0 differing of 480 answers checked; the drill-down run's
+// GPU test windows (SMS3DS_ProfDrawSkip) put the Shine's shadow
 // volume at 2.1 ms of GPU, the water volume and its silhouette at 1.6, the water's refraction and
 // specular and the sky's sphere at ~0; the game-logic objects ranked with objects timed
 // (kRoleRank) put Mario's movement first (2.5 ms), then the NPCs (2.3), the particle manager (1.7);
@@ -71,6 +76,8 @@
 // kSampleNs: the function the game thread is in, by phase, without timing each call. Other builds
 // never call the hooks and leave it out.
 #include <3ds.h>
+#include <algorithm>
+#include <atomic>
 #include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +138,15 @@ int SMS3DS_J3DCeiling;
 // (TModelWaterManager), 2 the water's refraction and specular, 4 the water volume and its
 // silhouette, 8 the sky's sphere. 0 in normal play.
 int SMS3DS_ProfDrawSkip;
+unsigned SMS3DS_ProfRunsDone;  // profile runs finished ("[prof] done"), for unattended runs (main.cpp)
+// A frame timeline (autorun.txt timeline, main.cpp): while SMS3DS_TimelineOn, the game thread's
+// phase changes and frame-end waits and the GX and render threads' waits for work, stamped,
+// printed once by SMS3DS_TimelineReport. Who: 0 game phase (what: the phase), 1 GX thread waits,
+// 2 GX thread wakes, 3 render thread waits, 4 render thread wakes, 5 game thread waits at the frame
+// end, 6 game thread done waiting.
+int SMS3DS_TimelineOn;
+void SMS3DS_TimelineEvent(int who, int what);
+void SMS3DS_TimelineReport(void);
 // The event watcher's name cache (decomp patch 3ds-0029): the name tree's changes so far, the
 // cache's mode (0 off, 1 on: settings.txt name_cache; 2 each answer from it checked against a full
 // search), its counters (lookups by name, answered from the cache, checked, differing, answers
@@ -141,8 +157,17 @@ unsigned SMS3DS_NameCacheStats[5];
 // J3D's material entries (decomp patch 3ds-0029, J3DJoint::entryIn) in profile runs: time by part
 // for the materials timed (one in four), and the counts (seen, timed, unlocked, entered).
 unsigned long long SMS3DS_J3DEntryTicks[4];
-unsigned SMS3DS_J3DEntryCount[4];
+unsigned SMS3DS_J3DEntryCount[6];  // decomp patch 3ds-0030: and dropped, joints visited
 unsigned long long SMS3DS_Ticks(void) { return svcGetSystemTick(); }
+// Decomp patch 3ds-0030: one J3DModel::entry in four timed whole (calls, timed, dropped); the sky's
+// model being performed (its zones, 49-59); the port's emulated thread switches and interrupt
+// deliveries so far (a sampled timer drops a sample during which this moved).
+unsigned long long SMS3DS_J3DModelEntryTicks;
+unsigned SMS3DS_J3DModelEntryCount[3];
+int SMS3DS_ZoneSky;
+unsigned long long port_os_switches(void);
+unsigned long long port_irq_deliveries(void);
+unsigned long long SMS3DS_PortEvents(void) { return port_os_switches() + port_irq_deliveries(); }
 int SMS3DS_PrintClip;
 float SMS3DS_PrintClipX0, SMS3DS_PrintClipX1;
 unsigned long SMS3DS_PrintGlyphs[2];
@@ -248,7 +273,7 @@ uint64_t s_calls;
 // sms-port patch 0039, the state blocks and their commands' parts; from 30 on 3ds-0025, the HUD's
 // and the particles' parts and the shadows' GX setup), nested ones included: calls, ticks, GX stream bytes. The open ones are a
 // stack (they nest, on the game thread).
-enum { kZones = 49 };
+enum { kZones = 60 };
 const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys::drawInit", "TLightCommon::setLight",
                                        "TLightMario::setLight", "J3DDrawBuffer::draw", "JPAEmitterManager::draw",
                                        "TMapObjWave::draw", "ReInitializeGX + SMS_DrawInit",
@@ -267,7 +292,12 @@ const char* const kZoneName[kZones] = {"ReInitializeGX", "SMS_DrawInit", "J3DSys
                                        "TSky: the sphere", "event watcher: name lookups", "TEventWatcher::perform",
                                        "hit checks: checkActorsHit", "clipping: TLiveManager::clipActorsAux",
                                        "clipping: TMapObjBaseManager::clipActors", "water: draw cue",
-                                       "water: refraction and specular"};
+                                       "water: refraction and specular", "sky: anim frames and anims in",
+                                       "sky: J3DModel::calc", "sky calc: vertices, deform, vertex colours",
+                                       "sky calc: joint matrices", "sky calc: envelopes, skin, callback",
+                                       "sky: anims out", "sky: viewCalc", "sky view: draw matrices",
+                                       "sky view: normals, billboards, bump", "sky view: flushes, shape packets",
+                                       "sky: entry"};
 uint64_t s_zoneTicks[kZones], s_zoneBytes[kZones];
 uint32_t s_zoneCalls[kZones];
 struct ZoneOpen {
@@ -684,18 +714,16 @@ enum { kRoleNormal, kRoleOn, kRoleCeiling, kRoleWarm, kRoleChecks, kRoleRank };
 // thread nothing), at the pipe (the game thread makes them; the GX thread, the render thread and the
 // GPU never see them), or not drawn at all.
 enum { kJ3dNormal, kJ3dMuteApi, kJ3dMutePipe, kJ3dNoDraw };
-// The batch: the event watcher's name cache, off (normal) and on, alternately; then the checks, with
-// every answer from the cache checked against a full search.
-enum { kGsWarm, kGsOff1, kGsOn1, kGsOff2, kGsOn2, kGsOff3, kGsChecks, kGameStepN };
+// This build's own windows, then every check this port has (native J3D verified on the render
+// thread, the state blocks against their separate writes, the sea against its original vertices,
+// the name cache against full searches).
+enum { kGsWarm, kGsN1, kGsN2, kGsChecks, kGameStepN };
 const GameStep kGameSteps[kGameStepN] = {
     {"warm-up (not compared)", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleWarm, 0, 0, 0, -1},
-    {"the name cache off", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, 0},
-    {"the name cache on", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0, 0, 1},
-    {"the name cache off", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, 0},
-    {"the name cache on", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleOn, 0, 0, 0, 1},
-    {"the name cache off", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, 0},
-    {"the name cache on, every check run, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0, 3, 1, 0, 2, 2,
-     -1, -1, -1, kRoleChecks, 0, 0, 0, 2},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, -1},
+    {"this build", 2, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, kRoleNormal, 0, 0, 0, -1},
+    {"this build, every check run, the name cache checked, native J3D verified (not for timing)", 2, 0, 0, 0, 0, 1, 0,
+     3, 1, 0, 2, 2, -1, -1, -1, kRoleChecks, 0, 0, 0, 2},
 };
 int s_heapFlushSaved = 1;  // pica_heap_flush before part 4 (put back after it)
 int s_compiledSaved = 1;  // GXPC_StateBlockCompiled before part 4 (put back after it)
@@ -721,7 +749,9 @@ int s_nativeSaved = -1, s_packagesSaved = 1;
 uint64_t s_nj0[9];                  // GXPC_J3DTicks and GXPC_J3DOpTicks at the window's start
 unsigned s_names0[6];               // SMS3DS_NameCacheStats and SMS3DS_NameTreeGen at the window's start
 unsigned long long s_entryT0[4];    // SMS3DS_J3DEntryTicks at the window's start
-unsigned s_entryN0[4];              // SMS3DS_J3DEntryCount at the window's start
+unsigned s_entryN0[6];              // SMS3DS_J3DEntryCount at the window's start
+unsigned long long s_modelT0;       // SMS3DS_J3DModelEntryTicks at the window's start
+unsigned s_modelN0[3];              // SMS3DS_J3DModelEntryCount at the window's start
 uint32_t s_njOps0[2];               // GXPC_J3DOps at the window's start
 // Native J3D's ops on the GX thread, ms/frame: the parts (0-6 scaled from the timed ops), the
 // hand-overs (7), all of the ops (8); and the ops a frame.
@@ -1430,7 +1460,34 @@ int SMS3DS_ProfState(void) {
 	return s_state >= 13 || s_request == 2 ? 4 : s_state == 4 ? 3 : (s_state == 3 || (s_state >= 5 && s_state <= 12)) ? 2 : s_state == 2 || s_request ? 1 : 0;
 }
 
+struct TlEv {
+	uint64_t t;
+	uint8_t who, what;
+};
+static TlEv s_tl[4096];
+static std::atomic<uint32_t> s_tlN{0};
+void SMS3DS_TimelineEvent(int who, int what) {
+	if (!SMS3DS_TimelineOn) return;
+	const uint32_t i = s_tlN.fetch_add(1, std::memory_order_relaxed);
+	if (i < 4096) s_tl[i] = TlEv{svcGetSystemTick(), uint8_t(who), uint8_t(what)};
+}
+void SMS3DS_TimelineReport(void) {
+	const uint32_t n = std::min<uint32_t>(s_tlN.load(), 4096);
+	if (!n) return;
+	std::sort(s_tl, s_tl + n, [](const TlEv& a, const TlEv& b) { return a.t < b.t; });
+	static const char* const kWho[7] = {"game phase", "GX thread waits", "GX thread wakes", "render thread waits",
+	                                    "render thread wakes", "game thread waits at the frame end",
+	                                    "game thread done waiting"};
+	const uint64_t t0 = s_tl[0].t;
+	fprintf(stderr, "[tl] frame timeline, %lu events (ms from the first):\n", (unsigned long)n);
+	for (uint32_t i = 0; i < n; i++)
+		fprintf(stderr, "[tl] %8.3f %s%s%s\n", double(s_tl[i].t - t0) / kTicksPerMs, kWho[s_tl[i].who],
+		        s_tl[i].who == 0 ? " " : "", s_tl[i].who == 0 && s_tl[i].what < PHASES ? kPhaseName[s_tl[i].what] : "");
+	s_tlN.store(0);
+}
+
 void SMS3DS_ProfPhase(int phase) {
+	SMS3DS_TimelineEvent(0, phase);
 	const uint64_t now = svcGetSystemTick();
 	s_phaseTicks[s_phase] += now - s_phaseLast;
 	s_phaseLast = now;
@@ -1690,6 +1747,8 @@ void SMS3DS_ProfFrame(void) {
 			s_names0[5] = SMS3DS_NameTreeGen;
 			memcpy(s_entryT0, SMS3DS_J3DEntryTicks, sizeof s_entryT0);
 			memcpy(s_entryN0, SMS3DS_J3DEntryCount, sizeof s_entryN0);
+			s_modelT0 = SMS3DS_J3DModelEntryTicks;
+			memcpy(s_modelN0, SMS3DS_J3DModelEntryCount, sizeof s_modelN0);
 			s_glyph0[1] = SMS3DS_PrintGlyphs[1];
 			s_verify0[0] = GXPC_J3DStats[15];  // NJ_VERIFIED
 			s_verify0[1] = GXPC_J3DPkgStats[0];
@@ -1744,20 +1803,29 @@ void SMS3DS_ProfFrame(void) {
 				fprintf(stderr, "\n");
 			}
 			{
-				unsigned n[4];
-				for (int i = 0; i < 4; i++) n[i] = SMS3DS_J3DEntryCount[i] - s_entryN0[i];
-				const double scale = n[1] ? double(n[0]) / n[1] : 0;
+				// Each sampled figure is scaled by all the runs over the timed ones kept (the dropped
+				// ones' time was partly other threads' or interrupt sources').
+				unsigned n[6], m[3];
+				for (int i = 0; i < 6; i++) n[i] = SMS3DS_J3DEntryCount[i] - s_entryN0[i];
+				for (int i = 0; i < 3; i++) m[i] = SMS3DS_J3DModelEntryCount[i] - s_modelN0[i];
+				const double scale = n[1] ? double(n[0]) / n[1] : 0, mscale = m[1] ? double(m[0]) / m[1] : 0;
 				double ms[4], all = 0;
 				for (int i = 0; i < 4; i++) {
 					ms[i] = double(SMS3DS_J3DEntryTicks[i] - s_entryT0[i]) * scale / kFrames / kTicksPerMs;
 					all += ms[i];
 				}
+				const double whole = double(SMS3DS_J3DModelEntryTicks - s_modelT0) * mscale / kFrames / kTicksPerMs;
 				fprintf(stderr,
-				        "[prof]   J3D's material entries (J3DJoint::entryIn, one in four timed): %.1f a frame, %.1f unlocked, "
-				        "%.1f entered, %.2f ms | packets' lookup and material animation %.2f | material calc and "
-				        "matrices %.2f | packets set and entry %.2f | display lists %.2f\n",
-				        n[0] / double(kFrames), n[2] / double(kFrames), n[3] / double(kFrames), all, ms[0], ms[1], ms[2],
-				        ms[3]);
+				        "[prof]   J3D's material entries (J3DJoint::entryIn, one in four timed, %u kept, %u dropped): %.1f "
+				        "a frame, %.1f unlocked, %.1f entered, %.2f ms | packets' lookup and material animation %.2f | "
+				        "material calc and matrices %.2f | packets set and entry %.2f | display lists %.2f\n",
+				        n[1], n[4], n[0] / double(kFrames), n[2] / double(kFrames), n[3] / double(kFrames), all, ms[0],
+				        ms[1], ms[2], ms[3]);
+				fprintf(stderr,
+				        "[prof]   J3D's model entries (J3DModel::entry whole, one in four timed, %u kept, %u dropped): %.1f "
+				        "a frame, %.2f ms; %.1f joints visited a frame; outside the materials (joints, recursion, setup) "
+				        "%.2f ms\n",
+				        m[1], m[2], m[0] / double(kFrames), whole, n[5] / double(kFrames), whole - all);
 			}
 			if (s_gameNjOps[k] > 0)
 				fprintf(stderr,
@@ -1795,6 +1863,7 @@ void SMS3DS_ProfFrame(void) {
 			pica_set_gpu_test(0);
 			reportGameSaved();
 			fprintf(stderr, "[prof] done\n");
+			SMS3DS_ProfRunsDone++;
 			s_state = 0;
 		}
 		return;
@@ -1810,6 +1879,7 @@ void SMS3DS_ProfFrame(void) {
 			if (!s_nSkip) {
 				SMS3DS_ProfOn = 0;
 				fprintf(stderr, "[prof] game thread by object: no drawing objects found\n[prof] done\n");
+				SMS3DS_ProfRunsDone++;
 				s_state = 0;
 				return;
 			}
@@ -1848,6 +1918,7 @@ void SMS3DS_ProfFrame(void) {
 					SMS3DS_ProfSkipOn = 0;
 					reportSkip();
 					fprintf(stderr, "[prof] done\n");
+					SMS3DS_ProfRunsDone++;
 					s_state = 0;
 					return;
 				}

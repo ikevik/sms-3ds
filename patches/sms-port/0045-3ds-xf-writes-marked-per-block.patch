@@ -1,0 +1,147 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -328,12 +328,37 @@
+ // 3DS port: writeBP tells the renderer which register it wrote (bpTouched), so its render thread
+ // gets only the registers that changed.
+ static void writeBPImpl(uint32_t value);
++#if defined(__3DS__)
++// 3DS port: the BP registers whose write does more than store the value (writeBPImpl's special
++// cases: the mask, the TEV colour registers (konst ones by their value), copies, tokens, draw-done,
++// the TLUT load, texture invalidation, the copy destination and the texture images). Any other one
++// with no mask pending is a compare and a store, done without writeBPImpl's tests.
++static const struct BpSpecial {
++    uint8_t is[256];
++    BpSpecial() : is() {
++        is[BP_MASK] = 1;
++        for (int i = 0; i < 8; i++) is[BP_TEV_REG + i] = 1;
++        is[BP_COPY_EXEC] = is[BP_PE_TOKEN_INT] = is[BP_PE_TOKEN] = is[BP_DRAWDONE] = 1;
++        is[BP_LOADTLUT1] = is[BP_TEXINVALIDATE] = is[BP_COPY_DST] = 1;
++        for (int i = 0; i < 4; i++) is[BP_TX_IMAGE3 + i] = is[BP_TX_IMAGE3 + 0x20 + i] = 1;
++    }
++} s_bpSpecial;
++#endif
+ void writeBP(uint32_t value) {
+ #if defined(__3DS__)
+     // Only a value that changed: J3D sends most registers again for every shape (on Delfino Plaza
+     // ~73% of the BP writes changed nothing), and each register touched is copied into the next
+     // draw record and applied again on the render thread.
+     const uint32_t reg = value >> 24, before = g.bp[reg];
++    if (!s_bpSpecial.is[reg] && g.bpMask == 0xFFFFFF) {
++        const uint32_t data = value & 0xFFFFFF;
++        if (before != data) {
++            onStateChange();
++            g.bp[reg] = data;
++            bpTouched(reg);
++        }
++        return;
++    }
+     writeBPImpl(value);
+     if (g.bp[reg] != before) bpTouched(reg);
+ #else
+@@ -462,7 +487,50 @@
+ }
+ 
+ void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
++#if defined(__3DS__)
++    // 3DS port: XF memory as a run, compared and copied whole: the state-change hook once (it only
++    // flushes a pending batch, so later calls did nothing) and the renderer's dirty mark once per
++    // 16-word block from the first changed word to the last (it marks blocks; one with no change in
++    // between sends the same values again), not a compare, a hook and a mark per word: the GX
++    // thread's biggest item in Azahar. The registers word by word, marked once (as a whole).
++    bool changed = false;
++    if (addr < XF_MEM_WORDS) {
++        const uint32_t n = count < uint32_t(XF_MEM_WORDS - addr) ? count : uint32_t(XF_MEM_WORDS - addr);
++        uint32_t* mem = &g.xfMem[addr];
++        uint32_t first = 0;
++        while (first < n && mem[first] == words[first]) first++;
++        if (first < n) {
++            uint32_t last = n - 1;
++            while (mem[last] == words[last]) last--;
++            onStateChange();
++            changed = true;
++            memmove(mem + first, words + first, (last - first + 1) * 4);
++            for (uint32_t b = (addr + first) >> 4, e = (addr + last) >> 4; b <= e; b++) xfTouched(b << 4);
++        }
++        addr += n;
++        words += n;
++        count -= n;
++    }
++    bool regMarked = false;
+     for (uint32_t i = 0; i < count; i++, addr++) {
++        const uint32_t v = words[i];
++        if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
++            uint32_t r = addr - XF_REG_BASE;
++            if (g.xfReg[r] != v) {
++                if (!changed) {
++                    onStateChange();
++                    changed = true;
++                }
++                g.xfReg[r] = v;
++                if (!regMarked) {
++                    regMarked = true;
++                    xfTouched(addr);
++                }
++            }
++        }
++    }
++#else
++    for (uint32_t i = 0; i < count; i++, addr++) {
+         uint32_t v = words[i];
+         if (addr < XF_MEM_WORDS) {
+             if (g.xfMem[addr] != v) {
+@@ -479,6 +547,7 @@
+             }
+         }
+     }
++#endif
+ }
+ 
+ void writeXFf(uint16_t addr, uint32_t count, const float* f) {
+@@ -1592,7 +1661,19 @@
+         const bool opTimed = streamTop && GXPC_Detail && ((++s_opSample & 15) == 0);
+         const uint64_t opT0 = opTimed ? svcGetSystemTick() : 0;
+ #endif
+-        if (op == 0x08) {
++        // 3DS port: BP writes, the commonest command, tested first (the tests are exclusive).
++        if (op == 0x61) {
++            len = 5;
++            if (avail < len) break;
++            CMD_COUNT(4);
++#if defined(__3DS__)
++            if (wrStudy()) {
++                if (streamTop) wrCountBP(0, be32(p + 1));
++                else wrFromList(0, p[1]);
++            }
++#endif
++            writeBP(be32(p + 1));
++        } else if (op == 0x08) {
+             len = 6;
+             if (avail < len) break;
+             CMD_COUNT(5);
+@@ -1644,17 +1725,6 @@
+                 runCommands(dl, sz);
+                 s_dlDepth--;
+             }
+-        } else if (op == 0x61) {
+-            len = 5;
+-            if (avail < len) break;
+-            CMD_COUNT(4);
+-#if defined(__3DS__)
+-            if (wrStudy()) {
+-                if (streamTop) wrCountBP(0, be32(p + 1));
+-                else wrFromList(0, p[1]);
+-            }
+-#endif
+-            writeBP(be32(p + 1));
+         } else if (op >= 0x80 && op < 0xC0) {
+             CMD_COUNT(0);
+ #if defined(__3DS__)
+@@ -1686,7 +1756,7 @@
+             continue;
+         }
+ #if defined(__3DS__)
+-        if (streamTop) {
++        if (streamTop && GXPC_Detail) {  // (the [perf] line by command kind: profile runs only)
+             const int k = opKind(op);
+             GXPC_OpAll[k]++;
+             if (opTimed) {

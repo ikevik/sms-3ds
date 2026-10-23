@@ -58,6 +58,15 @@ static uint32_t s_tevEntries;
 // could save with duplicate vertices merged. Indices, vertices stored, then the run stats.
 enum { RS_TRIS, RS_STRIP, RS_DISTINCT, RS_C8, RS_C16, RS_C32, RS_D8, RS_D16, RS_D32, RS_T16, RS_S16, kRunStat };
 static uint64_t s_reuse[2 + kRunStat], s_reuse0[2 + kRunStat];
+// Render thread: changes to anything a draw's TEV setup, textures and PICA state are worked out from
+// (s_rsGen: BP, XF and konst registers, TLUTs, texture images, the copy destination, EFB copies;
+// not XF memory, the matrices), the draws that came with none since the last draw, and the draws
+// that took the last draw's setup (drawTriangles), for the [perf] lines.
+static uint32_t s_rsGen, s_rsGenLastDraw, s_drawsSameState, s_drawsCounted, s_drawsFast;
+// settings.txt draw_state_check (GX3DS_SetDrawStateCheck): the draws that could take the last draw's
+// setup work it out, compared with it (checked, differing).
+static bool s_fpCheck;
+static uint32_t s_fpChecked, s_fpDiffer;
 // Resident runs store each distinct vertex once (arenaUpload; GX3DS_SetMergeDuplicates), and those
 // drawn where order makes no difference have their triangles reordered for the GPU's vertex cache
 // (GX3DS_SetReorder). Reordered runs drawn, and those of them drawn where order matters, for [perf].
@@ -186,6 +195,7 @@ static uint32_t s_rFrames;         // display copies the render side has done
 // Per-frame time of each renderer phase, in ARM11 system ticks (268,111,856 Hz), averaged over
 // kPerfFrames frames for the status screen and logged as [perf] lines. "other" is the rest of the
 // frame: game logic, the GX front half (command parsing, vertex decoding) and waiting.
+extern "C" void SMS3DS_TimelineEvent(int who, int what);  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
 extern "C" uint64_t svcGetSystemTick(void);
 // The "other" breakdown: GX command parsing and display-list calls (gx_fifo.cpp, patch 0006; it
 // includes our draw work done inside them), the emulated OS's idle time (no game thread runnable:
@@ -286,18 +296,28 @@ static inline void perfAdd(PerfPhase ph, uint64_t ticks) {
 	s_gAcc[ph] += ticks;
 	GX3DS_OursTicks += ticks;
 }
+// The [perf] breakdown by phase (tex, tev, xform, submit, decode, batch, append, the queueing)
+// reads the system tick several times a draw, thousands of times a frame: 261 ns each on a New
+// 3DS, 1.3 us in Azahar. Off unless settings.txt says perf_timers = on (GX3DS_SetPerfTimers); the
+// frame, the threads' busy and idle time and the waits are always timed.
+static bool s_perfTimers;
+static inline uint64_t perfTick() { return s_perfTimers ? svcGetSystemTick() : 0; }
 struct PerfScope {
 	PerfPhase ph;
 	uint64_t t0;
-	explicit PerfScope(PerfPhase p) : ph(p), t0(svcGetSystemTick()) {}
-	~PerfScope() { perfAdd(ph, svcGetSystemTick() - t0); }
+	explicit PerfScope(PerfPhase p) : ph(p), t0(perfTick()) {}
+	~PerfScope() {
+		if (s_perfTimers) perfAdd(ph, svcGetSystemTick() - t0);
+	}
 };
 // A phase without the phases nested in it.
 struct PerfScopeExcl {
 	PerfPhase ph;
 	uint64_t t0, o0;
-	explicit PerfScopeExcl(PerfPhase p) : ph(p), t0(svcGetSystemTick()), o0(GX3DS_OursTicks) {}
-	~PerfScopeExcl() { perfAdd(ph, (svcGetSystemTick() - t0) - (GX3DS_OursTicks - o0)); }
+	explicit PerfScopeExcl(PerfPhase p) : ph(p), t0(perfTick()), o0(GX3DS_OursTicks) {}
+	~PerfScopeExcl() {
+		if (s_perfTimers) perfAdd(ph, (svcGetSystemTick() - t0) - (GX3DS_OursTicks - o0));
+	}
 };
 
 // Why batches fell back to the CPU path: batches and vertices per reason over the profiler window,
@@ -376,11 +396,11 @@ static void perfFrameEnd() {
 	        debugColorMode() == 1 ? "debug (no textures)" : debugColorMode() == 2 ? "opaque (no blending)" : "material");
 	fprintf(stderr,
 	        "[perf] frame %.1f ms (%.1f fps) | tex %.2f tev %.2f xform %.2f submit %.2f copy %.2f present %.2f | "
-	        "decode %.1f batch %.2f append %.2f other %.1f | %.0f batches %.0f verts/frame\n",
+	        "decode %.1f batch %.2f append %.2f other %.1f | %.0f batches %.0f verts/frame%s\n",
 	        s_perfAvgMs[PERF_COUNT], 1000.0 / s_perfAvgMs[PERF_COUNT], s_perfAvgMs[PERF_TEX], s_perfAvgMs[PERF_TEV],
 	        s_perfAvgMs[PERF_XFORM], s_perfAvgMs[PERF_SUBMIT], s_perfAvgMs[PERF_COPY], s_perfAvgMs[PERF_PRESENT],
 	        s_perfAvgMs[PERF_DECODE], s_perfAvgMs[PERF_BATCH], s_perfAvgMs[PERF_APPEND], s_perfAvgMs[PERF_COUNT + 1],
-	        s_perfAvgBatches, s_perfAvgVerts);
+	        s_perfAvgBatches, s_perfAvgVerts, s_perfTimers ? "" : " | phases not timed (perf_timers off)");
 	{
 		// present split up: pica_present's frame end
 		uint64_t end[PICA_END_COUNT];
@@ -406,9 +426,19 @@ static void perfFrameEnd() {
 			part[i] = double(s_tevPartTicks[i] - p0[i]) / frames / kTicksPerMs;
 			p0[i] = s_tevPartTicks[i];
 		}
+		static uint32_t sd0, dc0, df0;
 		fprintf(stderr, "[perf]   TEV cache per frame: %.0f hits, %.0f misses, %.1f clears (%u entries) | its time: read %.2f, "
-		        "state+key+lookup %.2f, translate (misses) %.2f, rest %.2f ms\n", hits, misses,
-		        double(s_tevClears - c0) / frames, unsigned(s_tevEntries), part[0], part[1], part[2], part[3]);
+		        "state+key+lookup %.2f, translate (misses) %.2f, rest %.2f ms | draws with nothing changed since the last "
+		        "draw: %.0f of %.0f, %.0f of them with its TEV setup and state as they were\n", hits, misses,
+		        double(s_tevClears - c0) / frames, unsigned(s_tevEntries), part[0], part[1], part[2], part[3],
+		        double(s_drawsSameState - sd0) / frames, double(s_drawsCounted - dc0) / frames,
+		        double(s_drawsFast - df0) / frames);
+		if (s_fpCheck)
+			fprintf(stderr, "[perf]   draw state check: %lu draws so far worked out where the last draw's setup would have "
+			        "been taken, %lu differing\n", (unsigned long)s_fpChecked, (unsigned long)s_fpDiffer);
+		sd0 = s_drawsSameState;
+		dc0 = s_drawsCounted;
+		df0 = s_drawsFast;
 		h0 = s_tevHits;
 		m0 = s_tevMisses;
 		c0 = s_tevClears;
@@ -1071,6 +1101,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		if (trustWriteStamps() && unwrittenSince(ptr, 0, 0) && !unwrittenSince(ptr, texLevelBytes(fmt0, w, h), c->clock)) {
 			pica_tex_free(c->tex);
 			s_efbCopies.erase(s_efbCopies.begin() + (c - s_efbCopies.data()));
+			s_rsGen++;
 		} else {
 			c->usedFrame = s_rFrames;
 			s_copyTexDraws++;
@@ -2873,7 +2904,21 @@ static uint64_t tevCacheKey(const bool pwhite[kMaxPairs], int nPairs, const Pica
 // one matrix, and each texture unit's texgen, texture matrix, post matrix and EFB-copy rectangle
 // composed into two rows. Batches it cannot express exactly (projected texture coordinates, a
 // texture matrix index that varies per vertex, clipping off, ...) stay on the CPU path.
+// XF memory changed since drawGpu last copied the matrix rows: position rows (s_posDirty, bit r
+// for rows 0-29, 4 words each from word 0) and normal rows (s_nrmDirty, 3 words each from word 256).
+// Only those rows are copied and their uniforms compared again: one matrix load used to recopy and
+// recompare all 30 rows of both at the next draw.
 static bool s_xfDirty = true;
+static uint32_t s_posDirty = 0x3FFFFFFFu, s_nrmDirty = 0x3FFFFFFFu;
+static inline uint32_t rowBits(uint32_t r0, uint32_t r1) {  // rows r0..r1 (r1 < 30)
+	return ((2u << r1) - 1) & ~((1u << r0) - 1);
+}
+static inline void xfMemChanged(uint32_t w0, uint32_t w1) {  // words w0..w1
+	if (w0 < 4 * PICA_GX_MTX_ROWS) s_posDirty |= rowBits(w0 >> 2, std::min<uint32_t>(w1, 4 * PICA_GX_MTX_ROWS - 1) >> 2);
+	if (w1 >= 256 && w0 < 256 + 3 * PICA_GX_MTX_ROWS)
+		s_nrmDirty |= rowBits((std::max<uint32_t>(w0, 256) - 256) / 3, (std::min<uint32_t>(w1, 256 + 3 * PICA_GX_MTX_ROWS - 1) - 256) / 3);
+	s_xfDirty = true;
+}
 static bool s_gpuTransform = true;  // GX3DS_SetGpuTransform: off draws everything on the CPU path
 static float s_posRows[PICA_GX_MTX_ROWS][4], s_nrmRows[PICA_GX_MTX_ROWS][4];
 static uint32_t s_gpuBatches, s_cpuBatches;
@@ -3044,14 +3089,19 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	}
 	pica_gx_projection(O, &u);
 
-	// Matrix rows, refreshed when XF memory changed (renderState).
-	const bool dirty = s_xfDirty;
-	if (dirty) {
-		for (int r = 0; r < PICA_GX_MTX_ROWS; r++) {
+	// Matrix rows, refreshed where XF memory changed (renderState, renderXFWord).
+	const uint32_t dirty = s_posDirty;
+	if (s_xfDirty) {
+		for (uint32_t m = s_posDirty; m; m &= m - 1) {
+			const int r = __builtin_ctz(m);
 			memcpy(s_posRows[r], &rs.xfMem[4 * r], 16);
+		}
+		for (uint32_t m = s_nrmDirty; m; m &= m - 1) {
+			const int r = __builtin_ctz(m);
 			memcpy(s_nrmRows[r], &rs.xfMem[256 + 3 * r], 12);
 			s_nrmRows[r][3] = 0.f;
 		}
+		s_posDirty = s_nrmDirty = 0;
 		s_xfDirty = false;
 	}
 
@@ -3092,7 +3142,10 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	}
 	PerfScope ps(PERF_SUBMIT);
 	if (!pica_draw_gx(vb, n, &lay, ib, nidx, &u, dirty, s_posRows, s_nrmRows, &st)) {
-		s_xfDirty = s_xfDirty || dirty;
+		if (dirty) {  // the rows' uniforms were not compared: again at the next draw
+			s_posDirty |= dirty;
+			s_xfDirty = true;
+		}
 		return gpuFail(FB_LAYOUT, n);
 	}
 	s_gpuBatches++;
@@ -3119,6 +3172,9 @@ static void drawTriangles() {
 	if (((rs.bp[BP_GENMODE] >> 14) & 3) == 3) return;  // every face culled
 	if (s_afterTexCopy) s_drawsAfterCopy++;
 	else s_drawsBeforeCopy++;
+	s_drawsCounted++;
+	if (s_rsGen == s_rsGenLastDraw) s_drawsSameState++;
+	s_rsGenLastDraw = s_rsGen;
 	const VtxFmtLayout& L = r_layout;
 	uint32_t n = r_count, nidx = uint32_t(r_nidx);
 
@@ -3127,154 +3183,215 @@ static void drawTriangles() {
 	// The textures the TEV stages sample, per (map, coordinate) pair, and the combiner stages,
 	// which give PICA texture units to the pairs they use (none in debug-colour mode).
 	const bool debug = s_debugColors;
-	uint64_t perfTev0 = svcGetSystemTick();
+	uint64_t perfTev0 = perfTick(), tevT1 = perfTev0;
 	TevSetup tev;
-	readTev(tev);
-	{
-		const uint64_t t = svcGetSystemTick() - perfTev0;
-		perfAdd(PERF_TEV, t);
-		s_tevPartTicks[0] += t;
-	}
 	PicaTex* ptex[kMaxPairs] = {};
 	const EfbCopy* pcopy[kMaxPairs] = {};
 	bool pwhite[kMaxPairs];
-	for (int p = 0; p < kMaxPairs; p++) pwhite[p] = true;
-	if (!debug) {
-		PerfScope ps(PERF_TEX);
-		for (int p = 0; p < tev.nPairs; p++) {
-			ptex[p] = textureForMap(tev.pairMap[p], &pcopy[p]);
-			pwhite[p] = ptex[p] == nullptr;
-			if (ptex[p] && !pcopy[p]) {
-				const uint32_t img0 = rs.bp[bpTexReg(BP_TX_IMAGE0, tev.pairMap[p])];
-				tev.pairTexels[p] = ((img0 & 0x3FF) + 1) * (((img0 >> 10) & 0x3FF) + 1);
-				tev.pairFmt[p] = uint8_t((img0 >> 20) & 15);
-				auto a = s_texAvg.find(ptex[p]);
-				if (a != s_texAvg.end())
-					for (int i = 0; i < 4; i++) tev.pairConst[p][i] = int16_t((a->second >> (24 - 8 * i)) & 0xFF);
-			}
-		}
-	}
-	perfTev0 = svcGetSystemTick();
-
 	PicaState st;
-	memset(&st, 0, sizeof st);  // the PICA side compares states bytewise
-	currentPicaState(st);
-	alphaTest(st);
 	bool translated = true;
 	unsigned dumpId = 0;
-	const uint64_t tevKey = tevCacheKey(pwhite, tev.nPairs, st, debug, ptex);
-	// The last batch's entry when the key repeats (the map's elements stay where they are until it
-	// is cleared), else a lookup.
-	static uint64_t s_lastTevKey;
-	static const TevCacheEntry* s_lastTevEntry;
-	const TevCacheEntry* hitEntry = nullptr;
-	if (s_lastTevEntry && tevKey == s_lastTevKey) {
-		hitEntry = s_lastTevEntry;
-	} else {
-		auto tevHit = s_tevCache.find(tevKey);
-		if (tevHit != s_tevCache.end()) hitEntry = &tevHit->second;
-	}
-	const bool cached = hitEntry != nullptr;
-	if (cached) {
-		tev = hitEntry->tev;
-		st = hitEntry->st;
-		translated = hitEntry->translated;
-		dumpId = hitEntry->dumpId;
-		s_lastTevKey = tevKey;
-		s_lastTevEntry = hitEntry;
-	}
-	uint64_t tevT1 = svcGetSystemTick();
-	s_tevPartTicks[1] += tevT1 - perfTev0;
-	if (cached) s_tevHits++;
-	else s_tevMisses++;
-	if (cached) {
-	} else if (debug) {
-		tev.nUnits = 0;
-	} else if (isThpSetup(tev) && ptex[tev.stagePair[0]] && ptex[tev.stagePair[1]] && ptex[tev.stagePair[2]]) {
-		translateThp(tev, st);
-	} else if (isStampSetup(tev) && ptex[tev.stagePair[0]] && ptex[tev.stagePair[2]]) {
-		translateStamp(tev, st);
-	} else {
-		translated = translateTevFallback(tev, pwhite, st);
-	}
-	if (!cached && !debug && !translated) {
-		resetTev(st, tev);
-		for (uint32_t s = 0; s < tev.numStages; s++) {
-			const int pr = tev.stagePair[s];
-			if (pr < 0 || !ptex[pr]) continue;
-			PicaTevStage& ps = st.stage[0];
-			const bool rasNull = ((tev.order[s] >> 7) & 7) == 7;
-			ps.src_rgb = ps.src_alpha = uint16_t(SRC_TEX0) | (rasNull ? 0 : SRC_PRIMARY << 4);
-			ps.func_rgb = ps.func_alpha = rasNull ? FN_REPLACE : FN_MODULATE;
-			st.nstages = 1;
-			tev.nUnits = 1;
-			tev.unitPair[0] = pr;
-			break;
-		}
-	}
-	if (!cached) {
-		const uint64_t t2 = svcGetSystemTick();
-		s_tevPartTicks[2] += t2 - tevT1;
-		tevT1 = t2;
-		if (s_tevCache.size() >= kTevCacheMax) {
-			s_tevCache.clear();
-			s_tevClears++;
-		}
-		TevCacheEntry& e = s_tevCache[tevKey];
-		s_lastTevKey = tevKey;
-		s_lastTevEntry = &e;
-		s_tevEntries = uint32_t(s_tevCache.size());
-		e.tev = tev;
-		e.st = st;
-		e.translated = translated;
-		e.dumpId = 0;
-	}
-	static const uint8_t kWrap[4] = {0, 2, 3, 2};  // clamp, repeat, mirror -> GPU_TEXTURE_WRAP_PARAM
 	PicaTex* utex[PICA_MAX_TEX] = {};
 	const EfbCopy* ucopy[PICA_MAX_TEX] = {};
 	int ucoord[PICA_MAX_TEX] = {};
-	for (int u = 0; u < tev.nUnits; u++) {
-		const int pr = tev.unitPair[u];
-		utex[u] = ptex[pr];
-		ucopy[u] = pcopy[pr];
-		ucoord[u] = tev.pairCoord[pr];
-		if (!utex[u]) continue;
-		const uint32_t mode0 = rs.bp[bpTexReg(BP_TX_MODE0, tev.pairMap[pr])];
-		st.tex[u] = utex[u];
-		st.wrap_s[u] = kWrap[mode0 & 3];
-		st.wrap_t[u] = kWrap[(mode0 >> 2) & 3];
-		st.linear[u] = (mode0 >> 4) & 1;
-		st.lod_bias[u] = int16_t(int8_t((mode0 >> 9) & 0xFF) * 8);  // s2.5 -> 1/256
-		// A perspective draw reading a one-byte map copy is the goop layer on the ground.
-		if (ucopy[u] && (ucopy[u]->fmt == 1 || (ucopy[u]->fmt >= 7 && ucopy[u]->fmt <= 10)) &&
-		    !(rs.xfReg[XFR_PROJ + 6] & 1))
-			st.depth_bias = 1;
-	}
-	if (!debug && ((!cached && s_verbose) || s_tracing)) {
-		// Blend (BP 0x41), depth (0x40), alpha compare (0xF3), channel controls and the first
-		// vertex's colours, for the dump.
-		const VtxFmtLayout& L0 = r_layout;
-		uint32_t c0 = 0, c1 = 0;
-		if (r_count && (r_fmt & VF_CLR0)) memcpy(&c0, r_verts + L0.clr[0], 4);
-		if (r_count && (r_fmt & (VF_CLR0 << 1))) memcpy(&c1, r_verts + L0.clr[1], 4);
-		char extra[200];
-		snprintf(extra, sizeof extra,
-		         "clip %s cmode0 %06x zmode %06x alphacmp %06x chans %u ctrl %04x/%04x %04x/%04x mat %08x %08x vtx clr %08x %08x (fmt %x)",
-		         rs.xfReg[0x05] ? "off" : "on", rs.bp[BP_CMODE0] & 0xFFFFFF, rs.bp[BP_ZMODE] & 0xFFFFFF, rs.bp[BP_ALPHACOMPARE] & 0xFFFFFF,
-		         rs.xfReg[XFR_NUMCHANS] & 3, rs.xfReg[XFR_COLOR0CTRL] & 0x7FFF, rs.xfReg[XFR_ALPHA0CTRL] & 0x7FFF,
-		         rs.xfReg[XFR_COLOR0CTRL + 1] & 0x7FFF, rs.xfReg[XFR_ALPHA0CTRL + 1] & 0x7FFF, rs.xfReg[XFR_MAT0],
-		         rs.xfReg[XFR_MAT0 + 1], __builtin_bswap32(c0), __builtin_bswap32(c1), r_fmt);
-		dumpId = tevDump(tev, st, translated, ptex, pcopy, extra);
-		if (!cached || !s_tevCache[tevKey].dumpId) s_tevCache[tevKey].dumpId = dumpId;
-	}
-	if (s_opaque) {
-		st.blend = 0;
-		st.alpha_test = st.alpha_test2 = 0;
-		st.alpha_func = 1;  // GPU_ALWAYS
-	}
+	// A draw that comes with no change to anything worked out below (the BP, XF and konst registers,
+	// the TLUTs, the texture images and the EFB copies: s_rsGen; the vertex format; the frame, as
+	// the textures are checked once a frame; the colour modes) takes the last draw's TEV setup,
+	// textures and PICA state as they were: in Delfino Plaza 42% of the draws (a material's shapes
+	// after its first), each saving the TEV read, the texture lookups, the state and its key.
+	static struct {
+		bool valid, debug, opaque;
+		uint32_t gen, fmt, frame;
+		TevSetup tev;
+		PicaTex* ptex[kMaxPairs];
+		const EfbCopy* pcopy[kMaxPairs];
+		bool pwhite[kMaxPairs];
+		PicaState st;
+		bool translated;
+		unsigned dumpId;
+		PicaTex* utex[PICA_MAX_TEX];
+		const EfbCopy* ucopy[PICA_MAX_TEX];
+		int ucoord[PICA_MAX_TEX];
+	} s_fp;
+	const bool same = s_fp.valid && s_fp.gen == s_rsGen && s_fp.fmt == r_fmt && s_fp.frame == s_rFrames &&
+	                  s_fp.debug == debug && s_fp.opaque == s_opaque && !s_verbose && !s_tracing;
+	if (same && !s_fpCheck) {
+		tev = s_fp.tev;
+		memcpy(ptex, s_fp.ptex, sizeof ptex);
+		memcpy(pcopy, s_fp.pcopy, sizeof pcopy);
+		memcpy(pwhite, s_fp.pwhite, sizeof pwhite);
+		st = s_fp.st;
+		translated = s_fp.translated;
+		dumpId = s_fp.dumpId;
+		memcpy(utex, s_fp.utex, sizeof utex);
+		memcpy(ucopy, s_fp.ucopy, sizeof ucopy);
+		memcpy(ucoord, s_fp.ucoord, sizeof ucoord);
+		s_drawsFast++;
+	} else {
+		readTev(tev);
+		{
+			const uint64_t t = perfTick() - perfTev0;
+			perfAdd(PERF_TEV, t);
+			s_tevPartTicks[0] += t;
+		}
+		for (int p = 0; p < kMaxPairs; p++) pwhite[p] = true;
+		if (!debug) {
+			PerfScope ps(PERF_TEX);
+			for (int p = 0; p < tev.nPairs; p++) {
+				ptex[p] = textureForMap(tev.pairMap[p], &pcopy[p]);
+				pwhite[p] = ptex[p] == nullptr;
+				if (ptex[p] && !pcopy[p]) {
+					const uint32_t img0 = rs.bp[bpTexReg(BP_TX_IMAGE0, tev.pairMap[p])];
+					tev.pairTexels[p] = ((img0 & 0x3FF) + 1) * (((img0 >> 10) & 0x3FF) + 1);
+					tev.pairFmt[p] = uint8_t((img0 >> 20) & 15);
+					auto a = s_texAvg.find(ptex[p]);
+					if (a != s_texAvg.end())
+						for (int i = 0; i < 4; i++) tev.pairConst[p][i] = int16_t((a->second >> (24 - 8 * i)) & 0xFF);
+				}
+			}
+		}
+		perfTev0 = perfTick();
 
+		memset(&st, 0, sizeof st);  // the PICA side compares states bytewise
+		currentPicaState(st);
+		alphaTest(st);
+		const uint64_t tevKey = tevCacheKey(pwhite, tev.nPairs, st, debug, ptex);
+		// The last batch's entry when the key repeats (the map's elements stay where they are until it
+		// is cleared), else a lookup.
+		static uint64_t s_lastTevKey;
+		static const TevCacheEntry* s_lastTevEntry;
+		const TevCacheEntry* hitEntry = nullptr;
+		if (s_lastTevEntry && tevKey == s_lastTevKey) {
+			hitEntry = s_lastTevEntry;
+		} else {
+			auto tevHit = s_tevCache.find(tevKey);
+			if (tevHit != s_tevCache.end()) hitEntry = &tevHit->second;
+		}
+		const bool cached = hitEntry != nullptr;
+		if (cached) {
+			tev = hitEntry->tev;
+			st = hitEntry->st;
+			translated = hitEntry->translated;
+			dumpId = hitEntry->dumpId;
+			s_lastTevKey = tevKey;
+			s_lastTevEntry = hitEntry;
+		}
+		tevT1 = perfTick();
+		s_tevPartTicks[1] += tevT1 - perfTev0;
+		if (cached) s_tevHits++;
+		else s_tevMisses++;
+		if (cached) {
+		} else if (debug) {
+			tev.nUnits = 0;
+		} else if (isThpSetup(tev) && ptex[tev.stagePair[0]] && ptex[tev.stagePair[1]] && ptex[tev.stagePair[2]]) {
+			translateThp(tev, st);
+		} else if (isStampSetup(tev) && ptex[tev.stagePair[0]] && ptex[tev.stagePair[2]]) {
+			translateStamp(tev, st);
+		} else {
+			translated = translateTevFallback(tev, pwhite, st);
+		}
+		if (!cached && !debug && !translated) {
+			resetTev(st, tev);
+			for (uint32_t s = 0; s < tev.numStages; s++) {
+				const int pr = tev.stagePair[s];
+				if (pr < 0 || !ptex[pr]) continue;
+				PicaTevStage& ps = st.stage[0];
+				const bool rasNull = ((tev.order[s] >> 7) & 7) == 7;
+				ps.src_rgb = ps.src_alpha = uint16_t(SRC_TEX0) | (rasNull ? 0 : SRC_PRIMARY << 4);
+				ps.func_rgb = ps.func_alpha = rasNull ? FN_REPLACE : FN_MODULATE;
+				st.nstages = 1;
+				tev.nUnits = 1;
+				tev.unitPair[0] = pr;
+				break;
+			}
+		}
+		if (!cached) {
+			const uint64_t t2 = perfTick();
+			s_tevPartTicks[2] += t2 - tevT1;
+			tevT1 = t2;
+			if (s_tevCache.size() >= kTevCacheMax) {
+				s_tevCache.clear();
+				s_tevClears++;
+			}
+			TevCacheEntry& e = s_tevCache[tevKey];
+			s_lastTevKey = tevKey;
+			s_lastTevEntry = &e;
+			s_tevEntries = uint32_t(s_tevCache.size());
+			e.tev = tev;
+			e.st = st;
+			e.translated = translated;
+			e.dumpId = 0;
+		}
+		static const uint8_t kWrap[4] = {0, 2, 3, 2};  // clamp, repeat, mirror -> GPU_TEXTURE_WRAP_PARAM
+		for (int u = 0; u < tev.nUnits; u++) {
+			const int pr = tev.unitPair[u];
+			utex[u] = ptex[pr];
+			ucopy[u] = pcopy[pr];
+			ucoord[u] = tev.pairCoord[pr];
+			if (!utex[u]) continue;
+			const uint32_t mode0 = rs.bp[bpTexReg(BP_TX_MODE0, tev.pairMap[pr])];
+			st.tex[u] = utex[u];
+			st.wrap_s[u] = kWrap[mode0 & 3];
+			st.wrap_t[u] = kWrap[(mode0 >> 2) & 3];
+			st.linear[u] = (mode0 >> 4) & 1;
+			st.lod_bias[u] = int16_t(int8_t((mode0 >> 9) & 0xFF) * 8);  // s2.5 -> 1/256
+			// A perspective draw reading a one-byte map copy is the goop layer on the ground.
+			if (ucopy[u] && (ucopy[u]->fmt == 1 || (ucopy[u]->fmt >= 7 && ucopy[u]->fmt <= 10)) &&
+			    !(rs.xfReg[XFR_PROJ + 6] & 1))
+				st.depth_bias = 1;
+		}
+		if (!debug && ((!cached && s_verbose) || s_tracing)) {
+			// Blend (BP 0x41), depth (0x40), alpha compare (0xF3), channel controls and the first
+			// vertex's colours, for the dump.
+			const VtxFmtLayout& L0 = r_layout;
+			uint32_t c0 = 0, c1 = 0;
+			if (r_count && (r_fmt & VF_CLR0)) memcpy(&c0, r_verts + L0.clr[0], 4);
+			if (r_count && (r_fmt & (VF_CLR0 << 1))) memcpy(&c1, r_verts + L0.clr[1], 4);
+			char extra[200];
+			snprintf(extra, sizeof extra,
+			         "clip %s cmode0 %06x zmode %06x alphacmp %06x chans %u ctrl %04x/%04x %04x/%04x mat %08x %08x vtx clr %08x %08x (fmt %x)",
+			         rs.xfReg[0x05] ? "off" : "on", rs.bp[BP_CMODE0] & 0xFFFFFF, rs.bp[BP_ZMODE] & 0xFFFFFF, rs.bp[BP_ALPHACOMPARE] & 0xFFFFFF,
+			         rs.xfReg[XFR_NUMCHANS] & 3, rs.xfReg[XFR_COLOR0CTRL] & 0x7FFF, rs.xfReg[XFR_ALPHA0CTRL] & 0x7FFF,
+			         rs.xfReg[XFR_COLOR0CTRL + 1] & 0x7FFF, rs.xfReg[XFR_ALPHA0CTRL + 1] & 0x7FFF, rs.xfReg[XFR_MAT0],
+			         rs.xfReg[XFR_MAT0 + 1], __builtin_bswap32(c0), __builtin_bswap32(c1), r_fmt);
+			dumpId = tevDump(tev, st, translated, ptex, pcopy, extra);
+			if (!cached || !s_tevCache[tevKey].dumpId) s_tevCache[tevKey].dumpId = dumpId;
+		}
+		if (s_opaque) {
+			st.blend = 0;
+			st.alpha_test = st.alpha_test2 = 0;
+			st.alpha_func = 1;  // GPU_ALWAYS
+		}
+		// The check (settings.txt draw_state_check): a draw that could have taken the last draw's
+		// setup works it out, and each part is compared with what it would have taken.
+		if (same) {
+			s_fpChecked++;
+			const bool differs = memcmp(&tev, &s_fp.tev, sizeof tev) != 0 || memcmp(ptex, s_fp.ptex, sizeof ptex) != 0 ||
+			                     memcmp(pcopy, s_fp.pcopy, sizeof pcopy) != 0 ||
+			                     memcmp(pwhite, s_fp.pwhite, sizeof pwhite) != 0 || memcmp(&st, &s_fp.st, sizeof st) != 0 ||
+			                     translated != s_fp.translated || memcmp(utex, s_fp.utex, sizeof utex) != 0 ||
+			                     memcmp(ucopy, s_fp.ucopy, sizeof ucopy) != 0 || memcmp(ucoord, s_fp.ucoord, sizeof ucoord) != 0;
+			if (differs) s_fpDiffer++;
+		}
+		s_fp.valid = true;
+		s_fp.gen = s_rsGen;
+		s_fp.fmt = r_fmt;
+		s_fp.frame = s_rFrames;
+		s_fp.debug = debug;
+		s_fp.opaque = s_opaque;
+		s_fp.tev = tev;
+		memcpy(s_fp.ptex, ptex, sizeof ptex);
+		memcpy(s_fp.pcopy, pcopy, sizeof pcopy);
+		memcpy(s_fp.pwhite, pwhite, sizeof pwhite);
+		s_fp.st = st;
+		s_fp.translated = translated;
+		s_fp.dumpId = dumpId;
+		memcpy(s_fp.utex, utex, sizeof utex);
+		memcpy(s_fp.ucopy, ucopy, sizeof ucopy);
+		memcpy(s_fp.ucoord, ucoord, sizeof ucoord);
+	}
 	{
-		const uint64_t t3 = svcGetSystemTick();
+		const uint64_t t3 = perfTick();
 		perfAdd(PERF_TEV, t3 - perfTev0);
 		s_tevPartTicks[3] += t3 - tevT1;
 	}
@@ -3306,7 +3423,7 @@ static void drawTriangles() {
 		out = s_traceVtx.data();
 		oidx = s_traceIdx.data();
 	}
-	const uint64_t perfXform0 = svcGetSystemTick();
+	const uint64_t perfXform0 = perfTick();
 
 	// Projection (GXSetProjection) and viewport (GXSetViewport), as the GX shader reads them.
 	const float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1), p2 = xff(XFR_PROJ + 2), p3 = xff(XFR_PROJ + 3),
@@ -3476,7 +3593,7 @@ static void drawTriangles() {
 		        hasMtx ? r_verts[L.mtx] : defPm, m0[0], m0[1], m0[2], m0[3], m0[4], m0[5], m0[6], m0[7], m0[8], m0[9], m0[10],
 		        m0[11], p0, p1, p2, p3, p4, p5, ortho ? "ortho" : "persp", vsx, vsy, vsz, vcx, vcy, vcz, r_fmt);
 	}
-	perfAdd(PERF_XFORM, svcGetSystemTick() - perfXform0);
+	perfAdd(PERF_XFORM, perfTick() - perfXform0);
 	{
 		PerfScope ps(PERF_SUBMIT);
 		if (submit) pica_draw_triangles(out, oidx, nidx, &st);
@@ -3546,6 +3663,10 @@ static uint32_t s_gFrames;                            // display copies queued
 static bool s_bNative;                                // the open batch's draws are native J3D ones (j3dBatchNative)
 // Registers written since the last state record (game side).
 static uint32_t s_dBp[8], s_dXm[4], s_dTlut[32];  // BP registers, 16-word XF memory blocks, 512-byte TLUT blocks
+// The bits set in each mask, kept as they are set: stateBytes() is asked many times a frame, and a
+// population count of all 44 words cost the GX thread ~7% of its time (the ARM11 has no popcount
+// instruction).
+static uint32_t s_dNbp, s_dNxm, s_dNt;
 static bool s_dXr, s_dAny, s_dAll = true;
 static const uint32_t kXmBlocks = XF_MEM_WORDS / 16, kTlutBlocks = TMEM_TLUT_SIZE / 512;
 // Profiler. Game side: waits, queue use. Render side: busy and idle time, and the game side's
@@ -3597,13 +3718,19 @@ static void renderThreadPerf(double frames) {
 
 // Front-half hooks (patch 0016).
 void bpTouched(uint32_t reg) {
-	s_dBp[(reg >> 5) & 7] |= 1u << (reg & 31);
+	uint32_t& w = s_dBp[(reg >> 5) & 7];
+	const uint32_t bit = 1u << (reg & 31);
+	s_dNbp += (w & bit) == 0;
+	w |= bit;
 	s_dAny = true;
 }
 void xfTouched(uint32_t addr) {
 	if (addr < XF_MEM_WORDS) {
 		const uint32_t b = addr >> 4;
-		s_dXm[b >> 5] |= 1u << (b & 31);
+		uint32_t& w = s_dXm[b >> 5];
+		const uint32_t bit = 1u << (b & 31);
+		s_dNxm += (w & bit) == 0;
+		w |= bit;
 	} else {
 		s_dXr = true;
 	}
@@ -3611,8 +3738,12 @@ void xfTouched(uint32_t addr) {
 }
 void tlutTouched(uint32_t off, uint32_t bytes) {
 	if (!bytes) return;
-	for (uint32_t b = off >> 9, e = (off + bytes - 1) >> 9; b <= e && b < kTlutBlocks; b++)
-		s_dTlut[b >> 5] |= 1u << (b & 31);
+	for (uint32_t b = off >> 9, e = (off + bytes - 1) >> 9; b <= e && b < kTlutBlocks; b++) {
+		uint32_t& w = s_dTlut[b >> 5];
+		const uint32_t bit = 1u << (b & 31);
+		s_dNt += (w & bit) == 0;
+		w |= bit;
+	}
 	s_dAny = true;
 }
 void stateReset() { s_dAll = true; }
@@ -3712,8 +3843,11 @@ static inline uint32_t popcount(const uint32_t* m, int words) {
 }
 
 // The registers written since the last state record, as one. Layout after the header: flags (bit
-// 0: XF registers follow), BP mask (8 words) and the registers it names, XF memory block mask (4)
-// and the blocks, TLUT block mask (32) and the blocks, then the XF registers.
+// 0: XF registers follow, bit 1: XF memory blocks, bit 2: TLUT blocks), BP mask (8 words) and the
+// registers it names, then if flagged the XF memory block mask (4) and the blocks, the TLUT block
+// mask (32) and the blocks, and the XF registers. (The masks of no blocks are left out: TLUTs
+// change a few times a frame, and copying and scanning their 32-word mask in every record cost the
+// GX and render threads more than the registers.)
 // Bytes of the registers written since the last state record (0: none).
 static uint32_t stateBytes() {
 	if (s_dAll) {
@@ -3721,41 +3855,49 @@ static uint32_t stateBytes() {
 		memset(s_dXm, 0, sizeof s_dXm);
 		for (uint32_t b = 0; b < kXmBlocks; b++) s_dXm[b >> 5] |= 1u << (b & 31);
 		memset(s_dTlut, 0xFF, sizeof s_dTlut);
+		s_dNbp = popcount(s_dBp, 8);
+		s_dNxm = popcount(s_dXm, 4);
+		s_dNt = popcount(s_dTlut, 32);
 		s_dXr = s_dAny = true;
 		s_dAll = false;
 	}
 	if (!s_dAny) return 0;
-	const uint32_t nbp = popcount(s_dBp, 8), nxm = popcount(s_dXm, 4), nt = popcount(s_dTlut, 32);
-	return 4 + 32 + nbp * 4 + 16 + nxm * 64 + 128 + nt * 512 + (s_dXr ? XF_REG_COUNT * 4 : 0);
+	return 4 + 32 + s_dNbp * 4 + (s_dNxm ? 16 + s_dNxm * 64 : 0) + (s_dNt ? 128 + s_dNt * 512 : 0) +
+	       (s_dXr ? XF_REG_COUNT * 4 : 0);
 }
 
 // Writes them (stateBytes() bytes) and starts over.
 static void writeState(uint8_t* dst) {
 	PerfScope ps(PERF_QSTATE);
 	uint32_t* w = reinterpret_cast<uint32_t*>(dst);
-	*w++ = s_dXr ? 1 : 0;
+	*w++ = (s_dXr ? 1 : 0) | (s_dNxm ? 2 : 0) | (s_dNt ? 4 : 0);
 	memcpy(w, s_dBp, 32);
 	w += 8;
 	for (int k = 0; k < 8; k++)
 		for (uint32_t m = s_dBp[k]; m; m &= m - 1) *w++ = g.bp[k * 32 + __builtin_ctz(m)];
-	memcpy(w, s_dXm, 16);
-	w += 4;
-	for (int k = 0; k < 4; k++)
-		for (uint32_t m = s_dXm[k]; m; m &= m - 1) {
-			memcpy(w, &g.xfMem[(k * 32 + __builtin_ctz(m)) * 16], 64);
-			w += 16;
-		}
-	memcpy(w, s_dTlut, 128);
-	w += 32;
-	for (int k = 0; k < 32; k++)
-		for (uint32_t m = s_dTlut[k]; m; m &= m - 1) {
-			memcpy(w, g.tlutMem + (k * 32 + __builtin_ctz(m)) * 512, 512);
-			w += 128;
-		}
+	if (s_dNxm) {
+		memcpy(w, s_dXm, 16);
+		w += 4;
+		for (int k = 0; k < 4; k++)
+			for (uint32_t m = s_dXm[k]; m; m &= m - 1) {
+				memcpy(w, &g.xfMem[(k * 32 + __builtin_ctz(m)) * 16], 64);
+				w += 16;
+			}
+		memset(s_dXm, 0, sizeof s_dXm);
+	}
+	if (s_dNt) {
+		memcpy(w, s_dTlut, 128);
+		w += 32;
+		for (int k = 0; k < 32; k++)
+			for (uint32_t m = s_dTlut[k]; m; m &= m - 1) {
+				memcpy(w, g.tlutMem + (k * 32 + __builtin_ctz(m)) * 512, 512);
+				w += 128;
+			}
+		memset(s_dTlut, 0, sizeof s_dTlut);
+	}
 	if (s_dXr) memcpy(w, g.xfReg, XF_REG_COUNT * 4);
 	memset(s_dBp, 0, sizeof s_dBp);
-	memset(s_dXm, 0, sizeof s_dXm);
-	memset(s_dTlut, 0, sizeof s_dTlut);
+	s_dNbp = s_dNxm = s_dNt = 0;
 	s_dXr = s_dAny = false;
 }
 
@@ -3801,28 +3943,34 @@ static void rcBatchRoom(size_t bytes) {
 
 static void renderState(const uint8_t* p) {
 	const uint32_t* w = reinterpret_cast<const uint32_t*>(p);
-	const bool xr = *w++ & 1;
+	const uint32_t flags = *w++;
+	if ((flags & 5) || w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) s_rsGen++;
 	uint32_t m[32];
 	memcpy(m, w, 32);
 	w += 8;
 	for (int k = 0; k < 8; k++)
 		for (uint32_t b = m[k]; b; b &= b - 1) rs.bp[k * 32 + __builtin_ctz(b)] = *w++;
-	memcpy(m, w, 16);
-	w += 4;
-	for (int k = 0; k < 4; k++)
-		for (uint32_t b = m[k]; b; b &= b - 1) {
-			memcpy(&rs.xfMem[(k * 32 + __builtin_ctz(b)) * 16], w, 64);
-			w += 16;
-			s_xfDirty = true;
-		}
-	memcpy(m, w, 128);
-	w += 32;
-	for (int k = 0; k < 32; k++)
-		for (uint32_t b = m[k]; b; b &= b - 1) {
-			memcpy(rs.tlutMem + (k * 32 + __builtin_ctz(b)) * 512, w, 512);
-			w += 128;
-		}
-	if (xr) memcpy(rs.xfReg, w, XF_REG_COUNT * 4);
+	if (flags & 2) {
+		memcpy(m, w, 16);
+		w += 4;
+		for (int k = 0; k < 4; k++)
+			for (uint32_t b = m[k]; b; b &= b - 1) {
+				const uint32_t w0 = (k * 32 + __builtin_ctz(b)) * 16;
+				memcpy(&rs.xfMem[w0], w, 64);
+				w += 16;
+				xfMemChanged(w0, w0 + 15);
+			}
+	}
+	if (flags & 4) {
+		memcpy(m, w, 128);
+		w += 32;
+		for (int k = 0; k < 32; k++)
+			for (uint32_t b = m[k]; b; b &= b - 1) {
+				memcpy(rs.tlutMem + (k * 32 + __builtin_ctz(b)) * 512, w, 512);
+				w += 128;
+			}
+	}
+	if (flags & 1) memcpy(rs.xfReg, w, XF_REG_COUNT * 4);
 }
 
 static void enqueueDraw() {
@@ -3928,9 +4076,13 @@ static std::atomic<bool> s_dropDraws{false};
 static void renderDraw(const RecHdr* h) {
 	const DrawRec* d = reinterpret_cast<const DrawRec*>(h + 1);
 	if (d->stateOff) renderState(reinterpret_cast<const uint8_t*>(h) + d->stateOff);
-	memcpy(rs.kreg, d->kreg, sizeof rs.kreg);
-	memcpy(rs.texImage, d->texImage, sizeof rs.texImage);
-	rs.copyDest = d->copyDest;
+	if (memcmp(rs.kreg, d->kreg, sizeof rs.kreg) != 0 || memcmp(rs.texImage, d->texImage, sizeof rs.texImage) != 0 ||
+	    rs.copyDest != d->copyDest) {
+		memcpy(rs.kreg, d->kreg, sizeof rs.kreg);
+		memcpy(rs.texImage, d->texImage, sizeof rs.texImage);
+		rs.copyDest = d->copyDest;
+		s_rsGen++;
+	}
 	const uint8_t* data = d->ext ? d->ext : reinterpret_cast<const uint8_t*>(h) + kDrawHead;
 	const size_t vbytes = d->arena ? 0 : (size_t(d->count) * d->stride + 3) & ~size_t(3);
 	r_class = PrimClass(d->cls);
@@ -3995,14 +4147,16 @@ void j3dEmitXF(const uint32_t* pairs, uint32_t n) {
 static void renderXFWord(uint32_t a, uint32_t v) {
 	if (a < XF_MEM_WORDS) {
 		rs.xfMem[a] = v;
-		s_xfDirty = true;
-	} else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT) {
+		xfMemChanged(a, a);
+	} else if (a >= XF_REG_BASE && a < XF_REG_BASE + XF_REG_COUNT && rs.xfReg[a - XF_REG_BASE] != v) {
 		rs.xfReg[a - XF_REG_BASE] = v;
+		s_rsGen++;
 	}
 }
 static void renderJ3DMat(const uint8_t* body) {
 	const J3DImage* img;
 	memcpy(&img, body, sizeof img);
+	s_rsGen++;
 	for (const J3DImage::Bp& b : img->bp) {
 		if (b.reg < 256) rs.bp[b.reg] = (rs.bp[b.reg] & ~b.mask) | (b.v & b.mask);
 		else rs.kreg[b.reg - 256] = b.v;
@@ -4101,6 +4255,7 @@ static void renderMain(void*) {
 			t0 = t;
 		}
 		const uint64_t t1 = t0;
+		SMS3DS_TimelineEvent(3, 0);
 		// Alone on its core: poll for a while before sleeping, so the game thread rarely has to
 		// wake it (a kernel call per record otherwise).
 		if (s_rtCore == 2) {
@@ -4112,6 +4267,7 @@ static void renderMain(void*) {
 			}
 			if (more) {
 				s_rIdle += svcGetSystemTick() - t1;
+				SMS3DS_TimelineEvent(4, 0);
 				continue;
 			}
 		}
@@ -4119,6 +4275,7 @@ static void renderMain(void*) {
 		if (s_head.load() == s_tail.load(std::memory_order_relaxed)) pica_event_wait(0);
 		s_rSleeping.store(0);
 		s_rIdle += svcGetSystemTick() - t1;
+		SMS3DS_TimelineEvent(4, 0);
 	}
 }
 
@@ -4161,7 +4318,7 @@ uint8_t* primitiveBegin(uint8_t op, uint32_t n, uint32_t fmt, uint32_t stride) {
 	s_bstride = stride;
 	size_t at = size_t(s_bcount) * stride;
 	s_vdata.resize(at + size_t(n) * stride);
-	s_decodeT0 = svcGetSystemTick();  // the front half decodes the vertices until primitiveEnd
+	s_decodeT0 = perfTick();  // the front half decodes the vertices until primitiveEnd (0: not timed)
 	return s_vdata.data() + at;
 }
 
@@ -4696,7 +4853,10 @@ static void arenaFrameEnd() {
 // and expects it read within a frame). Draw-sync tokens go back to the game thread, whose callback
 // runs game code: an interrupt source there runs it at its next check point. Off with D-pad right
 // held at launch (GX3DS_SetGxThread), and with the render thread off.
-static const uint32_t kStreamChunk = 64u << 10, kStreamChunks = 16;
+// 3DS port: 8 KB chunks (32, the most s_sFree's mask holds): the GX thread starts on a frame's
+// commands as soon as the first chunk fills, and 64 KB ones left it idle longer at each frame's
+// start, on the frame's critical path in Azahar (41.5 -> 38.6 ms a frame with 16 KB ones).
+static const uint32_t kStreamChunk = 8u << 10, kStreamChunks = 32;
 static uint8_t* s_sChunk[kStreamChunks];
 static uint32_t s_sLen[kStreamChunks];
 // Which buffer each chunk fills (by chunk number), and the buffers free. Taken in turn, or with
@@ -4705,7 +4865,7 @@ static uint32_t s_sLen[kStreamChunks];
 // in turn. The GX thread frees a chunk's buffer before it marks the chunk done. s_sUsed: buffers
 // taken since GX3DS_RingStats last read it.
 static uint8_t s_sBufOf[kStreamChunks];
-static std::atomic<uint32_t> s_sFree{(1u << kStreamChunks) - 1};
+static std::atomic<uint32_t> s_sFree{kStreamChunks >= 32 ? ~0u : (1u << (kStreamChunks & 31)) - 1};  // (no shift by 32)
 static std::atomic<bool> s_sCompact{false};
 static uint32_t s_sNext, s_sUsed;
 static std::atomic<uint32_t> s_sHead{0}, s_sTail{0};  // chunks handed over; done (released after parsing)
@@ -4796,7 +4956,14 @@ static void streamNoteDL(const void* list, uint32_t n) {
 	uint32_t b0, b1;
 	if (!mem1Blocks(list, n, b0, b1)) return;
 	const uint32_t mark = s_sHead.load(std::memory_order_relaxed) + 1;
-	for (uint32_t b = b0; b <= b1; b++) s_dlMark[b] = mark;
+	uint32_t b = b0;
+	for (; b + 3 <= b1; b += 4) {  // (four a step: a shape's list spans hundreds of blocks)
+		s_dlMark[b] = mark;
+		s_dlMark[b + 1] = mark;
+		s_dlMark[b + 2] = mark;
+		s_dlMark[b + 3] = mark;
+	}
+	for (; b <= b1; b++) s_dlMark[b] = mark;
 }
 // Game thread, before it writes [p, p + n).
 static void streamBeforeWrite(const void* p, uint32_t n) {
@@ -4822,17 +4989,27 @@ static bool streamCopyList(const void* list, uint32_t n) {
 	uint32_t b0, b1;
 	if (!s_dlCopyOn || n > kDlCopyMax || !mem1Blocks(list, n, b0, b1)) return false;
 	const int now = rwStamp(s_sFramesSent);
-	for (uint32_t b = b0; b <= b1; b++) {
-		if (!s_dlRw[b]) continue;
+	const auto recent = [now](uint32_t b) {
+		if (!s_dlRw[b]) return false;
 		int age = now - int(s_dlRw[b]);
 		if (age < 0) age += 255;
-		if (uint32_t(age) <= kDlCopyFrames) {
-			s_dlCopies++;
-			s_dlCopyBytes += n;
-			return true;
-		}
+		return uint32_t(age) <= kDlCopyFrames;
+	};
+	// Blocks never rewritten (almost all) four at a time: a shape's list spans hundreds of blocks.
+	uint32_t b = b0;
+	bool hit = false;
+	for (; b <= b1 && (b & 3) && !hit; b++) hit = recent(b);
+	for (; b + 3 <= b1 && !hit; b += 4) {
+		uint32_t w;
+		memcpy(&w, s_dlRw + b, 4);
+		if (w) hit = recent(b) || recent(b + 1) || recent(b + 2) || recent(b + 3);
 	}
-	return false;
+	for (; b <= b1 && !hit; b++) hit = recent(b);
+	if (hit) {
+		s_dlCopies++;
+		s_dlCopyBytes += n;
+	}
+	return hit;
 }
 
 // Draw-sync tokens, GX thread -> game thread.
@@ -4870,7 +5047,10 @@ static void gxMain(void*) {
 	uint32_t carryNeed = 0;
 	for (;;) {
 		const uint64_t t0 = svcGetSystemTick();
+		const bool waits = s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire);
+		if (waits) SMS3DS_TimelineEvent(1, 0);
 		while (s_sTail.load(std::memory_order_relaxed) == s_sHead.load(std::memory_order_acquire)) pica_event_wait(EV_GX);
+		if (waits) SMS3DS_TimelineEvent(2, 0);
 		const uint64_t t1 = svcGetSystemTick();
 		s_sIdle += t1 - t0;
 		GX3DS_GxWaitTicks += t1 - t0;
@@ -5100,6 +5280,7 @@ void executeCopy(uint32_t ctrl) {
 static void renderCopy(const CopyRec* cr) {
 	const uint32_t ctrl = cr->ctrl;
 	rs.copyDest = cr->copyDest;
+	s_rsGen++;  // (the EFB copies, which textures can be found among, change below)
 	for (int i = 0; i < PERF_COUNT; i++) s_perfAcc[i] += cr->gAcc[i];
 	memcpy(s_gWaitSeen, cr->gWait, sizeof s_gWaitSeen);
 	s_qBytesSeen = cr->qBytes;
@@ -5283,7 +5464,9 @@ int GXPC_InitAuto(int) {
 void GXPC_StreamFrameEnd(void) {
 	gx::GXPC_StreamFlush();
 	const uint32_t sent = ++gx::s_sFramesSent;
+	gx::SMS3DS_TimelineEvent(5, 0);
 	gx::streamWait(gx::s_sWait[1], [sent] { return int32_t(sent - gx::s_sFramesDone.load(std::memory_order_acquire)) <= 0; });
+	gx::SMS3DS_TimelineEvent(6, 0);
 }
 // ... a display list was called through the stream by address (GXCallDisplayList).
 void GXPC_StreamNoteDL(const void* list, uint32_t nbytes) { gx::streamNoteDL(list, nbytes); }
@@ -5306,6 +5489,8 @@ void GXPC_StreamDrain(void) {
 }
 // Off before the first frame: GX runs on the game thread (no GX thread).
 void GX3DS_SetGxThread(int on) { gx::s_gxWanted = on != 0; }
+void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.txt perf_timers
+void GX3DS_SetDrawStateCheck(int on) { gx::s_fpCheck = on != 0; }  // settings.txt draw_state_check
 void GX3DS_SetListCopies(int on) { gx::s_dlCopyOn = on != 0; }
 
 // 0: material, 1: debug colours, 2: opaque (material colours, no blending or alpha test).

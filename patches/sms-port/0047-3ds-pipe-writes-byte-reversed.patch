@@ -1,0 +1,49 @@
+--- a/platform/gx/include/sms_gx/gx_pc.h
++++ b/platform/gx/include/sms_gx/gx_pc.h
+@@ -9,6 +9,9 @@
+ #define SMS_GX_GX_PC_H
+ 
+ #include <stdint.h>
++#if defined(__3DS__)
++#include <string.h>
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -146,11 +149,19 @@
+     if (GXPC_PipeLen + 1 <= GXPC_PipeFast) GXPC_PipeBuf[GXPC_PipeLen++] = v;
+     else GXPC_Write8(v);
+ }
++/* 3DS port: the big-endian halfword and word as one byte-reversed store each (rev16/rev and an
++ * unaligned str: ARMv6K), not a store per byte: the same bytes, in a third of the instructions
++ * of tens of thousands of writes a frame. */
+ static inline void GXPC_Put16(uint16_t v) {
+     if (GXPC_PipeLen + 2 <= GXPC_PipeFast) {
++#if defined(__3DS__)
++        const uint16_t be = __builtin_bswap16(v);
++        memcpy(GXPC_PipeBuf + GXPC_PipeLen, &be, 2);
++#else
+         uint8_t* p = GXPC_PipeBuf + GXPC_PipeLen;
+         p[0] = (uint8_t)(v >> 8);
+         p[1] = (uint8_t)v;
++#endif
+         GXPC_PipeLen += 2;
+     } else {
+         GXPC_Write16(v);
+@@ -158,11 +169,16 @@
+ }
+ static inline void GXPC_Put32(uint32_t v) {
+     if (GXPC_PipeLen + 4 <= GXPC_PipeFast) {
++#if defined(__3DS__)
++        const uint32_t be = __builtin_bswap32(v);
++        memcpy(GXPC_PipeBuf + GXPC_PipeLen, &be, 4);
++#else
+         uint8_t* p = GXPC_PipeBuf + GXPC_PipeLen;
+         p[0] = (uint8_t)(v >> 24);
+         p[1] = (uint8_t)(v >> 16);
+         p[2] = (uint8_t)(v >> 8);
+         p[3] = (uint8_t)v;
++#endif
+         GXPC_PipeLen += 4;
+     } else {
+         GXPC_Write32(v);

@@ -1,0 +1,33 @@
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -120,6 +120,11 @@
+ std::map<OSThread*, Host*> g_hosts;
+ std::vector<OSThread*> g_threads;
+ u64 g_switch_seq;
++#if defined(__3DS__)
++// 3DS port: interrupt deliveries so far (deliver_irqs: the sources run on the thread that
++// delivers them, with no switch), for profile runs' timers (port_irq_deliveries).
++u64 g_irq_seq;
++#endif
+ bool g_irq_enabled = true;
+ bool g_in_irq;
+ bool g_need_resched;
+@@ -519,6 +524,9 @@
+ 	if (g_in_irq)
+ 		return;
+ 	g_in_irq = true;
++#if defined(__3DS__)
++	g_irq_seq++;
++#endif
+ 	g_irq_kicks.store(0);
+ 	for (size_t i = 0; i < g_sources.size(); i++)
+ 		g_sources[i]();
+@@ -1044,4 +1052,8 @@
+ #if defined(__3DS__)
+ // 3DS port: emulated thread switches so far, for the renderer's [perf] lines.
+ extern "C" unsigned long long port_os_switches(void) { return g_switch_seq; }
++// 3DS port: interrupt deliveries so far. While neither count moves, no other emulated thread and
++// no interrupt source runs in the middle of the timed code (the 3DS's own threads on that core,
++// such as ndsp's, can still take turns).
++extern "C" unsigned long long port_irq_deliveries(void) { return g_irq_seq; }
+ #endif

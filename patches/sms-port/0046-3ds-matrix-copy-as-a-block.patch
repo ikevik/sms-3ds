@@ -1,0 +1,20 @@
+--- a/platform/mtx/mtx_ps.inc
++++ b/platform/mtx/mtx_ps.inc
+@@ -88,10 +88,17 @@
+ }
+ static void gMTXCopy(Mtx src, Mtx dst)
+ {
++#if defined(__3DS__)
++	// 3DS port: one 48-byte block (load and store multiple), the same bits as the pair-by-pair
++	// copy below: the game copies thousands of matrices a frame (J3D's joints and envelopes), and
++	// the loop took a third more of the game thread's time in Azahar than the copy needs.
++	memcpy(&dst[0][0], &src[0][0], sizeof(Mtx));
++#else
+ 	const f32* s = &src[0][0];
+ 	f32* d       = &dst[0][0];
+ 	for (int i = 0; i < 12; i += 2)
+ 		S(d + i, L(s + i));
++#endif
+ }
+ static void gMTXConcat(Mtx a, Mtx b, Mtx ab)
+ {

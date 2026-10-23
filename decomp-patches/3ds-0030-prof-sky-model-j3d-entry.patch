@@ -1,0 +1,341 @@
+--- a/include/sms3ds_zone.h
++++ b/include/sms3ds_zone.h
+@@ -10,6 +10,7 @@
+ struct SMS3DSZone {
+ 	int zone, token;
+ 	explicit SMS3DSZone(int z) : zone(z), token(SMS3DS_ProfOn ? SMS3DS_ZoneBegin(z) : -1) {}
++	SMS3DSZone(int z, bool on) : zone(z), token(on && SMS3DS_ProfOn ? SMS3DS_ZoneBegin(z) : -1) {}
+ 	~SMS3DSZone()
+ 	{
+ 		if (token >= 0)
+@@ -17,8 +18,13 @@
+ 	}
+ };
+ #define SMS3DS_ZONE(n) SMS3DSZone sms3ds_zone_(n)
++// 3DS port (decomp patch 3ds-0030): a zone timed only while `on` holds, as the sky's model's parts
++// (in MActor and J3DModel, while TSky::perform runs its model: SMS3DS_ZoneSky).
++#define SMS3DS_ZONE_IF(on, n) SMS3DSZone sms3ds_zone_(n, (on))
++extern "C" int SMS3DS_ZoneSky;
+ #else
+ #define SMS3DS_ZONE(n)
++#define SMS3DS_ZONE_IF(on, n)
+ #endif
+ 
+ // 3DS port (decomp patch 3ds-0019, native J3D stage 0, docs/native-j3d.md): in profile runs the J3D
+--- a/libs/JSystem/src/J3D/J3DGraphAnimator/J3DJoint.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphAnimator/J3DJoint.cpp
+@@ -1,30 +1,50 @@
+ #include <JSystem/J3D/J3DGraphAnimator/J3DJoint.hpp>
+ #if defined(__3DS__)
+-// 3DS port (decomp patch 3ds-0029, platform/3ds/prof_3ds.cpp): in profile runs J3DJoint::entryIn
+-// counts its materials (SMS3DS_J3DEntryCount: seen, timed, unlocked, entered into a draw buffer)
+-// and times one in four by part (SMS3DS_J3DEntryTicks: the packets' lookup and the material
+-// animation, the material's calc and current matrices, the packets set and the entry, the display
+-// list). Outside a profile run each costs one branch.
++// 3DS port (decomp patches 3ds-0029 and 3ds-0030, platform/3ds/prof_3ds.cpp): in profile runs
++// J3DJoint::entryIn counts the joints it visits and its materials (SMS3DS_J3DEntryCount: seen,
++// timed, unlocked, entered into a draw buffer, dropped, joints) and times one material in four by
++// part (SMS3DS_J3DEntryTicks: the packets' lookup and the material animation, the material's calc
++// and current matrices, the packets set and the entry, the display list). A timed material
++// during which another emulated thread or an interrupt source ran (the display list's
++// OSRestoreInterrupts delivers them) is dropped: its time would be theirs. Outside a profile run
++// each costs one branch.
+ extern "C" int SMS3DS_ProfOn;
+ extern "C" unsigned long long SMS3DS_Ticks(void);
++extern "C" unsigned long long SMS3DS_PortEvents(void);
+ extern "C" unsigned long long SMS3DS_J3DEntryTicks[4];
+-extern "C" unsigned SMS3DS_J3DEntryCount[4];
++extern "C" unsigned SMS3DS_J3DEntryCount[6];
+ namespace {
+ struct TEntryTimer {
+ 	bool on;
+-	unsigned long long t;
++	unsigned long long t, events, ticks[4];
+ 	TEntryTimer()
+ 	    : on(SMS3DS_ProfOn && (SMS3DS_J3DEntryCount[0]++ & 3) == 0)
+-	    , t(on ? SMS3DS_Ticks() : 0)
++	    , t(0)
++	    , events(0)
+ 	{
+-		if (on)
+-			SMS3DS_J3DEntryCount[1]++;
++		ticks[0] = ticks[1] = ticks[2] = ticks[3] = 0;
++		if (on) {
++			events = SMS3DS_PortEvents();
++			t      = SMS3DS_Ticks();
++		}
+ 	}
++	~TEntryTimer()
++	{
++		if (!on)
++			return;
++		if (SMS3DS_PortEvents() != events) {
++			SMS3DS_J3DEntryCount[4]++;
++			return;
++		}
++		SMS3DS_J3DEntryCount[1]++;
++		for (int i = 0; i < 4; i++)
++			SMS3DS_J3DEntryTicks[i] += ticks[i];
++	}
+ 	void lap(int part)
+ 	{
+ 		if (on) {
+ 			const unsigned long long now = SMS3DS_Ticks();
+-			SMS3DS_J3DEntryTicks[part] += now - t;
++			ticks[part] += now - t;
+ 			t = now;
+ 		}
+ 	}
+@@ -389,6 +409,7 @@
+ 
+ void J3DJoint::entryIn()
+ {
++	SMS3DS_ENTRY_COUNT(5);
+ 	j3dSys.getDrawBuffer(0)->setZMtx(j3dSys.getModel()->getAnmMtx(getJntNo()));
+ 	j3dSys.getDrawBuffer(1)->setZMtx(j3dSys.getModel()->getAnmMtx(getJntNo()));
+ 
+--- a/libs/JSystem/src/J3D/J3DGraphAnimator/J3DModel.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphAnimator/J3DModel.cpp
+@@ -1,4 +1,46 @@
+ #include <JSystem/J3D/J3DGraphAnimator/J3DModel.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0030 (the sky's model timed)
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0030, platform/3ds/prof_3ds.cpp): in profile runs one J3DModel::entry
++// in four is timed whole (SMS3DS_J3DModelEntryTicks; SMS3DS_J3DModelEntryCount: calls, timed,
++// dropped). A timed entry during which another emulated thread or an interrupt source ran (the
++// display lists' OSRestoreInterrupts delivers them) is dropped: its time would be theirs.
++extern "C" unsigned long long SMS3DS_Ticks(void);
++extern "C" unsigned long long SMS3DS_PortEvents(void);
++extern "C" unsigned long long SMS3DS_J3DModelEntryTicks;
++extern "C" unsigned SMS3DS_J3DModelEntryCount[3];
++namespace {
++struct TModelEntryTimer {
++	bool on;
++	unsigned long long t, events;
++	TModelEntryTimer()
++	    : on(SMS3DS_ProfOn && (SMS3DS_J3DModelEntryCount[0]++ & 3) == 0)
++	    , t(0)
++	    , events(0)
++	{
++		if (on) {
++			events = SMS3DS_PortEvents();
++			t      = SMS3DS_Ticks();
++		}
++	}
++	~TModelEntryTimer()
++	{
++		if (!on)
++			return;
++		const unsigned long long now = SMS3DS_Ticks();
++		if (SMS3DS_PortEvents() != events) {
++			SMS3DS_J3DModelEntryCount[2]++;
++			return;
++		}
++		SMS3DS_J3DModelEntryCount[1]++;
++		SMS3DS_J3DModelEntryTicks += now - t;
++	}
++};
++} // namespace
++#define SMS3DS_MODEL_ENTRY_TIMER() TModelEntryTimer sms3ds_model_entry_
++#else
++#define SMS3DS_MODEL_ENTRY_TIMER()
++#endif
+ #include <JSystem/J3D/J3DGraphAnimator/J3DJoint.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DMaterial.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DShape.hpp>
+@@ -1015,25 +1057,32 @@
+ 		j3dSys.offFlag(0x8);
+ 	}
+ 
+-	mVertexBuffer->frameInit();
+-
+-	if (unk9C != nullptr)
+-		unk9C->calc(mModelData);
++	{
++		SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 51);
++		mVertexBuffer->frameInit();
+ 
+-	if (mDeformData != nullptr)
+-		mDeformData->deform(this);
++		if (unk9C != nullptr)
++			unk9C->calc(mModelData);
++
++		if (mDeformData != nullptr)
++			mDeformData->deform(this);
+ 
+-	if (unk90 != nullptr)
+-		unk90->calc(this);
++		if (unk90 != nullptr)
++			unk90->calc(this);
+ 
+-	if (unk94 != nullptr)
+-		unk94->calc(this);
++		if (unk94 != nullptr)
++			unk94->calc(this);
++	}
+ 
+-	j3dSys.setCurrentMtxCalc(mModelData->getMtxCalc());
+-	mModelData->getMtxCalc()->init(unk14, unk20);
+-	j3dSys.setTexture(mModelData->getTexture());
+-	mModelData->getMtxCalc()->recursiveCalc(mModelData->getRootNode());
++	{
++		SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 52);
++		j3dSys.setCurrentMtxCalc(mModelData->getMtxCalc());
++		mModelData->getMtxCalc()->init(unk14, unk20);
++		j3dSys.setTexture(mModelData->getTexture());
++		mModelData->getMtxCalc()->recursiveCalc(mModelData->getRootNode());
++	}
+ 
++	SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 53);
+ 	calcWeightEnvelopeMtx();
+ 
+ 	if (mSkinDeform)
+@@ -1045,6 +1094,7 @@
+ 
+ void J3DModel::entry()
+ {
++	SMS3DS_MODEL_ENTRY_TIMER();
+ 
+ 	j3dSys.setModel(this);
+ 
+@@ -1067,34 +1117,41 @@
+ 
+ void J3DModel::viewCalc()
+ {
+-	swapDrawMtx();
+-	swapNrmMtx();
++	{
++		SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 56);
++		swapDrawMtx();
++		swapNrmMtx();
+ 
+-	if (checkFlag(1)) {
+-		for (u16 i = 0; i < mModelData->getDrawFullWgtMtxNum(); i++) {
+-			MTXCopy(getAnmMtx(mModelData->getDrawMtxIndex(i)), getDrawMtx(i));
+-		}
+-		for (u16 i = 0; i < mModelData->getWEvlpMtxNum(); i++) {
+-			MTXCopy(mWeightEvlpMatrices[i],
+-			        getDrawMtx(mModelData->getDrawFullWgtMtxNum() + i));
+-		}
+-	} else {
+-		MtxPtr viewMtx = j3dSys.getViewMtx();
+-		if (mModelData->getDrawFullWgtMtxNum() != 0) {
+-			J3DMTXConcatArrayIndexedSrc(
+-			    viewMtx, mNodeMatrices, mModelData->mDrawMtxData.mDrawMtxIndex,
+-			    getDrawMtxPtr(), mModelData->getDrawFullWgtMtxNum());
+-		}
+-		if (mModelData->getDrawMtxNum() > mModelData->getDrawFullWgtMtxNum()) {
+-			J3DPSMtxArrayConcat(viewMtx, getWeightAnmMtx(0),
+-			                    getDrawMtx(mModelData->getDrawFullWgtMtxNum()),
+-			                    mModelData->getWEvlpMtxNum());
++		if (checkFlag(1)) {
++			for (u16 i = 0; i < mModelData->getDrawFullWgtMtxNum(); i++) {
++				MTXCopy(getAnmMtx(mModelData->getDrawMtxIndex(i)), getDrawMtx(i));
++			}
++			for (u16 i = 0; i < mModelData->getWEvlpMtxNum(); i++) {
++				MTXCopy(mWeightEvlpMatrices[i],
++				        getDrawMtx(mModelData->getDrawFullWgtMtxNum() + i));
++			}
++		} else {
++			MtxPtr viewMtx = j3dSys.getViewMtx();
++			if (mModelData->getDrawFullWgtMtxNum() != 0) {
++				J3DMTXConcatArrayIndexedSrc(
++				    viewMtx, mNodeMatrices, mModelData->mDrawMtxData.mDrawMtxIndex,
++				    getDrawMtxPtr(), mModelData->getDrawFullWgtMtxNum());
++			}
++			if (mModelData->getDrawMtxNum() > mModelData->getDrawFullWgtMtxNum()) {
++				J3DPSMtxArrayConcat(viewMtx, getWeightAnmMtx(0),
++				                    getDrawMtx(mModelData->getDrawFullWgtMtxNum()),
++				                    mModelData->getWEvlpMtxNum());
++			}
+ 		}
+ 	}
+ 
+-	calcNrmMtx();
+-	calcBBoard();
+-	calcBumpMtx();
++	{
++		SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 57);
++		calcNrmMtx();
++		calcBBoard();
++		calcBumpMtx();
++	}
++	SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 58);
+ 	DCStoreRange(getDrawMtxPtr(),
+ 	             getModelData()->getDrawMtxNum() * sizeof(Mtx));
+ 	DCStoreRange(getNrmMtxPtr(),
+--- a/src/M3DUtil/MActor.cpp
++++ b/src/M3DUtil/MActor.cpp
+@@ -1,4 +1,5 @@
+ #include <M3DUtil/MActor.hpp>
++#include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0030 (the sky's model timed)
+ #include <M3DUtil/MActorAnm.hpp>
+ #include <MarioUtil/LightUtil.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+@@ -349,11 +350,18 @@
+ 
+ void MActor::calcAnm()
+ {
+-	frameUpdate();
++	{
++		SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 49);
++		frameUpdate();
+ 
+-	updateIn();
++		updateIn();
++	}
+ 	J3DModel* model = getModel();
+-	model->calc();
++	{
++		SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 50);
++		model->calc();
++	}
++	SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 54);
+ 	updateOut();
+ }
+ 
+@@ -369,6 +377,7 @@
+ 
+ void MActor::viewCalc()
+ {
++	SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 55);
+ 	if (unk39)
+ 		mModel->viewCalc();
+ }
+@@ -445,6 +454,7 @@
+ 
+ void MActor::entry()
+ {
++	SMS3DS_ZONE_IF(SMS3DS_ZoneSky, 59);
+ 	if (!unk39)
+ 		return;
+ 
+--- a/src/Map/Sky.cpp
++++ b/src/Map/Sky.cpp
+@@ -31,7 +31,8 @@
+ 
+ #if defined(__3DS__)
+ // 3DS port (decomp patch 3ds-0028, platform/3ds/prof_3ds.cpp): a profile run's GPU test window
+-// leaves out the draws its bit names (SMS3DS_ProfDrawSkip; 0 in normal play).
++// leaves out the draws its bit names (SMS3DS_ProfDrawSkip; 0 in normal play). Decomp patch 3ds-0030:
++// bit 16 leaves the sky's model out (its perform: no calc, no entry, so not drawn), a ceiling.
+ extern "C" int SMS3DS_ProfDrawSkip;
+ #define SMS3DS_DRAW_SKIP(bit) ((SMS3DS_ProfDrawSkip & (bit)) != 0)
+ #else
+@@ -89,9 +90,15 @@
+ 		}
+ 		MTXCopy(local_BC, getMActor()->getModel()->getBaseTRMtx());
+ 	}
+-	{
++	if (!SMS3DS_DRAW_SKIP(16)) {
+ 		SMS3DS_ZONE(40);
++#if defined(__3DS__)
++		SMS3DS_ZoneSky = 1;  // decomp patch 3ds-0030: its model's parts timed
++#endif
+ 		unk44->perform(cue, graphics);
++#if defined(__3DS__)
++		SMS3DS_ZoneSky = 0;
++#endif
+ 	}
+ 	if ((cue & CUE_DRAW) != 0 && !SMS3DS_DRAW_SKIP(8)) {
+ 		SMS3DS_ZONE(41);

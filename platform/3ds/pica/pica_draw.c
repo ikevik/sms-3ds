@@ -1340,11 +1340,11 @@ static void gx_light_vectors(const float (*nrm_rows)[4], const float LD[4])
 
 /* The setup a GX-mode draw needs (attribute loaders, state, uniforms, shortcuts, buffer): 0 when the
  * layout cannot be expressed. */
-static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, int matrices_dirty,
+static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, uint32_t matrices_dirty,
                     const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st);
 
 int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, const uint16_t* idx, uint32_t nidx,
-                 const PicaGxUniforms* u, int matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
+                 const PicaGxUniforms* u, uint32_t matrices_dirty, const float (*pos_rows)[4], const float (*nrm_rows)[4],
                  const PicaState* st)
 {
 	(void)nverts;
@@ -1360,7 +1360,7 @@ int pica_draw_gx(const void* verts, uint32_t nverts, const PicaGxLayout* L, cons
 	return 1;
 }
 
-static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, int matrices_dirty,
+static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUniforms* u, uint32_t matrices_dirty,
                     const float (*pos_rows)[4], const float (*nrm_rows)[4], const PicaState* st)
 {
 	static PicaGxLayout s_posOnly;
@@ -1386,13 +1386,18 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 			C3D_BoolUnifSet(GPU_VERTEX_SHADER, s_bCpu, false);
 			s_mode = MODE_GX;
 		}
-		matrices_dirty = matrices_dirty || !s_gxMatricesLoaded;
+		if (!s_gxMatricesLoaded) matrices_dirty = (1u << PICA_GX_MTX_ROWS) - 1;
 	}
 	apply_state(st);
 	if (!s_gxMatricesLoaded) memset(s_lnValid, 0, sizeof s_lnValid);  /* uniforms set elsewhere (self-test, [vbench]) */
 	if (matrices_dirty || !s_gxMatricesLoaded) {
-		for (int r = 0; r < PICA_GX_MTX_ROWS; r++)
+		/* the rows whose XF words changed (bit r), or all of them when the uniforms were set elsewhere:
+		 * the others hold the values set last */
+		uint32_t m = s_gxMatricesLoaded ? matrices_dirty : (1u << PICA_GX_MTX_ROWS) - 1;
+		for (; m; m &= m - 1) {
+			const int r = __builtin_ctz(m);
 			vunif(s_uP + r, pos_rows[r][0], pos_rows[r][1], pos_rows[r][2], pos_rows[r][3]);
+		}
 		s_gxMatricesLoaded = 1;
 	}
 	if (u->LD[3] != 0.0f) gx_light_vectors(nrm_rows, u->LD);
@@ -2363,7 +2368,7 @@ int pica_selftest(void)
 			st.blend_eq = st.blend_aeq = GPU_BLEND_ADD;
 			st.blend_src = st.blend_asrc = GPU_ONE;
 			st.blend_dst = st.blend_adst = GPU_ZERO;
-			pica_draw_gx(vb, 4, &L, ib, 6, &u, 1, (const float(*)[4])rows, (const float(*)[4])rows, &st);
+			pica_draw_gx(vb, 4, &L, ib, 6, &u, (1u << PICA_GX_MTX_ROWS) - 1, (const float(*)[4])rows, (const float(*)[4])rows, &st);
 		} else {
 			fprintf(stderr, "[gputest] 3: no ring space\n");
 		}
