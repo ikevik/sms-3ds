@@ -3,9 +3,9 @@
 @@ -1,4 +1,10 @@
  #include <JSystem/JParticle/JPAEmitter.hpp>
 +#if defined(__3DS__)
-+// 3DS port (decomp patch 3ds-0033, settings.txt lite): half the particles. Emitters that spawn at a
-+// rate spawn at half of it; those that emit a set of particles at once (fixed interval: spheres,
-+// circles, lines) emit every other one of the set.
++// 3DS port (decomp patch 3ds-0033, settings.txt lite): one particle in SMS3DS_LiteParticles (2 or
++// more; else all). Emitters that spawn at a rate spawn at that fraction of it; those that emit a set
++// of particles at once (fixed interval: spheres, circles, lines) emit one of the set in that many.
 +extern "C" int SMS3DS_LiteParticles;
 +#endif
  #include <JSystem/JParticle/JPAEmitterManager.hpp>
@@ -16,8 +16,8 @@
  			}
  
 +#if defined(__3DS__)
-+			if (SMS3DS_LiteParticles)
-+				createRate *= 0.5f;
++			if (SMS3DS_LiteParticles > 1)
++				createRate /= (f32)SMS3DS_LiteParticles;
 +#endif
  			mChildSpawnTimer += createRate;
  
@@ -27,7 +27,7 @@
  		if (numToCreate != 0) {
  			for (int i = 0; i < numToCreate; ++i) {
 +#if defined(__3DS__)
-+				if (SMS3DS_LiteParticles && (i & 1) && checkFlag(EMIT_FLAG_FIXED_INTERVAL))
++				if (SMS3DS_LiteParticles > 1 && i % SMS3DS_LiteParticles != 0 && checkFlag(EMIT_FLAG_FIXED_INTERVAL))
 +					continue;
 +#endif
  				eio.mVolumeEmitIdx = i;

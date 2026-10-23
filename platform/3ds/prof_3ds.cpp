@@ -207,9 +207,13 @@ int SMS3DS_ProfSkipOn;  // part 5: an object's drawing is being left out (SMS3DS
 // (decomp patch 3ds-0033), nothing drawn wholly past a distance (sms-port patch 0051's
 // GXPC_CullFar), no mirror (its objects and its EFB copy left out through SMS3DS_ProfSkip).
 float SMS3DS_LiteShadowDist2;
-int SMS3DS_LiteParticles;
+int SMS3DS_LiteParticles;  // one particle in this many (decomp patch 3ds-0033; 0 or 1: all)
 int SMS3DS_LiteMirror;
 float SMS3DS_LiteFar;
+float SMS3DS_LiteActorFar;  // NPCs' and map objects' clip distance cap (decomp patch 3ds-0034; 0: the game's)
+int SMS3DS_LiteSeaStep;     // the sea's grid, every this many columns and rows (decomp patch 3ds-0034)
+uint64_t GX3DS_GameWaitTicks(void);  // gx3ds_backend.cpp: the game thread's waits for the GX thread
+double port_idle_seconds(void);      // os_thread.cpp: the game's pacing waits so far
 int SMS3DS_ProfSkip(const void* vtable, const char* name);
 int SMS3DS_J3DCeilingBegin(void);  // decomp patch 3ds-0027: a J3D ceiling step's draw buffers
 void SMS3DS_J3DCeilingEnd(void);
@@ -746,6 +750,7 @@ struct GameStep {
 	int trade;     // kTr*: what of the game is left out (profile_steps = trades)
 	int farCull;   // GXPC_CullFar: draws wholly farther than this left out (0: none)
 	int lite;      // the lite setting: 0 as set, 1 off, 2 on (profile_steps = lite)
+	int litePlus;  // kLp*: more trims on top of it (profile_steps = liteplus)
 };
 // A window's role: normal (or the batch off), the batch on, a ceiling (compared with the normal
 // windows either side), a warm-up (not compared: the first window's render-thread time ran high),
@@ -915,14 +920,55 @@ const GameStep kLiteSteps[kLiteN] = {
     kStdSteps[kGsChecks],
 };
 #undef SMS3DS_STEP
+// autorun.txt profile_steps = liteplus (main.cpp, SMS3DS_ProfLitePlusSteps): the lite setting on
+// throughout, and one more trim at a time between plain lite windows: the Shine's shadow volume
+// left out, the sea's grid at every other column and row (a quarter of its vertices), shadows for
+// Mario and Yoshi only, a quarter of the particles, NPCs and map objects clipped past 2500, nothing
+// drawn past 3000, the HUD not drawn (for reference); then all but the HUD, then all of them.
+// Phases untimed; the game thread's own work is its frame less its waits for the GX thread and the
+// pacing wait. Then every check.
+enum { kLpShine = 1, kLpSea = 2, kLpShadows = 4, kLpParticles = 8, kLpActors = 16, kLpFar = 32, kLpHud = 64,
+       kLpAllButHud = 63 };
+#define SMS3DS_STEP(name, plus, role) \
+	{name, 0, 0, 0, 0, 0, 1, 0, -1, -1, 0, -1, -1, -1, -1, -1, role, 0, 0, 0, -1, 0, 0, 0, 0, 2, plus}
+enum { kLitePlusN = 21 };
+const GameStep kLitePlusSteps[kLitePlusN] = {
+    SMS3DS_STEP("warm-up (not compared)", 0, kRoleWarm),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + no Shine shadow", kLpShine, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + sea at a quarter of its vertices", kLpSea, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + shadows for Mario only", kLpShadows, kRoleCeiling),
+    SMS3DS_STEP("lite + a quarter of the particles", kLpParticles, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + NPCs and objects clipped past 2500", kLpActors, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + nothing drawn past 3000", kLpFar, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + no HUD drawn", kLpHud, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + all but the HUD", kLpAllButHud, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + all of them", kLpAllButHud | kLpHud, kRoleCeiling),
+    SMS3DS_STEP("lite", 0, kRoleNormal),
+    SMS3DS_STEP("lite + all but the HUD", kLpAllButHud, kRoleCeiling),
+    kStdSteps[kGsChecks],
+};
+#undef SMS3DS_STEP
 int s_trade;  // this window's kTr* (SMS3DS_ProfSkip)
+void litePlusApply(int plus);  // more trims on top of the lite setting (below)
+double s_gameOwn[32], s_gameWaitMs[32], s_gameIdleMs[32];  // untimed steps: the game thread's own work, waits, pacing
+uint64_t s_gameWait0;
+double s_gameIdle0;
 void skipGate();          // SMS3DS_ProfSkipOn from what is left out now (below)
 void liteApply(bool on);  // the lite setting's parts on or off (below)
 bool s_liteOn;            // the lite setting as set (SMS3DS_SetLite)
 double s_gameSkips[32];  // each step's performs left out a frame
 enum { kStepMax2 = kGpuN > kGsN ? kGpuN : kGsN, kStepMax3 = kRvN > kStepMax2 ? kRvN : kStepMax2,
        kStepMax4 = kCacheN > kStepMax3 ? kCacheN : kStepMax3, kStepMax5 = kFixedN > kStepMax4 ? kFixedN : kStepMax4,
-       kStepMax6 = kTradeN > kStepMax5 ? kTradeN : kStepMax5, kGameStepMax = kLiteN > kStepMax6 ? kLiteN : kStepMax6 };
+       kStepMax6 = kTradeN > kStepMax5 ? kTradeN : kStepMax5, kStepMax7 = kLiteN > kStepMax6 ? kLiteN : kStepMax6,
+       kGameStepMax = kLitePlusN > kStepMax7 ? kLitePlusN : kStepMax7 };
 static_assert(kGameStepMax <= 32, "s_gameSkips");
 // The run's steps: the standard ones, or the GPU's ceilings.
 const GameStep* s_steps = kStdSteps;
@@ -997,6 +1043,7 @@ void setGameStep(int k) {
 	pica_set_cache_way(g && g->cacheWay ? g->cacheWay - 1 : s_cacheWaySaved);
 	s_trade = g ? g->trade : 0;
 	liteApply(g && g->lite ? g->lite == 2 : s_liteOn);
+	if (g && g->litePlus) litePlusApply(g->litePlus);
 	skipGate();
 	GX3DS_SetSkipColourCopies(s_trade & kTrMirror);
 	GXPC_CullFar = g && g->farCull ? float(g->farCull) : SMS3DS_LiteFar;
@@ -1073,6 +1120,11 @@ void reportGameStep(int k) {
 		const size_t at0 = strlen(hog);
 		snprintf(hog + at0, sizeof hog - at0, "; %.1f performs a frame left out", s_gameSkips[k]);
 	}
+	if (!s_steps[k].profOn) {
+		const size_t at0 = strlen(hog);
+		snprintf(hog + at0, sizeof hog - at0, "; game thread's own work %.1f (waits %.1f, pacing %.1f)", s_gameOwn[k],
+		         s_gameWaitMs[k], s_gameIdleMs[k]);
+	}
 	fprintf(stderr, "[prof] game thread, %s: frame %.1f ms, GPU %.1f, GX thread %.1f, render thread %.1f%s; its work %.1f "
 	        "ms/frame (end rendering, waits included, %.1f more):%s\n", s_steps[k].name, s_gameFrame[k], s_gameGpu[k],
 	        s_gameGx[k], s_gameRender[k], hog, gameWork(k), s_gamePh[k][15], line);
@@ -1083,8 +1135,9 @@ struct WinFig {
 	double work, end, gx, render, gpu, frame, j3d, ph[PHASES];
 };
 WinFig winFig(int k) {
-	WinFig f = {gameWork(k), s_gamePh[k][15], s_gameGx[k], s_gameRender[k], s_gameGpu[k], s_gameFrame[k],
-	            s_gameZoneMs[k][5], {}};
+	// (untimed steps: the game thread's own work, its frame less its waits and the pacing wait)
+	WinFig f = {s_steps[k].profOn ? gameWork(k) : s_gameOwn[k], s_steps[k].profOn ? s_gamePh[k][15] : s_gameWaitMs[k],
+	            s_gameGx[k], s_gameRender[k], s_gameGpu[k], s_gameFrame[k], s_gameZoneMs[k][5], {}};
 	for (int i = 0; i < PHASES; i++) f.ph[i] = s_gamePh[k][i];
 	return f;
 }
@@ -1732,14 +1785,29 @@ namespace {
 void skipGate() { SMS3DS_ProfSkipOn = s_trade != 0 || s_skipNow != nullptr || SMS3DS_LiteMirror; }
 // The lite setting's parts, as set by SMS3DS_SetLite (or its defaults when only a profile run turns
 // it on): shadows' distance, particles, mirror, draw distance.
-float s_liteShadowDist = 2000.0f, s_liteFar = 4000.0f;
+float s_liteShadowDist = 2000.0f, s_liteFar = 4000.0f, s_liteActorFar = 0.0f;
+int s_liteParticles = 2, s_liteSeaStep = 1;
+bool s_liteShine = true;  // the Shine's shadow volume drawn
 void liteApply(bool on) {
-	SMS3DS_LiteShadowDist2 = on ? s_liteShadowDist * s_liteShadowDist : 0.0f;
-	SMS3DS_LiteParticles = on;
+	// (a distance of 0: Mario's and Yoshi's shadows only)
+	SMS3DS_LiteShadowDist2 = !on ? 0.0f : s_liteShadowDist > 1.0f ? s_liteShadowDist * s_liteShadowDist : 1.0f;
+	SMS3DS_LiteParticles = on ? s_liteParticles : 0;
 	SMS3DS_LiteMirror = on;
 	SMS3DS_LiteFar = on ? s_liteFar : 0.0f;
+	SMS3DS_LiteActorFar = on ? s_liteActorFar : 0.0f;
+	SMS3DS_LiteSeaStep = on ? s_liteSeaStep : 0;
+	SMS3DS_ProfDrawSkip = (SMS3DS_ProfDrawSkip & ~1) | (on && !s_liteShine ? 1 : 0);  // 1: the Shine's shadow volume
 	GXPC_CullFar = SMS3DS_LiteFar;
 	skipGate();
+}
+void litePlusApply(int plus) {
+	if (plus & kLpShine) SMS3DS_ProfDrawSkip |= 1;
+	if (plus & kLpSea) SMS3DS_LiteSeaStep = 2;
+	if (plus & kLpShadows) SMS3DS_LiteShadowDist2 = 1.0f;
+	if (plus & kLpParticles) SMS3DS_LiteParticles = 4;
+	if (plus & kLpActors) SMS3DS_LiteActorFar = 2500.0f;
+	if (plus & kLpFar) SMS3DS_LiteFar = 3000.0f;
+	if (plus & kLpHud) s_trade |= kTrHud;
 }
 }  // namespace
 int SMS3DS_ProfSkip(const void* vtable, const char* name) {
@@ -2032,6 +2100,8 @@ void SMS3DS_ProfFrame(void) {
 			s_winStart = s_phaseLast = now;
 			s_phase = 0;
 			s_skipFired = 0;
+			s_gameWait0 = GX3DS_GameWaitTicks();
+			s_gameIdle0 = port_idle_seconds();
 			s_gpu0 = pica_gpu_ms_sum();
 			GX3DS_ThreadTicks(s_thread0);
 			uint32_t rs0[2];
@@ -2065,6 +2135,9 @@ void SMS3DS_ProfFrame(void) {
 			s_gameGpu[k] = (pica_gpu_ms_sum() - s_gpu0) / kFrames;
 			s_gameHog[k] = hogRate();
 			s_gameSkips[k] = double(s_skipFired) / kFrames;
+			s_gameWaitMs[k] = double(GX3DS_GameWaitTicks() - s_gameWait0) / kFrames / kTicksPerMs;
+			s_gameIdleMs[k] = (port_idle_seconds() - s_gameIdle0) * 1000.0 / kFrames;
+			s_gameOwn[k] = s_gameFrame[k] - s_gameWaitMs[k] - s_gameIdleMs[k];
 			uint64_t th[2];
 			GX3DS_ThreadTicks(th);
 			s_gameGx[k] = double(th[0] - s_thread0[0]) / kFrames / kTicksPerMs;
@@ -2273,12 +2346,28 @@ extern "C" void SMS3DS_ProfGpuSteps(void) {
 // distance (game units; 0 or less: the defaults, 4000 and 2000).
 extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist) {
 	if (drawDist > 0) s_liteFar = float(drawDist);
-	if (shadowDist > 0) s_liteShadowDist = float(shadowDist);
+	if (shadowDist >= 0) s_liteShadowDist = float(shadowDist);
 	s_liteOn = on != 0;
 	liteApply(s_liteOn);
 	if (s_liteOn)
-		fprintf(stderr, "[3ds] lite: on (shadows only within %.0f besides Mario's and Yoshi's, half the particles, nothing "
-		        "drawn wholly past %.0f, no mirror)\n", double(s_liteShadowDist), double(s_liteFar));
+		fprintf(stderr, "[3ds] lite: on (shadows only within %.0f besides Mario's and Yoshi's, one particle in %d, nothing "
+		        "drawn wholly past %.0f, no mirror, NPCs and objects clipped past %.0f (0: the game's), the sea's grid every "
+		        "%d, the Shine's shadow %s)\n", double(s_liteShadowDist), s_liteParticles, double(s_liteFar),
+		        double(s_liteActorFar), s_liteSeaStep, s_liteShine ? "drawn" : "not drawn");
+}
+// settings.txt's further lite keys (main.cpp), before SMS3DS_SetLite: lite_particles (one in N),
+// lite_sea_step, lite_actor_distance, lite_shine_shadow (off); a negative value keeps the default.
+extern "C" void SMS3DS_SetLiteParts(int particles, int seaStep, int actorDist, int shineOff) {
+	if (particles >= 0) s_liteParticles = particles;
+	if (seaStep >= 0) s_liteSeaStep = seaStep;
+	if (actorDist >= 0) s_liteActorFar = float(actorDist);
+	if (shineOff >= 0) s_liteShine = !shineOff;
+}
+// autorun.txt profile_steps = liteplus (main.cpp): more trims on top of lite (kLitePlusSteps).
+extern "C" void SMS3DS_ProfLitePlusSteps(void) {
+	s_steps = kLitePlusSteps;
+	s_stepN = kLitePlusN;
+	s_stepVerify = kLitePlusN - 1;
 }
 // autorun.txt profile_steps = lite (main.cpp): the lite setting off and on in turn (kLiteSteps).
 extern "C" void SMS3DS_ProfLiteSteps(void) {

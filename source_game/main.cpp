@@ -76,7 +76,8 @@ int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // bottom screen not redrawn) and profile_steps (gpu: the profile run's windows are the GPU's
 // ceilings; reverts: parts of this build put back as before, one window each; cache: the frame's
 // cache work three ways; fixed: the GPU's fixed work by part; trades: quality trade-offs' ceilings;
-// lite: the lite setting off and on in turn). It may also give lite (on), as settings.txt does.
+// lite: the lite setting off and on in turn; liteplus: more trims on top of it). It may also give
+// lite (on), as settings.txt does.
 static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
 static bool s_statusDraw = true;  // autorun.txt status_screen = off: the bottom screen not redrawn
 extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
@@ -454,6 +455,8 @@ extern "C" void SMS3DS_ProfFixedSteps(void);    // ... profile_steps = fixed
 extern "C" void SMS3DS_ProfTradeSteps(void);    // ... profile_steps = trades
 extern "C" void SMS3DS_ProfLiteSteps(void);     // ... profile_steps = lite
 extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist);  // prof_3ds.cpp: settings.txt lite
+extern "C" void SMS3DS_SetLiteParts(int particles, int seaStep, int actorDist, int shineOff);
+extern "C" void SMS3DS_ProfLitePlusSteps(void);  // ... profile_steps = liteplus
 extern "C" void GX3DS_SetGxPoll(int on);        // gx3ds_backend.cpp: settings.txt gx_poll
 extern "C" void GX3DS_SetPerfTimers(int on);  // gx3ds_backend.cpp: the [perf] breakdown by phase timed
 extern "C" void GX3DS_SetDrawStateCheck(int on);  // ... draws taking the last draw's setup checked
@@ -632,12 +635,23 @@ static void* game_thread(void*)
 		if (setting_value(kSettingsPath, "perf_timers", v, sizeof v)) GX3DS_SetPerfTimers(strcmp(v, "on") == 0);
 		if (setting_value(kSettingsPath, "gx_poll", v, sizeof v)) GX3DS_SetGxPoll(strcmp(v, "off") != 0);
 		// lite = on: console-only quality trades for frame rate (prof_3ds.cpp, SMS3DS_SetLite): shadows near
-		// the camera only (lite_shadow_distance, default 2000), half the particles, nothing drawn past
-		// lite_draw_distance (default 4000), no mirror. autorun.txt's lite before settings.txt's.
+		// the camera only (lite_shadow_distance, default 2000; 0: Mario's and Yoshi's only), one particle
+		// in lite_particles (default 2),
+		// nothing drawn past lite_draw_distance (default 4000), no mirror; and if given, NPCs and objects
+		// clipped past lite_actor_distance, the sea's grid every lite_sea_step, lite_shine_shadow = off.
+		// lite = plus: all of those, as measured on a New 3DS in Delfino Plaza (36 -> ~33 ms a frame on
+		// top of lite): Mario's and Yoshi's shadows only, one particle in 4, nothing drawn past 3000,
+		// NPCs and objects clipped past 2500, the sea's grid every 2, the Shine's shadow not drawn. Each
+		// lite_* key still overrides. autorun.txt's lite before settings.txt's.
 		if (setting_value(SMS_DIR "/autorun.txt", "lite", v, sizeof v) || setting_value(kSettingsPath, "lite", v, sizeof v)) {
-			const bool on = strcmp(v, "on") == 0;
-			const int dd = setting_value(kSettingsPath, "lite_draw_distance", v, sizeof v) ? atoi(v) : 0;
-			const int sd = setting_value(kSettingsPath, "lite_shadow_distance", v, sizeof v) ? atoi(v) : 0;
+			const bool plus = strcmp(v, "plus") == 0, on = plus || strcmp(v, "on") == 0;
+			const int dd = setting_value(kSettingsPath, "lite_draw_distance", v, sizeof v) ? atoi(v) : plus ? 3000 : 0;
+			const int sd = setting_value(kSettingsPath, "lite_shadow_distance", v, sizeof v) ? atoi(v) : plus ? 0 : -1;
+			const int pn = setting_value(kSettingsPath, "lite_particles", v, sizeof v) ? atoi(v) : plus ? 4 : -1;
+			const int ss = setting_value(kSettingsPath, "lite_sea_step", v, sizeof v) ? atoi(v) : plus ? 2 : -1;
+			const int ad = setting_value(kSettingsPath, "lite_actor_distance", v, sizeof v) ? atoi(v) : plus ? 2500 : -1;
+			const int so = setting_value(kSettingsPath, "lite_shine_shadow", v, sizeof v) ? strcmp(v, "off") == 0 : plus ? 1 : -1;
+			SMS3DS_SetLiteParts(pn, ss, ad, so);
 			SMS3DS_SetLite(on, dd, sd);
 		}
 		if (setting_value(kSettingsPath, "draw_state_check", v, sizeof v)) {
@@ -676,6 +690,7 @@ static void* game_thread(void*)
 			if (strcmp(v, "fixed") == 0) SMS3DS_ProfFixedSteps();
 			if (strcmp(v, "trades") == 0) SMS3DS_ProfTradeSteps();
 			if (strcmp(v, "lite") == 0) SMS3DS_ProfLiteSteps();
+			if (strcmp(v, "liteplus") == 0) SMS3DS_ProfLitePlusSteps();
 		}
 		if (setting_value(kAutoPath, "profile_auto_quit", v, sizeof v)) s_profAutoQuit = strcmp(v, "on") == 0;
 		if (SMS3DS_DemoStage >= 0 || s_profAuto > 0 || s_quitAfter > 0)

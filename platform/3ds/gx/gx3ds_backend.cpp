@@ -5696,6 +5696,13 @@ void GX3DS_SetPerfTimers(int on) { gx::s_perfTimers = on != 0; }  // settings.tx
 void GX3DS_SetGxPoll(int on) { gx::s_gxPoll = on != 0; }  // settings.txt gx_poll
 void GX3DS_SetGamePoll(int on) { gx::s_gamePoll = on != 0; }
 void GX3DS_SetSkipColourCopies(int on) { gx::s_skipColourCopies = on != 0; }
+// The game thread's waits for the GX thread so far (ticks): a free chunk, the frame's end, a drain,
+// a list rewrite (the profiler's game-thread work without phase timers).
+uint64_t GX3DS_GameWaitTicks(void) {
+	uint64_t t = 0;
+	for (int i = 0; i < 4; i++) t += gx::s_sWait[i].load(std::memory_order_relaxed);
+	return t;
+}
 int GX3DS_GxPoll(void) { return gx::s_gxPoll; }
 void GX3DS_SetDrawStateCheck(int on) {  // settings.txt draw_state_check
 	gx::s_fpCheck = on != 0;

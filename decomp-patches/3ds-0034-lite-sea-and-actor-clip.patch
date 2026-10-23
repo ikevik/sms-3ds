@@ -1,0 +1,107 @@
+--- a/src/MoveBG/MapObjWave.cpp
++++ b/src/MoveBG/MapObjWave.cpp
+@@ -31,6 +31,9 @@
+ // against the original's values (SMS3DS_WaveChecked vertices, SMS3DS_WaveDiffs differing).
+ extern "C" int SMS3DS_WaveMode;
+ extern "C" unsigned long SMS3DS_WaveChecked, SMS3DS_WaveDiffs;
++// 3DS port (decomp patch 3ds-0034, settings.txt lite_sea_step): the sea drawn with every
++// SMS3DS_LiteSeaStep-th column and row of its grid (2 or more; else all), its edges kept.
++extern "C" int SMS3DS_LiteSeaStep;
+ #include <string.h>
+ #endif
+ 
+@@ -190,6 +193,41 @@
+ 			colT0[n] = getMoveTexPos0(x0);
+ 			colT1[n] = 0.8f * getStaticTexPos1(x0);
+ 			n++;
++		}
++		if (n > 0 && SMS3DS_LiteSeaStep > 1) {
++			const int st = SMS3DS_LiteSeaStep;
++			int cols[kMaxCols + 1], nc = 0;
++			for (int i = 0; i < n; i += st) cols[nc++] = i;
++			if (cols[nc - 1] != n - 1) cols[nc++] = n - 1;
++			f32 rowZ[kMaxCols + 1];
++			int nr = 0;
++			for (f32 z = -mHalfSize; z <= mHalfSize - mGridSize && nr < kMaxCols; z += mGridSize) rowZ[nr++] = z;
++			if (nr == 0) return;
++			rowZ[nr] = rowZ[nr - 1] + mGridSize;  // (the last row's far edge)
++			for (int r = 0; r < nr; r += st) {
++				const int r1    = r + st < nr ? r + st : nr;
++				const f32 z     = rowZ[r], zEnd = rowZ[r1];
++				const f32 z0    = z + SMS_GetMarioZ();
++				const f32 z1    = zEnd + SMS_GetMarioZ();
++				const f32 hz0   = flat ? 0.0f : mWaveHeightZ * sinf(mWaveFreqZ * (z0 * (1.0f / 6.28318f)) + mWavePhaseZ);
++				const f32 hz1   = flat ? 0.0f : mWaveHeightZ * sinf(mWaveFreqZ * (z1 * (1.0f / 6.28318f)) + mWavePhaseZ);
++				const f32 s0 = getStaticTexPos0(z0), s1 = getStaticTexPos0(z1);
++				const f32 m0 = getMoveTexPos1(z0), m1 = getMoveTexPos1(z1);
++				GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT0, nc * 2);
++				for (int k = 0; k < nc; k++) {
++					const int i = cols[k];
++					GXPosition3f32(colX0[i], flat ? 0.0f : colH[i] + hz0, z0);
++					GXColor4u8(sColor.r, sColor.g, sColor.b, getAlpha(colX[i], z));
++					GXTexCoord2f32(colT0[i], s0);
++					GXTexCoord2f32(colT1[i], m0);
++					GXPosition3f32(colX0[i], flat ? 0.0f : colH[i] + hz1, z1);
++					GXColor4u8(sColor.r, sColor.g, sColor.b, getAlpha(colX[i], zEnd));
++					GXTexCoord2f32(colT0[i], s1);
++					GXTexCoord2f32(colT1[i], m1);
++				}
++				GXEnd();
++			}
++			return;
+ 		}
+ 		if (n >= 0) {
+ 			const bool check = SMS3DS_WaveMode == 2;
+--- a/src/MoveBG/MapObjManager.cpp
++++ b/src/MoveBG/MapObjManager.cpp
+@@ -1,5 +1,8 @@
+ #include <MoveBG/MapObjManager.hpp>
+ #include "sms3ds_zone.h"  // 3DS port: decomp patch 3ds-0028 (profile-run timers)
++#if defined(__3DS__)
++f32 SMS3DS_LiteClipFar(f32 far);  // Strategic/livemanager.cpp (decomp patch 3ds-0034)
++#endif
+ #include <MoveBG/MapObjBase.hpp>
+ #include <MoveBG/Item.hpp>
+ #include <MoveBG/MapObjBall.hpp>
+@@ -529,7 +532,11 @@
+ {
+ 	SMS3DS_ZONE(46);
+ 	if (!(unk30 & 2))
++#if defined(__3DS__)
++		clipActorsAux(param_1, SMS3DS_LiteClipFar(unk38), unk3C);
++#else
+ 		clipActorsAux(param_1, unk38, unk3C);
++#endif
+ }
+ 
+ void TMapObjBaseManager::createModelData()
+--- a/src/Strategic/livemanager.cpp
++++ b/src/Strategic/livemanager.cpp
+@@ -9,6 +9,15 @@
+ #include <MarioUtil/LightUtil.hpp>
+ #include <Camera/CubeManagerBase.hpp>
+ #include <sms_modhook.h>
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0034, settings.txt lite_actor_distance): the NPCs' and map objects'
++// clip distance capped (0: the game's), so farther ones are clipped out (not animated or drawn).
++extern "C" f32 SMS3DS_LiteActorFar;
++f32 SMS3DS_LiteClipFar(f32 far)
++{
++	return SMS3DS_LiteActorFar > 0.0f && far > SMS3DS_LiteActorFar ? SMS3DS_LiteActorFar : far;
++}
++#endif
+ 
+ TLiveManager::TLiveManager(const char* name)
+     : TObjManager(name)
+@@ -70,7 +79,11 @@
+ 
+ void TLiveManager::clipActors(JDrama::TGraphics* param_1)
+ {
++#if defined(__3DS__)
++	clipActorsAux(param_1, SMS3DS_LiteClipFar(4000.0f), 200.0f);
++#else
+ 	clipActorsAux(param_1, 4000.0f, 200.0f);
++#endif
+ }
+ 
+ void TLiveManager::setFlagOutOfCube()
