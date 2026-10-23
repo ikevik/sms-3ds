@@ -396,3 +396,81 @@ walks all 64 voice slots every subframe. It sounded the same, so 2 is the defaul
    delay and reverb effects (`DspMasterStatus`), undocumented.
 5. If ndsp's callback still matters: vendor ndsp and move its thread off core 0.
 6. The wave load's hitch: DVD reads off the emulated CPU (helps every load).
+
+## 8. JAudio off the game's core (`audio_thread = core2`)
+
+Written 2026-10-22. JAudio's audio thread is one of the emulated threads that take turns on the game's
+core (sms-pc-port's `os_thread.cpp`: one emulated CPU), so its work, about 5.5 ms a frame in Delfino Plaza
+at ~20 fps, comes out of the game thread's frame. The other cores are busy too: in the same run the GX
+thread (core 1) was busy 40.1 ms and the render thread (core 2) 37.1 ms of a 50.9 ms frame.
+
+### Options
+
+| Option | Saves on the game's core | Costs elsewhere | Risk |
+| --- | --- | --- | --- |
+| **(a) JAudio's blocks run by a thread on core 2** | the audio thread's ~5.5 ms (all of JAudio's sequencer and channel work, and this file's voice handling) | the same ~5.5 ms on core 2 (render thread's core, ~14 ms idle a frame at 20 fps); the game's sound code briefly waits when it meets a turn | the game's sound code and JAudio must stay apart as on the GameCube: below |
+| (b) JAudio cheaper, bit for bit | maybe 10-25 % of it (estimate): no hot spot (section 6's profile: ~780,000 calls a second across the sequencer, oscillators and voice updates); a unity build or LTO of JASystem would inline its many small functions | none | low, but each change must be shown exact, with no host harness for JAudio |
+| (c) The voices' decoding (ndsp's thread, 1.2-1.5 ms) to core 2 as well | that | the same on core 2 | low (the consumer's ndsp calls take channel locks); a follow-up to (a) |
+
+Chosen: (a), behind `settings.txt audio_thread = core2` (default `game`, as before).
+
+### How it stays correct
+
+On the GameCube the audio thread ran above the game thread on the one CPU, woken by the AI DMA interrupt
+and by each DSP subframe: it could preempt the game anywhere interrupts were enabled, and the game's sound
+code (JAI, JALibrary, MSound) disabled interrupts where it shared state with it. So every legal schedule
+is one where each of the audio thread's steps (an AI block's `Kernel::updateDac`, each DSP subframe's
+`DSPBuf::updateDSP` or `finishDSPFrame`) happens whole, between two of the game's instructions with
+interrupts enabled.
+
+- **The steps run on core 2** (`driver_main`, above the render thread): for each AI block the 3DS DSP
+  asks for, `port_ai_block` starts the block JAudio made last time, `Kernel::updateDac` runs, then the
+  subframes the DSP's replies would have triggered (`getDSPSyncCount`), as `JASAudioThread.cpp`'s
+  `audioproc` does with its messages. JAudio's own audio thread sits idle.
+- **One lock stands in for the preemption.** Each step holds it. The game's side holds it while it runs
+  sound code: `scripts/build_game_lib.sh` compiles JAInterface, JALibrary, MSound and JAudio's DVD thread
+  with `-finstrument-functions`, their hooks renamed `__audio_lock_enter/_exit` (outermost call takes
+  it, per host thread). The game's side lets it go when its thread switches or the emulated CPU idles
+  (`port_os_switch_hook`, `port_os_idle_hook`; `port_os_resume_hook` takes it back), and at interrupt
+  check points with interrupts on, outside interrupt handlers, when a step waits
+  (`port_audio_checkpoint`). Those are the places a GameCube's audio thread could have run; holding the
+  lock elsewhere only picks one of the GameCube's schedules.
+- **The step's thread is off the emulated CPU** (patch 0043): the emulated OS's interrupt calls do
+  nothing there and deliver nothing, and the DSP does not reply (the driver runs the subframes itself).
+  Audited: in a block, JAudio calls nothing else of the emulated OS (no allocation after start-up, no
+  message queues) except the stream player and THP's mix callback.
+- **Movies with sound and streams go back to JAudio's audio thread.** THP's mix callback (called from
+  `vframeWork`) and the stream player's subframe callback (`JAIGFrameStream`, which reads the disc from
+  inside a subframe) use the emulated OS. `--wrap`s on `Kernel::registerMixCallback` and
+  `registerSubframeCallback` see them come. A stream sends the blocks to the audio thread (ai.cpp's
+  `ai_poll`, as before) while its callback is registered. THP's callback stays registered for as long
+  as the player is set up, but mixes only while a movie with sound plays (`open`, `internalState` 2,
+  `audioExist`); JAudio is given `thp_mix` in its place, and the blocks go to the audio thread only
+  while those three hold. On a turn `thp_mix` returns NULL, as THP's callback does when it has nothing
+  to mix. A movie's sound that starts during a turn's block is left out of that one block (about 5 ms
+  later than on the GameCube; counted in the `[audio]` line); the next block is the audio thread's. The
+  blocks come back to core 2 when neither holds and the audio thread is idle.
+
+What the lock does not cover: game code outside the sound modules that reads JAudio's objects through
+inline header functions (`JAISound::getID`, `getStatus`, ... in a handful of map objects and enemies), and
+the ARM11's weaker memory ordering for those unprotected reads. They read single fields the steps rarely
+write; the GameCube gave the same reads the same values or one step older.
+
+### To measure
+
+`log-audio3-core2.txt` and `log-audio3-game.txt`: the same build, `audio_thread = core2` and `game`,
+each with the standard profile run in Plaza facing the buildings (scorecard, game thread's phases) and
+the `[audio]` lines, which now include `JAudio on core 2: ... ms/frame`, the waits on each side, and the
+game's sound-code calls a frame (the lock hooks' count, which costs a little in both modes).
+
+### Results
+
+Run 1 (build 2026-10-22 18:56, `log-audio-core.txt` and `log-audio-game.txt`): the blocks ran on core 2
+through the boot and the opening, but once in Plaza they stayed with the audio thread. Plaza plays a
+movie with no sound (`[thp] state=2 internal=2`, no audio frames) and THP keeps its mix callback
+registered all the while, and that build sent the blocks to the audio thread whenever a mix callback was
+registered. The two scorecards matched (frame 52.5 against 53.4 ms, game thread 50.3 against 50.8 ms:
+the same path in both, within noise), and JAudio cost 5.2-6.1 ms a frame on the game's core in each. The
+game's sound code made about 3,000 calls a frame through the lock hooks. Fixed by `thp_mix` (above);
+the `[audio]` line now says why the blocks are with the audio thread (`for a movie's sound`, `for a
+stream`).

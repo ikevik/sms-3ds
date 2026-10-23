@@ -45,6 +45,23 @@ int port_audio_out_open(void);
 int port_audio_out_queued(void);
 void port_audio_out_write(const s16* lr, u32 frames);
 void port_os_switch_hook(void* from, void* to);
+// JAudio's turns on core 2 (settings.txt audio_thread = core2; sms-pc-port patch 0043, Makefile wraps,
+// scripts/build_game_lib.sh's lock hooks).
+void SMS3DS_AudioSetThread(int core2);
+void port_os_set_off_cpu(int on);
+void port_os_resume_hook(void);
+void port_audio_checkpoint(void);
+int port_audio_parallel_owns(int idle);
+void port_os_idle_hook(int idle);
+void port_ai_block(void);
+int port_ai_running(void);
+void __audio_lock_enter(void* fn, void* site);
+void __audio_lock_exit(void* fn, void* site);
+extern volatile int port_audio_turn_waiting;  // os_thread.cpp looks at it at interrupt check points
+int __real__ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_(s32 (*cb)(void*), void* data);
+int __wrap__ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_(s32 (*cb)(void*), void* data);
+void __real__ZN8JASystem6Kernel19registerMixCallbackEPFPslEh(s16* (*cb)(s32), u8 mode);
+void __wrap__ZN8JASystem6Kernel19registerMixCallbackEPFPslEh(s16* (*cb)(s32), u8 mode);
 // MSound::mainLoop, the game thread's sound work once a frame (-Wl,--wrap in the Makefile).
 void __real__ZN6MSound8mainLoopEv(void* self);
 void __wrap__ZN6MSound8mainLoopEv(void* self);
@@ -64,9 +81,24 @@ namespace JASystem {
 namespace AudioThread {
 extern u8 jac_audioThread[];  // the audio thread's OSThread (JASAudioThread.cpp)
 }
+namespace AudioThread {
+u32 getDSPSyncCount();             // subframes of the DSP frame still to come (JASAudioThread.cpp)
+void setDSPSyncCount(u32 count);
+}
 namespace Driver {
 void setUpdateInterval(u8 interval);  // JASDriverIF.cpp: subframes between a voice's updates
 }
+namespace Kernel {
+void updateDac();                                  // JASAiCtrl.cpp: an AI block's work
+int checkCallback(s32 (*cb)(void*), void* data);   // JASCallback.cpp: still registered (its index)
+}
+namespace DSPBuf {
+void updateDSP();       // JASDSPBuf.cpp: one subframe (sequencer, channels, the DSP's halt released)
+void finishDSPFrame();  // ... a DSP frame's end, and the next's start if a buffer is free
+}
+struct TTrack {
+	static s32 rootCallback(void* track);  // JASTrack.cpp: a root track's subframe (the sequencer)
+};
 }
 
 namespace {
@@ -246,11 +278,32 @@ u32 s_subframes, s_voiceSum, s_voiceMax, s_mixerSum, s_unheardSum, s_starts, s_o
 u32 s_silentDspSum, s_silentMixerSum, s_silentUnheardSum, s_mixerSeSum;  // per subframe: at zero volume; auto-mixer
 u32 s_quietSum, s_dspStarts, s_steals, s_stealsHeard, s_toQuiet, s_unplaced;  // followed without a channel; channel starts
 
+// JAudio's turns on core 2 (their code and comment: further down, before the benchmark).
+enum { kSerial, kDriver };
+bool s_parallel;                    // audio_thread = core2, and the thread runs
+volatile int s_blocksBy = kSerial;  // who runs the AI blocks now
+s16* (*volatile s_thpMix)(s32);     // THP's mix callback (JAudio is given thp_mix in its place)
+s32 (*volatile s_foreignCb)(void*); // the last subframe callback not the sequencer's (a stream)
+void* volatile s_foreignData;
+s32 (*volatile s_pendingCb)(void*); // ... registered while the turns ran: the driver registers it at
+void* volatile s_pendingData;       // its next block and hands the blocks to the audio thread
+LightLock s_alock;                  // the audio lock
+__thread int t_lockDepth;           // this host thread's depth in the game's sound code
+__thread bool t_turn;               // this is the turn's thread
+Thread s_driver;
+LightEvent s_blockDue;
+volatile bool s_driverRun;
+volatile u32 s_turnTicks, s_turnWaitTicks, s_emuWaitTicks, s_turnBlocks, s_serialBlocks, s_handoffs;
+volatile u32 s_thpLate;             // turns' blocks a movie's sound started in (left silent)
+u32 s_hookCalls;                    // the game's side: calls into its sound code (the lock hooks)
+const char* serial_reason();
+
 struct Report {
 	u32 sub, thread, render, mixer, mainLoop, cb, decode, flush, flushCalls, regionFlushes, seq, chan;
 	u32 frames, dspFrames, refills, dry, waits, skips, holds;
 	u32 sinkDry, sinkFull, dropped, starts, overflow, gameFrames;
 	u32 dspStarts, steals, stealsHeard, toQuiet, unplaced, exactSeeks, approxSeeks;
+	u32 turn, turnWait, emuWait, turnBlocks, serialBlocks, handoffs, hookCalls, thpLate;
 	u64 voiceSum, mixerSum, unheardSum, silentDsp, silentMixer, silentUnheard, mixerSe, quiet;
 };
 Report s_last;
@@ -607,7 +660,12 @@ void ndsp_frame(void*)
 	s_dspFrames++;
 	if (s_sinkStarted) {
 		const int q = port_audio_out_queued();
-		if (q < kSinkTarget) port_irq_kick();  // ai.cpp starts the next block
+		if (q < kSinkTarget) {
+			if (s_blocksBy == kDriver)
+				LightEvent_Signal(&s_blockDue);  // JAudio's next block, on core 2
+			else
+				port_irq_kick();  // ai.cpp starts the next block
+		}
 		if (!q) s_sinkDry++;
 	}
 	pace();
@@ -890,6 +948,14 @@ void report(bool cycleEnd)
 	now.quiet = s_quietSum;
 	now.dspStarts = s_dspStarts;
 	now.steals = s_steals;
+	now.turn = s_turnTicks;
+	now.turnWait = s_turnWaitTicks;
+	now.emuWait = s_emuWaitTicks;
+	now.turnBlocks = s_turnBlocks;
+	now.serialBlocks = s_serialBlocks;
+	now.handoffs = s_handoffs;
+	now.thpLate = s_thpLate;
+	now.hookCalls = s_hookCalls;
 	now.stealsHeard = s_stealsHeard;
 	now.toQuiet = s_toQuiet;
 	now.unplaced = s_unplaced;
@@ -916,12 +982,14 @@ void report(bool cycleEnd)
 	if (sub && frames) {
 		const double perFrame = 1.0 / (frames * kTicksPerMs);
 		const double secs = sub * 80 / 32028.5;
-		const double thread = (now.thread - a.thread) * perFrame, render = (now.render - a.render) * perFrame;
+		// JAudio's work wherever it ran: its audio thread on the game's core, and the turns on core 2.
+		const double thread = ((now.thread - a.thread) + (now.turn - a.turn)) * perFrame;
+		const double render = (now.render - a.render) * perFrame;
 		const double mixer = (now.mixer - a.mixer) * perFrame;
 		const double seq = (now.seq - a.seq) * perFrame, chan = (now.chan - a.chan) * perFrame;
 		const double jaudio = thread - render - mixer;
 		fprintf(stderr,
-		        "[audio] %.1f s %s, %lu game frames (%.1f/s): audio thread %.2f ms/frame (JAudio %.2f: sequencer %.2f, "
+		        "[audio] %.1f s %s, %lu game frames (%.1f/s): JAudio's blocks %.2f ms/frame (JAudio %.2f: sequencer %.2f, "
 		        "channel updates %.2f, the rest %.2f; voices to the DSP %.2f, software mixer %.2f), game thread's "
 		        "MSound::mainLoop %.2f ms/frame, ndsp thread's frame callback %.2f ms/frame (decoding %.2f, writing "
 		        "back %.2f in %lu calls, %lu of them all the buffers at once)%s\n",
@@ -954,9 +1022,137 @@ void report(bool cycleEnd)
 		        (unsigned long)(now.holds - a.holds), (unsigned long)(now.sinkDry - a.sinkDry),
 		        (unsigned long)(now.sinkFull - a.sinkFull), (unsigned long)(now.dspFrames - a.dspFrames),
 		        (unsigned long)(now.dropped - a.dropped));
+		fprintf(stderr, "[audio]   the game's sound code: %lu calls a frame (each passes the audio lock's hooks)\n",
+		        (unsigned long)((now.hookCalls - a.hookCalls) / frames));
+		if (s_parallel) {
+			const char* why = s_blocksBy == kDriver ? NULL : serial_reason();
+			fprintf(stderr,
+			        "[audio]   JAudio on core 2: %.2f ms/frame in %lu blocks (the turns waited %.2f ms/frame for the "
+			        "game's sound code), on the game's core %.2f; the game's sound code waited %.2f ms/frame for "
+			        "turns, let %lu wait no longer; %lu blocks for the audio thread (movies, streams), %lu a movie's "
+			        "sound started in on core 2; now %s%s%s\n",
+			        (now.turn - a.turn) * perFrame, (unsigned long)(now.turnBlocks - a.turnBlocks),
+			        (now.turnWait - a.turnWait) * perFrame, (now.thread - a.thread) * perFrame,
+			        (now.emuWait - a.emuWait) * perFrame, (unsigned long)(now.handoffs - a.handoffs),
+			        (unsigned long)(now.serialBlocks - a.serialBlocks), (unsigned long)(now.thpLate - a.thpLate),
+			        s_blocksBy == kDriver ? "on core 2" : "the audio thread's", why ? ", for " : "", why ? why : "");
+		}
 	}
 	s_voiceMax = 0;
 	s_last = now;
+}
+
+// --- JAudio's turns on core 2 (settings.txt audio_thread = core2) ---------------------------------
+//
+// On the GameCube, JAudio's audio thread ran on the one CPU above the game thread: woken by the AI
+// DMA interrupt and by each DSP subframe, it preempted the game wherever interrupts were enabled, and
+// the game's sound code (JAI, MSound) disabled interrupts where it shared state with it. Here a thread
+// on core 2 does the audio thread's work for each AI block (Kernel::updateDac, then the subframes as
+// the DSP's replies would have it), while the game runs on core 0. One lock stands in for that
+// preemption: the game's side holds it while it runs sound code (the lock hooks compiled into
+// JAInterface, JALibrary, MSound and JAudio's DVD thread, scripts/build_game_lib.sh), the turn holds
+// it for each step. The game's side lets it go where its thread switches, and at interrupt check
+// points while a turn waits: the places a GameCube's audio thread could have run. Every interleaving
+// is therefore one the GameCube allowed. On the turn's thread the emulated OS's interrupt calls do
+// nothing (patch 0043) and the DSP does not reply; it calls nothing else of the emulated OS.
+// Movies (THP's mix callback) and streams (a subframe callback other than the sequencer's) use the
+// emulated OS from inside a block: while one is registered the blocks go back to JAudio's own audio
+// thread, as before.
+void emu_lock()
+{
+	if (LightLock_TryLock(&s_alock) == 0) return;
+	const u32 t0 = ticks();
+	LightLock_Lock(&s_alock);
+	s_emuWaitTicks += ticks() - t0;
+}
+
+void turn_lock()
+{
+	port_audio_turn_waiting = 1;
+	__dmb();
+	const u32 t0 = ticks();
+	LightLock_Lock(&s_alock);
+	s_turnWaitTicks += ticks() - t0;
+	port_audio_turn_waiting = 0;
+}
+
+void turn_unlock() { LightLock_Unlock(&s_alock); }
+
+// THPPlayer.c's player; the fields its mix callback tests (the ARM build's offsets: open, internalState,
+// audioExist).
+extern "C" unsigned char ActivePlayer[];
+bool thp_would_mix()
+{
+	s32 open;
+	memcpy(&open, ActivePlayer + 0xA0, sizeof open);
+	return open && ActivePlayer[0xA5] == 2 && ActivePlayer[0xA7];
+}
+
+// Why a block must go to JAudio's own audio thread (NULL: it need not).
+const char* serial_reason()
+{
+	if (s_thpMix && thp_would_mix()) return "a movie's sound";
+	s32 (*cb)(void*) = s_foreignCb;
+	if (cb && JASystem::Kernel::checkCallback(cb, s_foreignData) >= 0) return "a stream";
+	return NULL;
+}
+
+bool serial_needed() { return serial_reason() != NULL; }
+
+// THP's mix callback as JAudio calls it (Kernel::vframeWork). It mixes only while a movie with sound
+// plays (and then runs the emulated OS), so the turns test for that before each block; a movie's sound
+// that starts inside a turn's block leaves that block without it, and the next block is the audio
+// thread's. Otherwise it returns NULL, as THP's callback does.
+s16* thp_mix(s32 samples)
+{
+	s16* (*cb)(s32) = s_thpMix;
+	if (!cb) return NULL;
+	if (!t_turn) return cb(samples);
+	if (thp_would_mix()) s_thpLate++;
+	return NULL;
+}
+
+void driver_main(void*)
+{
+	port_os_set_off_cpu(1);
+	t_turn = true;
+	while (s_driverRun) {
+		LightEvent_Wait(&s_blockDue);
+		while (s_driverRun && s_blocksBy == kDriver && port_audio_out_queued() < kSinkTarget) {
+			turn_lock();
+			const u32 t0 = ticks();
+			if (s_pendingCb) {
+				__real__ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_(s_pendingCb, s_pendingData);
+				s_pendingCb = NULL;
+			}
+			if (serial_needed()) {
+				s_blocksBy = kSerial;  // ai.cpp's ai_poll starts the next block, for the audio thread
+				turn_unlock();
+				port_irq_kick();
+				break;
+			}
+			port_ai_block();                // the block JAudio made last time starts playing
+			JASystem::Kernel::updateDac();  // the audio thread's message 0
+			s_turnTicks += ticks() - t0;
+			turn_unlock();
+			for (;;) {  // its message 1s: a DSP reply for each subframe the DSP was given
+				turn_lock();
+				const u32 t1 = ticks();
+				const u32 left = JASystem::AudioThread::getDSPSyncCount();
+				if (left) {
+					JASystem::AudioThread::setDSPSyncCount(left - 1);
+					if (left == 1)
+						JASystem::DSPBuf::finishDSPFrame();
+					else
+						JASystem::DSPBuf::updateDSP();
+				}
+				s_turnTicks += ticks() - t1;
+				turn_unlock();
+				if (!left) break;
+			}
+			s_turnBlocks++;
+		}
+	}
 }
 
 // --- a benchmark at start (game's core, nothing else running yet) ------------------------------
@@ -1306,6 +1502,12 @@ void SMS3DS_AudioSetUpdateInterval(int subframes)
 void SMS3DS_AudioExit(void)
 {
 	if (!s_ready) return;
+	if (s_driver) {
+		s_driverRun = false;
+		LightEvent_Signal(&s_blockDue);
+		threadJoin(s_driver, 200000000ull);  // at most 200 ms: it may wait for the lock
+		s_driver = NULL;
+	}
 	s_ready = false;
 	s_sinkOpen = false;
 	s_sinkStarted = false;
@@ -1469,6 +1671,8 @@ void port_os_switch_hook(void* from, void* to)
 {
 	if (s_mode == kOff) return;
 	void* audio = JASystem::AudioThread::jac_audioThread;
+	if (s_parallel && t_lockDepth) LightLock_Unlock(&s_alock);  // switched away inside sound code
+	if (s_parallel && to == audio) s_serialBlocks++;  // JAudio's audio thread runs a block (a movie, a stream)
 	if (to == audio) {
 		s_threadIn = ticks();
 	} else if (from == audio && s_threadIn) {
@@ -1500,4 +1704,124 @@ void __wrap__ZN8JASystem11TDSPChannel9updateAllEv(void)
 	const u32 t0 = ticks();
 	__real__ZN8JASystem11TDSPChannel9updateAllEv();
 	s_chanTicks += ticks() - t0;
+}
+
+// --- JAudio's turns on core 2: the entry points ------------------------------------------------
+
+volatile int port_audio_turn_waiting;
+
+// settings.txt audio_thread = core2, from the game thread after SMS3DS_AudioInit: JAudio's blocks are
+// run by a thread on core 2 (above the render thread there) instead of JAudio's audio thread.
+void SMS3DS_AudioSetThread(int core2)
+{
+	if (!core2) return;
+	if (!s_ready || (s_mode != kDsp && s_mode != kSoft)) {
+		fprintf(stderr, "[audio] audio_thread = core2 needs the 3DS DSP's output (audio = on or software): JAudio "
+		        "stays on the game's core\n");
+		return;
+	}
+	LightLock_Init(&s_alock);
+	LightEvent_Init(&s_blockDue, RESET_ONESHOT);
+	s32 prio = 0x30;
+	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+	prio = prio > 0x1A ? prio - 2 : 0x18;  // the render thread runs one step above the game thread
+	s_driverRun = true;
+	s_parallel = true;  // before the thread: the lock hooks are live from here on
+	s_driver = threadCreate(driver_main, NULL, 32u << 10, prio, 2, false);
+	if (!s_driver) {
+		s_parallel = false;
+		fprintf(stderr, "[audio] no thread on core 2: JAudio stays on the game's core\n");
+		return;
+	}
+	fprintf(stderr, "[audio] audio_thread = core2: JAudio's blocks run on core 2 (priority 0x%lx); the game's sound "
+	        "code takes the audio lock\n", (unsigned long)prio);
+}
+
+// The lock hooks in the game's sound code (scripts/build_game_lib.sh).
+void __audio_lock_enter(void*, void*)
+{
+	s_hookCalls++;
+	if (!s_parallel || t_turn) return;
+	if (t_lockDepth++ == 0) emu_lock();
+}
+
+void __audio_lock_exit(void*, void*)
+{
+	if (!s_parallel || t_turn || !t_lockDepth) return;
+	if (--t_lockDepth == 0) LightLock_Unlock(&s_alock);
+}
+
+// os_thread.cpp: the switched-in thread resumes; inside sound code it takes the lock back.
+void port_os_resume_hook(void)
+{
+	if (s_parallel && t_lockDepth) emu_lock();
+}
+
+// os_thread.cpp: an interrupt check point (interrupts on) while a turn waits for the lock.
+void port_audio_checkpoint(void)
+{
+	if (!s_parallel || t_turn || !t_lockDepth) return;
+	LightLock_Unlock(&s_alock);
+	const u32 t0 = ticks();
+	while (port_audio_turn_waiting && ticks() - t0 < (u32)(2 * kTicksPerMs)) {}  // until the turn has it
+	emu_lock();
+	s_handoffs++;
+}
+
+// ai.cpp's ai_poll, at each AI interrupt: 1 while the turns run the blocks. They take them over from
+// JAudio's audio thread when it is idle (between DSP frames) and no movie or stream needs it.
+int port_audio_parallel_owns(int idle)
+{
+	if (!s_parallel) return 0;
+	if (s_blocksBy == kDriver) return 1;
+	if (!idle || !port_ai_running() || serial_needed() || s_pendingCb) return 0;
+	s_blocksBy = kDriver;
+	LightEvent_Signal(&s_blockDue);
+	return 1;
+}
+
+// os_thread.cpp: the emulated CPU idles (every thread waits) and comes back; inside sound code the
+// lock is let go meanwhile.
+void port_os_idle_hook(int idle)
+{
+	if (!s_parallel || !t_lockDepth) return;
+	if (idle)
+		LightLock_Unlock(&s_alock);
+	else
+		emu_lock();
+}
+
+// A subframe callback other than the sequencer's (JAIGFrameStream's stream) runs the emulated OS from
+// inside a subframe: while the turns run, it waits for the next block's start, where the driver
+// registers it and gives the blocks to the audio thread.
+int __wrap__ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_(s32 (*cb)(void*), void* data)
+{
+	if (!s_parallel || cb == &JASystem::TTrack::rootCallback)
+		return __real__ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_(cb, data);
+	__audio_lock_enter(NULL, NULL);
+	int r = 0;
+	s_foreignCb = cb;
+	s_foreignData = data;
+	if (s_blocksBy == kDriver) {
+		s_pendingCb = cb;
+		s_pendingData = data;
+	} else {
+		r = __real__ZN8JASystem6Kernel24registerSubframeCallbackEPFlPvES1_(cb, data);
+	}
+	__audio_lock_exit(NULL, NULL);
+	return r;
+}
+
+// THP's mix callback goes through thp_mix: on the audio thread it is THP's, on a turn it stays out
+// (a movie's sound sends the blocks to the audio thread; see serial_reason).
+void __wrap__ZN8JASystem6Kernel19registerMixCallbackEPFPslEh(s16* (*cb)(s32), u8 mode)
+{
+	if (!s_parallel) {
+		__real__ZN8JASystem6Kernel19registerMixCallbackEPFPslEh(cb, mode);
+		return;
+	}
+	__audio_lock_enter(NULL, NULL);
+	s_thpMix = cb;
+	__real__ZN8JASystem6Kernel19registerMixCallbackEPFPslEh(cb ? &thp_mix : NULL, mode);
+	__audio_lock_exit(NULL, NULL);
 }

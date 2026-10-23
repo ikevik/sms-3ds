@@ -1,0 +1,177 @@
+--- a/platform/audio/ai.cpp
++++ b/platform/audio/ai.cpp
+@@ -46,6 +46,10 @@
+ extern "C" int port_audio_out_open(void) __attribute__((weak));
+ extern "C" int port_audio_out_queued(void) __attribute__((weak));
+ extern "C" void port_audio_out_write(const s16* lr, u32 frames) __attribute__((weak));
++// ... and while a thread on another core runs JAudio's blocks (audio_3ds.cpp), it starts them too
++// (port_ai_block): ai_poll leaves them alone. `idle`: JAudio's audio thread is between DSP frames,
++// so the blocks can go over to that thread.
++extern "C" int port_audio_parallel_owns(int idle) __attribute__((weak));
+ #endif
+ 
+ namespace {
+@@ -395,6 +399,13 @@
+ {
+ 	if (!g.running)
+ 		return;
++#if defined(__3DS__)
++	if (g.out3ds && port_audio_parallel_owns) {
++		const bool idle = !(port_audio_dsp_frame_pending && port_audio_dsp_frame_pending()) && !dac_thread_busy();
++		if (port_audio_parallel_owns(idle))
++			return;
++	}
++#endif
+ 	if (port_audio_dsp_frame_pending && port_audio_dsp_frame_pending()) {
+ 		port_irq_kick(); // the audio thread is mid-frame: retry at the next check point
+ 		return;
+@@ -486,6 +497,20 @@
+ 		port_irq_kick();
+ }
+ 
++#if defined(__3DS__)
++// The parallel JAudio thread (audio_3ds.cpp): one block starts, as dma_block, but in place of the
++// DMA callback (which would wake JAudio's audio thread) it runs JAudio's block itself afterwards.
++extern "C" void port_ai_block(void)
++{
++	AIDCallback cb = g.cb;
++	g.cb = NULL;
++	dma_block();
++	g.cb = cb;
++}
++// Whether the DMA runs (JAudio started it) and with the 3DS output.
++extern "C" int port_ai_running(void) { return g.running && g.out3ds; }
++#endif
++
+ extern "C" void AIInit(u8*)
+ {
+ 	if (g.inited)
+--- a/platform/audio/dsp_hle.cpp
++++ b/platform/audio/dsp_hle.cpp
+@@ -31,6 +31,8 @@
+ extern "C" void port_audio_hw_setup(void* voices, uint32_t nvoices, const uint32_t* adpcm_filter)
+     __attribute__((weak));
+ extern "C" int port_audio_hw_render(int16_t* outA, int16_t* outB, int n, uint16_t master) __attribute__((weak));
++// A JAudio turn on another core (audio_3ds.cpp) drives the subframes itself: no reply.
++extern "C" int port_os_off_cpu(void);
+ #endif
+ 
+ namespace {
+@@ -105,6 +107,10 @@
+ 		port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+ 	g.sub++;
+ 	g.subframesRendered++;
++#if defined(__3DS__)
++	if (port_os_off_cpu())
++		return;
++#endif
+ 	reply(0xFF00);
+ }
+ 
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -311,8 +311,18 @@
+ 
+ #if defined(__3DS__)
+ // 3DS port: told of every switch, with the CPU held (platform/3ds/audio_3ds.cpp times the audio
+-// thread's turns).
++// thread's turns), and of the switched-in thread resuming (the audio lock follows the CPU).
+ extern "C" void port_os_switch_hook(OSThread* from, OSThread* to) __attribute__((weak));
++extern "C" void port_os_resume_hook(void) __attribute__((weak));
++extern "C" void port_os_idle_hook(int idle) __attribute__((weak));  // ... and of it idling (1) and back (0)
++// 3DS port: a host thread off the emulated CPU that runs game code (audio_3ds.cpp's JAudio turns
++// on another core). It holds no CPU and is never an emulated thread: interrupts are not its to
++// mask or deliver, so the interrupt calls do nothing there.
++__thread int t_off_cpu;
++// ... and, set while such a turn waits for the audio lock, a check point where the CPU running
++// sound code with interrupts on (where a GameCube's audio thread could preempt it) lets it go.
++extern "C" volatile int port_audio_turn_waiting __attribute__((weak));
++extern "C" void port_audio_checkpoint(void) __attribute__((weak));
+ #endif
+ 
+ // Hand the CPU to `next` (already chosen). Returns once `self` owns the CPU
+@@ -453,6 +463,10 @@
+ 		}
+ 	}
+ 	g_irq_enabled = hs->irq_enabled;
++#if defined(__3DS__)
++	if (port_os_resume_hook)
++		port_os_resume_hook();
++#endif
+ }
+ 
+ // Wall time with no runnable game thread (the overlay's frame breakdown).
+@@ -489,7 +503,15 @@
+ 			ts.tv_sec++;
+ 			ts.tv_nsec -= 1000000000;
+ 		}
++#if defined(__3DS__)
++		if (port_os_idle_hook)
++			port_os_idle_hook(1);
++#endif
+ 		pthread_cond_timedwait(&g_idle_cv, &g_cpu, &ts);
++#if defined(__3DS__)
++		if (port_os_idle_hook)
++			port_os_idle_hook(0);
++#endif
+ 	}
+ 	if (idle_from != 0)
+ 		g_idle_seconds += mono_seconds() - idle_from;
+@@ -570,6 +592,11 @@
+ // ---------------------------------------------------------------------------
+ // Interrupt plumbing used by the other platform modules.
+ 
++#if defined(__3DS__)
++extern "C" void port_os_set_off_cpu(int on) { t_off_cpu = on; }
++extern "C" int port_os_off_cpu(void) { return t_off_cpu; }
++#endif
++
+ extern "C" void port_irq_kick(void)
+ {
+ 	g_irq_kicks.fetch_add(1);
+@@ -594,6 +621,12 @@
+ 
+ extern "C" void port_irq_check(void)
+ {
++#if defined(__3DS__)
++	if (t_off_cpu)
++		return;
++	if (&port_audio_turn_waiting && port_audio_turn_waiting && g_irq_enabled && !g_in_irq)
++		port_audio_checkpoint();  // not inside an interrupt handler: the audio thread could not preempt one
++#endif
+ 	if (!g_irq_enabled || g_in_irq)
+ 		return;
+ 	if (g_irq_kicks.load() == 0 && g_deferred.empty())
+@@ -680,6 +713,10 @@
+ 
+ extern "C" BOOL OSDisableInterrupts(void)
+ {
++#if defined(__3DS__)
++	if (t_off_cpu)
++		return FALSE;
++#endif
+ 	BOOL old      = g_irq_enabled;
+ 	g_irq_enabled = false;
+ 	return old;
+@@ -687,6 +724,10 @@
+ 
+ extern "C" BOOL OSEnableInterrupts(void)
+ {
++#if defined(__3DS__)
++	if (t_off_cpu)
++		return FALSE;
++#endif
+ 	BOOL old      = g_irq_enabled;
+ 	g_irq_enabled = true;
+ 	port_irq_check();
+@@ -695,6 +736,10 @@
+ 
+ extern "C" BOOL OSRestoreInterrupts(BOOL level)
+ {
++#if defined(__3DS__)
++	if (t_off_cpu)
++		return FALSE;
++#endif
+ 	BOOL old      = g_irq_enabled;
+ 	g_irq_enabled = level != 0;
+ 	if (level)
