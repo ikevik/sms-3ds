@@ -184,3 +184,17 @@ It also learned from:
 | [Azahar](https://github.com/azahar-emu/azahar) | The 3DS emulator every change is tested in first. |
 
 More prior art, and what was taken from each, is in `docs/PORTING.md`.
+
+## Licence
+
+The port's own code is under the MIT licence: see [`LICENSE`](LICENSE). The parts taken from other
+projects keep their own licences and notices:
+
+- `platform/3ds/gx/gx3ds_texdecode.cpp` and the shim headers in `platform/3ds/include/` come from
+  sms-pc-port and sms-switch (MIT, SoftwareAura LLC; `ext/sms-pc-port/LICENSE`);
+- `platform/3ds/pica/c3d_uniforms.c` stands in for citro3d's uniforms object (zlib licence);
+- the decompilation (`decomp/`) is CC0, and sms-pc-port (`ext/sms-pc-port/`) is MIT.
+
+None of it covers Super Mario Sunshine itself, which belongs to Nintendo: the port plays your own
+disc image, and nothing from the game is in this repository or its releases.
+

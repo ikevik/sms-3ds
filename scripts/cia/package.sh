@@ -29,6 +29,7 @@ cp scripts/cia/README.txt "$H/"
 # The game's binary carries sms-pc-port's and sms-switch's code (the same MIT licence and holder).
 mkdir -p "$H/LICENSES"
 cp ext/sms-pc-port/LICENSE "$H/LICENSES/sms-pc-port-and-sms-switch.txt"
+cp LICENSE "$H/LICENSES/sms3ds.txt"  # the port's own (MIT)
 
 K="$R/SMS-3DS-CIA-Builder"
 mkdir -p "$K/tools"

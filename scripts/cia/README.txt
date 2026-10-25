@@ -79,4 +79,5 @@ Learned from:
 - Dolphin (https://github.com/dolphin-emu/dolphin): how the GameCube's GPU behaves.
 - Azahar (https://github.com/azahar-emu/azahar): the emulator every change is tested in first.
 
-The licences of the code this release includes are in LICENSES.
+This port's own code is under the MIT licence (LICENSES/sms3ds.txt); the code it includes from
+other projects keeps theirs, also in LICENSES.
