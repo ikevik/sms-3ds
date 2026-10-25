@@ -1,5 +1,6 @@
 /* PICA200 draw path for the GX back end: see pica_draw.h. */
 #include "pica_draw.h"
+#include "pad_3ds.h" /* sms3ds_park */
 
 #include <3ds.h>
 #include <citro3d.h>
@@ -101,7 +102,22 @@ static int s_skipOff;
 /* pica_request_stop: quitting. Every entry point goes through pica_init, so nothing new reaches
  * the GPU after this, and what is in flight finishes before the screens are shut down. */
 static volatile int s_stopping;
-void pica_request_stop(void) { s_stopping = 1; }
+static u32 s_stopThread; /* the thread that asked (the main thread, quitting): it never parks */
+void pica_request_stop(void)
+{
+	svcGetThreadId(&s_stopThread, CUR_THREAD_HANDLE);
+	__dmb();
+	s_stopping = 1;
+}
+/* In the GPU waits' loops: once the app is quitting, the thread waiting (the render thread) parks
+ * rather than poll on, the GPU's completions gone with gfxExit (pad_3ds.h, sms3ds_park). */
+static void park_if_stopping(void)
+{
+	if (!s_stopping) return;
+	u32 id = 0;
+	svcGetThreadId(&id, CUR_THREAD_HANDLE);
+	if (id != s_stopThread) sms3ds_park();
+}
 
 /* libctru's linear heap has no lock of its own: with the GX back end's render thread
  * (gx3ds_backend.cpp) the game thread (resident vertices) and the render thread (textures, frames)
@@ -1037,6 +1053,7 @@ static void ovl_wait_running(void)
 	const u64 w0 = svcGetSystemTick();
 	u64 since = w0;
 	while (!gxCmdQueueWait(s_ovRunning, 0)) {
+		park_if_stopping();
 		svcSleepThread(200000); /* 0.2 ms */
 		if (svcGetSystemTick() - since > SYSCLOCK_ARM11 / 2) {
 			fprintf(stderr, "[pica] GPU completion missing for 500 ms (%s): supplied it\n", pica_queue_state());
@@ -1249,6 +1266,7 @@ static int frame_begin_ex(u8 flags)
 			 * after that the missing completion is supplied: a hitch instead of a freeze. */
 			u64 since = w0;
 			while (!(ok = C3D_FrameBegin(flags | C3D_FRAME_NONBLOCK))) {
+				park_if_stopping();
 				svcSleepThread(200000); /* 0.2 ms */
 				if (s_queue && svcGetSystemTick() - since > SYSCLOCK_ARM11 / 2) {
 					fprintf(stderr, "[pica] GPU completion missing for 500 ms (%s): supplied it\n",
@@ -1332,6 +1350,7 @@ static void drain_parts(void)
 	if (!s_queue || s_splitAtWords == 0) return;
 	const u64 t0 = svcGetSystemTick();
 	while (!queue_idle()) {
+		park_if_stopping();
 		svcSleepThread(100000); /* 0.1 ms */
 		if (svcGetSystemTick() - t0 > SYSCLOCK_ARM11 / 4) break; /* 250 ms: the stall report says why */
 	}

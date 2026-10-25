@@ -17,13 +17,26 @@
 #define TIMER_ABSTIME 1
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern volatile int sms3ds_ending;  /* pad_3ds.c: the app is ending (its threads park) */
+void sms3ds_park(void);             /* pad_3ds.c: the thread waits until the process ends */
+#ifdef __cplusplus
+}
+#endif
+
 /* port_host.h sleeps to an absolute deadline with clock_nanosleep (newlib has none).
- * Renamed through a macro so it can never clash with a declaration in the toolchain. */
+ * Renamed through a macro so it can never clash with a declaration in the toolchain.
+ * Its callers (the VI retrace timer, AI's host clock) wake up on their own: once the app is
+ * ending they park instead (sms3ds_park). */
 #define clock_nanosleep sms3ds_clock_nanosleep
 static inline int sms3ds_clock_nanosleep(int clock, int flags, const struct timespec* req, struct timespec* rem)
 {
 	struct timespec now, left = *req;
 	(void)rem;
+	if (sms3ds_ending)
+		sms3ds_park();
 	if (flags & TIMER_ABSTIME) {
 		if (clock_gettime((clockid_t)clock, &now) != 0)
 			return -1;
@@ -40,6 +53,8 @@ static inline int sms3ds_clock_nanosleep(int clock, int flags, const struct time
 		if (errno != EINTR)
 			return errno;
 	}
+	if (sms3ds_ending)
+		sms3ds_park();
 	return 0;
 }
 #endif

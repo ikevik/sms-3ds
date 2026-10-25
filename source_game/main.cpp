@@ -128,6 +128,9 @@ static u32 script_keys(const char* s)
 	return keys;
 }
 static bool s_statusDraw = true;  // autorun.txt status_screen = off: the bottom screen not redrawn
+// settings.txt (or autorun.txt) debug_input = on: the touch screen's, SELECT's and the launch holds'
+// debug and test modes (main). Off by default, so that a player's touch or held button changes nothing.
+static bool s_debugInput;
 extern "C" int SMS3DS_TimelineOn, SMS3DS_ProfOn;  // prof_3ds.cpp: the frame timeline (autorun.txt timeline)
 extern "C" void SMS3DS_TimelineReport(void);
 // autorun.txt game_thread_core (profiling in Azahar, whose debugger stub reads fresh registers only
@@ -487,8 +490,20 @@ static const char kDefaultSettings[] =
     "# timed.\n"
     "# perf_timers = off\n"
     "\n"
-    "# What touching the bottom right of the bottom screen low down runs: the game thread's steps\n"
-    "# (steps) or the game thread by object (objects). Higher up it starts the whole profile run.\n"
+    "# The port's debug and test controls (on): touching the screen (the top half shows the frame's\n"
+    "# copies on the top screen; the bottom half traces a frame, switches between the GPU and CPU\n"
+    "# vertex paths or starts a profile run), L + SELECT (cycles the colours) and buttons held at\n"
+    "# launch (test modes, named in the log). Off: the port's only controls are SELECT (R's press)\n"
+    "# and START + SELECT (quit).\n"
+    "debug_input = off\n"
+    "\n"
+    "# The R button as a soft press (soft: FLUDD sprays while Mario moves) or a hard one (hard: Mario\n"
+    "# stops to aim, as the GameCube's R pushed all the way). SELECT switches between them in play.\n"
+    "r_press = hard\n"
+    "\n"
+    "# What touching the bottom right of the bottom screen low down runs (debug_input = on): the game\n"
+    "# thread's steps (steps) or the game thread by object (objects). Higher up it starts the whole\n"
+    "# profile run.\n"
     "profile_low_touch = steps\n";
 
 // Small mipmapped textures with their mip levels (GX3DS_SetMips; settings.txt mipmaps).
@@ -941,10 +956,11 @@ static void draw_status(const uint32_t* s) {
 		GX3DS_TraceState(tst);
 		printf("\x1b[23;0Htrace: %-8s %d written (sms/trace-N.txt)  ", tst[0] ? "ARMED" : "idle", tst[1]);
 		static const char* const profState[] = {"idle: bottom right, low=game", "timing the CPU...", "GPU, pixels cut...", "GPU, object by object...", "game thread runs..."};
-		printf("\x1b[24;0Hprofile: %-28s", profState[SMS3DS_ProfState()]);
+		const int ps = SMS3DS_ProfState();
+		printf("\x1b[24;0Hprofile: %-28s", ps == 0 && !s_debugInput ? "idle" : profState[ps]);
 	}
-	printf("\x1b[22;0Htop shows: %s %d of %d  (touch top: next)\n", pica_view() ? "EFB copy" : "frame",
-	       pica_view(), pica_view_count());
+	printf("\x1b[22;0Htop shows: %s %d of %d%s\n", pica_view() ? "EFB copy" : "frame", pica_view(),
+	       pica_view_count(), s_debugInput ? "  (touch top: next)" : "");
 	printf("\x1b[20;0Htextures: %lu uploads, %lu KB\nEFB-copy texture draws: %lu   \n", (unsigned long)ts[0],
 	       (unsigned long)(ts[1] >> 10), (unsigned long)ts[2]);
 	float pf[11];
@@ -958,6 +974,7 @@ static void draw_status(const uint32_t* s) {
 	GX3DS_GetPathStats(ps2);
 	printf("transform: %s  gpu %lu cpu %lu   \n", GX3DS_GetGpuTransform() ? "GPU" : "CPU", (unsigned long)ps2[0],
 	       (unsigned long)ps2[1]);
+	printf("\x1b[28;0HR: %s press (SELECT switches)", pad3ds_soft_r ? "soft" : "hard");
 	// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 	// single-buffered, so writing back the CPU cache is enough.
 	gfxFlushBuffers();
@@ -1113,26 +1130,43 @@ int main()
 	fprintf(stderr, "[3ds] at quit: %s\n",
 	        __system_retAddr ? "the loader returns into this process (the heaps handed back first)"
 	                         : "the process ends (its heaps left to svcExitProcess)");
-	printf("log: %s\nSTART+SELECT = exit, SELECT = colours\ntouch: top=view  bottom: L=trace M=GPU R=pixel test\n", LOG_PATH);
+	{
+		char v[8];
+		s_debugInput = (setting_value(SMS_DIR "/autorun.txt", "debug_input", v, sizeof v) ||
+		                setting_value(SMS_DIR "/settings.txt", "debug_input", v, sizeof v)) &&
+		               strcmp(v, "on") == 0;
+	}
+	fprintf(stderr, "[3ds] debug input: %s (debug_input)\n",
+	        s_debugInput ? "on (the touch screen, L+SELECT, buttons held at launch)" : "off");
+	{
+		char v[8];
+		pad3ds_soft_r = setting_value(SMS_DIR "/settings.txt", "r_press", v, sizeof v) && strcmp(v, "soft") == 0;
+	}
+	fprintf(stderr, "[3ds] R: %s press (r_press; SELECT switches)\n", pad3ds_soft_r ? "soft" : "hard");
+	printf("log: %s\nSELECT: R soft/hard, START+SELECT: exit\n", LOG_PATH);
+	if (s_debugInput) printf("L+SELECT = colours\ntouch: top=view  bottom: L=trace M=GPU R=profile\n");
 
 	// Holding B at launch starts on the CPU vertex path (as the BR touch toggle), to tell a GPU
 	// lock-up in the GPU transform path from other hangs on hardware.
 	// The first HID reads after launch can come back empty: watch the buttons for half a second.
+	// The test modes below are debug_input's; without it a button held through launch only isn't
+	// taken as a press.
 	u32 launchHeld = 0;
 	for (int i = 0; i < 30; i++) {
 		hidScanInput();
 		launchHeld |= hidKeysHeld();
 		gspWaitForVBlank();
 	}
+	const u32 testHeld = s_debugInput ? launchHeld : 0;
 	// Holding Y at launch waits for the GPU after every draw and logs the one it never finishes.
-	if (launchHeld & KEY_Y) {
+	if (testHeld & KEY_Y) {
 		pica_set_gpu_check(1);
 		printf("Y held: GPU check after every draw (slow)\n");
 		fprintf(stderr, "[3ds] Y held at launch: GPU check after every draw\n");
 	}
 	// Holding X at launch logs each new TEV setup, unsupported TEV pattern and EFB copy kind, and
 	// writes the goop map readbacks to the SD card.
-	if (launchHeld & KEY_X) {
+	if (testHeld & KEY_X) {
 		GX3DS_SetVerboseLog(1);
 		pica_set_readback_dumps(1);
 		printf("X held: detailed renderer log\n");
@@ -1140,7 +1174,7 @@ int main()
 	}
 	// Holding R at launch sends frames to the GPU in parts as they are made (experimental: GSP
 	// stopped reporting GPU completions with it, at level loads).
-	if (launchHeld & KEY_R) {
+	if (testHeld & KEY_R) {
 		pica_set_split(1);
 		printf("R held: mid-frame GPU submission (experimental)\n");
 		fprintf(stderr, "[3ds] R held at launch: mid-frame GPU submission on\n");
@@ -1148,93 +1182,93 @@ int main()
 		fprintf(stderr, "[3ds] mid-frame GPU submission off (hold R at launch to try it)\n");
 	}
 	// Holding L at launch draws everything, off-screen map pieces included (to compare).
-	if (launchHeld & KEY_L) {
+	if (testHeld & KEY_L) {
 		GXPC_CullOff = 1;
 		printf("L held: off-screen culling off\n");
 		fprintf(stderr, "[3ds] L held at launch: off-screen culling off\n");
 	}
 	// Holding D-pad up at launch copies cached geometry into every frame again (resident
 	// vertices off, to compare).
-	if (launchHeld & KEY_DUP) {
+	if (testHeld & KEY_DUP) {
 		GX3DS_SetArena(0);
 		pica_set_big_ring(1);  // every vertex copied each frame
 		printf("Up held: resident vertices off\n");
 		fprintf(stderr, "[3ds] Up held at launch: cached geometry copied every frame (no resident vertices)\n");
 	}
 	// Holding D-pad left at launch draws on the game thread, as before the render thread (to compare).
-	if (launchHeld & KEY_DLEFT) {
+	if (testHeld & KEY_DLEFT) {
 		GX3DS_SetRenderThread(0);
 		printf("Left held: no render thread\n");
 		fprintf(stderr, "[3ds] Left held at launch: renderer on the game thread (no render thread)\n");
 	}
 	// Holding D-pad right at launch keeps GX command parsing on the game thread (no GX thread).
-	if (launchHeld & KEY_DRIGHT) {
+	if (testHeld & KEY_DRIGHT) {
 		GX3DS_SetGxThread(0);
 		printf("Right held: GX on the game thread\n");
 		fprintf(stderr, "[3ds] Right held at launch: GX thread off\n");
 	}
 	// Holding ZL at launch keeps every texture in FCRAM, as before VRAM textures (to compare).
-	if (launchHeld & KEY_ZL) {
+	if (testHeld & KEY_ZL) {
 		pica_set_vram_textures(0);
 		printf("ZL held: textures in FCRAM only\n");
 		fprintf(stderr, "[3ds] ZL held at launch: textures in FCRAM only (no VRAM textures)\n");
 	}
 	// Holding ZR at launch checks VRAM texture copies against their originals ([vram] lines).
-	if (launchHeld & KEY_ZR) {
+	if (testHeld & KEY_ZR) {
 		pica_set_vram_check(1);
 		printf("ZR held: VRAM copy self-check\n");
 		fprintf(stderr, "[3ds] ZR held at launch: VRAM texture copies checked against their originals\n");
 	}
 	// Holding START at launch sends every GPU setting again whenever a draw's state differs at
 	// all, as before unchanged settings were skipped piece by piece (to compare).
-	if (launchHeld & KEY_START) {
+	if (testHeld & KEY_START) {
 		pica_set_state_skip(0);
 		printf("START held: GPU settings sent in full\n");
 		fprintf(stderr, "[3ds] START held at launch: unchanged GPU settings sent again (no skipping)\n");
 	}
 	// Holding SELECT at launch sends every display-list call by address, as before copies of the
 	// lists the game rewrites: each rewrite waits for the GX thread instead (to compare).
-	if (launchHeld & KEY_SELECT) {
+	if (testHeld & KEY_SELECT) {
 		GX3DS_SetListCopies(0);
 		printf("SELECT held: display lists by address\n");
 		fprintf(stderr, "[3ds] SELECT held at launch: display-list copies off (rewrites wait for the GX thread)\n");
 	}
 	// Circle pad left at launch: every GX register write is sent, as before the write filter
 	// (gx_api.cpp, patch 0023) left out those that change nothing (to compare).
-	if (launchHeld & KEY_CPAD_LEFT) {
+	if (testHeld & KEY_CPAD_LEFT) {
 		GXPC_SetWriteFilter(0);
 		printf("Circle pad left: GX write filter off\n");
 		fprintf(stderr, "[3ds] circle pad left at launch: GX write filter off (every register write sent)\n");
 	}
 	// Circle pad down at launch: the write filter's check mode (patch 0026): every write is sent, and
 	// each one the filter would have left out is checked against the GX thread's register.
-	if (launchHeld & KEY_CPAD_DOWN) {
+	if (testHeld & KEY_CPAD_DOWN) {
 		GXPC_SetWriteFilter(2);
 		printf("Circle pad down: GX write filter check\n");
 		fprintf(stderr, "[3ds] circle pad down at launch: GX write filter check mode (nothing left out, each skip checked)\n");
 	}
 	// Circle pad up at launch: resident display-list runs' indices are copied into the GPU ring each
 	// frame, rebased to the batch (the render thread's copy, as before), not drawn where stored.
-	if (launchHeld & KEY_CPAD_UP) {
+	if (testHeld & KEY_CPAD_UP) {
 		GX3DS_SetResidentIndicesInPlace(0);
 		printf("Circle pad up: resident indices copied\n");
 		fprintf(stderr, "[3ds] circle pad up at launch: resident indices copied into the ring, rebased (not in place)\n");
 	}
 	// Circle pad right at launch: resident display-list runs keep their duplicate vertices (each
 	// stored as recorded), as before they were merged (to compare).
-	if (launchHeld & KEY_CPAD_RIGHT) {
+	if (testHeld & KEY_CPAD_RIGHT) {
 		GX3DS_SetMergeDuplicates(0);
 		printf("Circle pad right: duplicate vertices kept\n");
 		fprintf(stderr, "[3ds] circle pad right at launch: resident runs keep their duplicate vertices (not merged)\n");
 	}
 	// A held through launch: resident runs keep their triangles in the order recorded (merged runs
 	// are otherwise reordered for the vertex cache where order makes no difference).
-	if (launchHeld & KEY_A) {
+	if (testHeld & KEY_A) {
 		GX3DS_SetReorder(0);
 		printf("A held: triangle order kept\n");
 		fprintf(stderr, "[3ds] A held at launch: resident runs keep their triangle order (not reordered)\n");
 	}
-	if (launchHeld & KEY_B) {
+	if (testHeld & KEY_B) {
 		GX3DS_SetGpuTransform(0);
 		pica_set_big_ring(1);  // CPU-transformed vertices are larger
 		printf("B held: CPU vertex path\n");
@@ -1254,17 +1288,17 @@ int main()
 	printf(gpuOk ? "ok\n" : "HUNG: see log; game not started\n");
 	// Touching the screen at launch times what a vertex costs the GPU under different vertex
 	// formats and memory ([vbench] lines, about a second).
-	if (gpuOk && (launchHeld & KEY_TOUCH)) {
+	if (gpuOk && (testHeld & KEY_TOUCH)) {
 		printf("GPU vertex benchmark... ");
 		pica_vertex_bench();
 		printf("done\n");
 	}
 	// Overlapped frames (after the self-test, which runs one frame at a time): the CPU builds
 	// the next frame while the GPU draws the last. D-pad down at launch keeps them apart.
-	if (launchHeld & KEY_DDOWN) {
+	if (testHeld & KEY_DDOWN) {
 		printf("Down held: frames not overlapped\n");
 		fprintf(stderr, "[3ds] Down held at launch: CPU and GPU frames not overlapped\n");
-	} else if (!(launchHeld & (KEY_R | KEY_Y))) {
+	} else if (!(testHeld & (KEY_R | KEY_Y))) {
 		pica_set_overlap(1);
 	}
 	flush_log();
@@ -1386,19 +1420,25 @@ int main()
 				}
 			}
 		}
-		// SELECT on its own cycles the colours (material, debug, opaque), on its release, so the
-		// first half of a START+SELECT quit pressed SELECT first does not switch them.
+		// SELECT on its own switches R between a soft and a hard press (pad_3ds.c), on its release, so
+		// the first half of a START+SELECT quit pressed SELECT first does not switch it. With
+		// debug_input = on, L + SELECT cycles the colours (material, debug, opaque) instead.
 		static bool selectAlone;
 		if (pressed & KEY_SELECT) selectAlone = true;
 		if (held & KEY_START) selectAlone = false;
 		if ((released & KEY_SELECT) && selectAlone) {
 			selectAlone = false;
-			GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);
+			if (s_debugInput && (held & KEY_L)) {
+				GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);
+			} else {
+				pad3ds_soft_r = !pad3ds_soft_r;
+				fprintf(stderr, "[pad] R: %s press (SELECT)\n", pad3ds_soft_r ? "soft" : "hard");
+			}
 		}
 		// Debug input stays on the touch screen, which the game does not use (its buttons all
 		// reach the game through pad_3ds.c): the top half cycles the top screen through the last
 		// frame's EFB copies, the bottom half logs the next frame's draws to sdmc:/sms/log.txt.
-		if (pressed & KEY_TOUCH) {
+		if ((pressed & KEY_TOUCH) && s_debugInput) {
 			touchPosition tp;
 			hidTouchRead(&tp);
 			fprintf(stderr, "[touch] %d,%d: %s\n", tp.px, tp.py,
@@ -1455,9 +1495,16 @@ int main()
 	// running game or GX code while the services and the heap go away.
 	pad3ds_quit = 1;
 	for (int i = 0; i < 40 && !pad3ds_parked; i++) svcSleepThread(10000000LL);  // at most 400 ms
+	// From here the threads that wake up on their own (the render thread's GPU waits, the retrace
+	// timer) park in the kernel: as a .cia the system can take the process's memory away before
+	// svcExitProcess stops them (crash dump 49). Parked, none runs again.
+	sms3ds_ending = 1;
 	pica_request_stop();
 	SMS3DS_AudioExit();  // the DSP stops playing what it was given
 	svcSleepThread(100000000LL);
+	fprintf(stderr, "[3ds] ending: %d threads parked (the game thread, then any that woke on their own)\n",
+	        sms3ds_parked_threads);
+	flush_log();
 	// _exit, not a return from main: exit's atexit handlers and static destructors can wait on
 	// the game thread (its locks, its emulated OS), and a stuck game thread then kept the
 	// console from quitting. _exit still runs libctru's service cleanup.

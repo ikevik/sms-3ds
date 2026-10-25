@@ -27,7 +27,16 @@ static void read_now(Pad3DSStatus* out)
 	if (held & KEY_START)  out->button |= P3DS_BUTTON_START;
 	if (held & (KEY_ZL | KEY_ZR)) out->button |= P3DS_TRIGGER_Z;
 	if (held & KEY_L) { out->button |= P3DS_TRIGGER_L; out->triggerL = 255; }
-	if (held & KEY_R) { out->button |= P3DS_TRIGGER_R; out->triggerR = 255; }
+	if (held & KEY_R) {
+		/* Soft: past the analog level at which the game's spray pressure is full (150 of 255:
+		 * TMario::getLRLevel, mAnalogLRToMaxVal), without the click. */
+		if (pad3ds_soft_r) {
+			out->triggerR = 180;
+		} else {
+			out->button |= P3DS_TRIGGER_R;
+			out->triggerR = 255;
+		}
+	}
 
 	circlePosition cp;
 	hidCircleRead(&cp);
@@ -59,6 +68,18 @@ static Pad3DSStatus s_latest;
 volatile uint32_t pad3ds_script;
 static LightLock s_lock = 1; /* 1: unlocked */
 volatile int pad3ds_quit;
+volatile int pad3ds_soft_r;
+volatile int sms3ds_ending;
+volatile int sms3ds_parked_threads;
+
+void sms3ds_park(void)
+{
+	__atomic_fetch_add(&sms3ds_parked_threads, 1, __ATOMIC_RELAXED);
+	Handle never = 0;
+	if (R_SUCCEEDED(svcCreateEvent(&never, RESET_ONESHOT)))
+		for (;;) svcWaitSynchronization(never, U64_MAX);
+	for (;;) svcSleepThread(3600000000000LL); /* (no event: an hour at a time) */
+}
 volatile int pad3ds_parked;
 
 void pad3ds_poll(void)
