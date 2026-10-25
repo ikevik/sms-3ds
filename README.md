@@ -147,6 +147,11 @@ docs/              PORTING.md (prior art, design), STAGE1.md, audio-3ds.md, nati
 source/            the first bring-up app (make without MODE=game)
 ```
 
+## Contributing
+
+Pull requests and bug reports are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for how to build,
+test and submit a change, and what to include in a bug report.
+
 ## AI disclosure
 
 This port was made with heavy AI assistance, and tested rigorously.
