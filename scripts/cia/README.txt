@@ -50,11 +50,13 @@ Playing
 
 AI disclosure
 -------------
-Nearly all of this port (its code, scripts, patches and documentation) was written by an AI:
-Claude, Anthropic's model, working through Claude Code. ikevik directed the work and tested every
-build, in the Azahar emulator and on a New 3DS. The game's own code is the decompilation and PC
-port credited below. Expect mistakes; please report problems at
-https://github.com/ikevik/sms-3ds/issues.
+This port was made with heavy AI assistance, and tested rigorously. Nearly all of its code,
+scripts, patches and documentation were written by Claude, Anthropic's model, working through
+Claude Code. ikevik directed the work and tested it throughout, in the Azahar emulator and on a
+real New 3DS: play-testing through the whole game on the console, profiling runs, before-and-after
+builds of each change, and a checker for the renderer's materials against the GameCube's own
+arithmetic. The game's own code is the decompilation and PC port credited below. Expect mistakes
+all the same; please report problems at https://github.com/ikevik/sms-3ds/issues.
 
 Credits
 -------
