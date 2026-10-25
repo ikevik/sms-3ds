@@ -1557,7 +1557,19 @@ void SMS3DS_AudioExit(void)
 	s_sinkStarted = false;
 	ndspSetCallback(NULL, NULL);
 	for (int c = 0; c < 24; c++) ndspChnWaveBufClear(c);
-	ndspExit();
+	// ndspExit joins libctru's DSP thread with no time limit. Closed from the HOME Menu, the app's DSP
+	// was put to sleep for the HOME Menu and the close cancels it, and that thread can be left waiting
+	// for a DSP interrupt that never comes: the process then never ended (the next app's screen stayed
+	// black). Here ndspExit runs on a thread of its own for half a second at most; still waiting
+	// then, it is left to the process's end, waiting in the kernel.
+	Thread t = threadCreate([](void*) { ndspExit(); }, NULL, 8u << 10, 0x18, -2, false);
+	if (!t) {
+		ndspExit();
+	} else if (R_SUCCEEDED(threadJoin(t, 500000000ull))) {
+		threadFree(t);
+	} else {
+		fprintf(stderr, "[audio] ndspExit still waiting after 0.5 s: the DSP left to the process's end\n");
+	}
 }
 
 // sms-pc-port's DSP HLE, at the 0x81 setup command.

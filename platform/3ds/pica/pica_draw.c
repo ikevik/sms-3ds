@@ -2641,7 +2641,12 @@ int pica_gx_thread_start(void (*fn)(void*), void* arg)
 	svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
 	if (prio > 0x19) prio--;
 	if (pica_gx_core != 1 && threadCreate(fn, arg, 256u << 10, prio, pica_gx_core, true)) return 1;
-	if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(80)) && threadCreate(fn, arg, 256u << 10, prio, 1, true)) return 1;
+	/* (As a .cia the exheader's MaxCpu decides whether the application gets core 1: with 0x9E the
+	 * call failed on a console, and the GX thread ran on the game thread. Its result is logged.) */
+	const Result r = APT_SetAppCpuTimeLimit(80);
+	if (R_SUCCEEDED(r) && threadCreate(fn, arg, 256u << 10, prio, 1, true)) return 1;
+	fprintf(stderr, "[pica] core 1: %s (APT_SetAppCpuTimeLimit(80) = 0x%08lx)\n",
+	        R_SUCCEEDED(r) ? "no thread could be made there" : "the application got no time there", (unsigned long)r);
 	return -1;
 }
 void pica_event_wait(int i) { LightEvent_Wait(&s_evt[i]); }

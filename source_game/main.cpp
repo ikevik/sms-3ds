@@ -1481,13 +1481,19 @@ int main()
 		gspWaitForVBlank();
 	}
 
+	// Closed from the HOME Menu the app is still suspended here, and every wait below is bounded: an
+	// unbounded one kept the process from ending, and the next app the HOME Menu started had a black
+	// screen until the console was turned off. Each step is logged as it ends, to tell which one.
+	const bool homeClose = aptShouldClose();
+	fprintf(stderr, "[3ds] exiting (%s)\n", homeClose ? "closed from the HOME Menu" : "START+SELECT or autorun");
+	flush_log();
 	if (s_statusThread) {
 		s_statusRun = false;
-		threadJoin(s_statusThread, U64_MAX);
-		threadFree(s_statusThread);
+		if (R_SUCCEEDED(threadJoin(s_statusThread, 1000000000ull)))  // at most 1 s
+			threadFree(s_statusThread);
+		else
+			fprintf(stderr, "[3ds] quit: the status thread did not stop within 1 s\n");
 	}
-	fprintf(stderr, "[3ds] exiting\n");
-	flush_log();
 	// The game thread may be mid-frame: stop it submitting GPU work and let what is in flight
 	// finish, so gfxExit does not free the screens under a running display transfer (a quit
 	// that sometimes did not return cleanly).
@@ -1495,6 +1501,8 @@ int main()
 	// running game or GX code while the services and the heap go away.
 	pad3ds_quit = 1;
 	for (int i = 0; i < 40 && !pad3ds_parked; i++) svcSleepThread(10000000LL);  // at most 400 ms
+	fprintf(stderr, "[3ds] quit: the game thread %s\n", pad3ds_parked ? "stopped at PADRead" : "still out after 400 ms (blocked)");
+	flush_log();
 	// From here the threads that wake up on their own (the render thread's GPU waits, the retrace
 	// timer) park in the kernel: as a .cia the system can take the process's memory away before
 	// svcExitProcess stops them (crash dump 49). Parked, none runs again.
@@ -1509,5 +1517,7 @@ int main()
 	// the game thread (its locks, its emulated OS), and a stuck game thread then kept the
 	// console from quitting. _exit still runs libctru's service cleanup.
 	gfxExit();
+	fprintf(stderr, "[3ds] quit: graphics stopped; the services next, then the process ends\n");
+	flush_log();
 	_exit(0);
 }

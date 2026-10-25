@@ -29,9 +29,9 @@ AccessControlInfo:
     - DirectSdmcWrite
 
   MemoryType              : Application
-  # Old 3DS (unsupported: too slow) and New 3DS; the New 3DS's 124 MB is what the Homebrew
-  # Launcher gives (heap 83 MB, linear 32 MB).
-  SystemMode              : 80MB
+  # The Old 3DS's default 64 MB (unsupported there: too slow), and on a New 3DS 124 MB, what the
+  # Homebrew Launcher gives (heap 83 MB, linear 32 MB).
+  SystemMode              : 64MB
   SystemModeExt           : 124MB
   CpuSpeed                : 804MHz
   EnableL2Cache           : true
@@ -40,8 +40,10 @@ AccessControlInfo:
   AffinityMask            : 1
   # The main thread's: makerom adds 32 for an application (48, as under the Homebrew Launcher).
   Priority                : 16
-  # Core 1's time limit the port asks for (APT_SetAppCpuTimeLimit(80)) must not exceed this.
-  MaxCpu                  : 0x9E
+  # Core 1's time for the application (APT_SetAppCpuTimeLimit(80), the GX and status threads): with
+  # 0x9E that call failed on a console, and the GX thread ran on the game thread (Delfino Plaza
+  # 47.7 ms a frame against 35). 0xFF as Melee 3DS's .cia.
+  MaxCpu                  : 0xFF
   HandleTableSize         : 0x200
   DisableDebug            : false
   EnableForceDebug        : false
