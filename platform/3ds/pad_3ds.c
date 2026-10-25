@@ -39,6 +39,17 @@ static void read_now(Pad3DSStatus* out)
 	irrstCstickRead(&cs);   // New 3DS C-stick (needs irrstInit)
 	out->substickX = scale_axis(cs.dx);
 	out->substickY = scale_axis(cs.dy);
+
+	/* autorun.txt buttons: the Circle Pad and C-stick pushed all the way (main.cpp) */
+	u32 sc = pad3ds_script;
+	if (sc & KEY_CPAD_RIGHT) out->stickX = 72;
+	if (sc & KEY_CPAD_LEFT)  out->stickX = -72;
+	if (sc & KEY_CPAD_UP)    out->stickY = 72;
+	if (sc & KEY_CPAD_DOWN)  out->stickY = -72;
+	if (sc & KEY_CSTICK_RIGHT) out->substickX = 72;
+	if (sc & KEY_CSTICK_LEFT)  out->substickX = -72;
+	if (sc & KEY_CSTICK_UP)    out->substickY = 72;
+	if (sc & KEY_CSTICK_DOWN)  out->substickY = -72;
 }
 
 /* The main thread reads the buttons (pad3ds_poll, after its hidScanInput) and the game thread takes

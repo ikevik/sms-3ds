@@ -43,6 +43,7 @@ for f in gx_api gx_vert; do cxx "$GX/src/$f.cpp" "$OBJ/$f.o" "$INSTR"; done
 for f in gx_fifo gx_trace; do cxx "$GX/src/$f.cpp" "$OBJ/$f.o"; done
 cxx "$P3DS/gx/gx3ds_backend.cpp" "$OBJ/gx3ds_backend.o"
 cxx "$P3DS/gx/gx3ds_texdecode.cpp" "$OBJ/gx3ds_texdecode.o"
+cxx "$P3DS/gx/gx3ds_tevsym.cpp" "$OBJ/gx3ds_tevsym.o"
 for f in GDBase GDGeometry GDLight GDPixel GDTev GDTransform; do
   $CC $COMMON $INSTR -std=gnu99 -fcommon -include "$GX/src/gd_host_prefix.h" $INCS -c "$DECOMP/libs/dolphin/src/gd/$f.c" -o "$OBJ/$f.o" 2>"$OBJ/$f.o.err" \
     && rm -f "$OBJ/$f.o.err" || { echo "FAIL $f.c: $(grep -m1 error "$OBJ/$f.o.err" | cut -c1-160)"; fail=$((fail+1)); }

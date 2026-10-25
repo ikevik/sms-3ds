@@ -9,6 +9,7 @@
 #include <math.h>
 
 #include "gx_pass_shbin.h"
+#include "gx_proj_shbin.h" /* gx_pass with projective texgens on the GPU path (gpu_projective = on) */
 #include "vshader_shbin.h" /* the bring-up shader: [vbench] I1 (two outputs) */
 
 #define DISPLAY_TRANSFER_FLAGS                                                                     \
@@ -41,8 +42,9 @@ static C3D_Tex s_efbTex;
 static DVLB_s* s_dvlb;
 static shaderProgram_s s_prog;
 /* Vertex shader uniforms (shaders/gx_pass.v.pica) and the vertex mode they are set up for. */
-static int s_uF, s_uP, s_uN, s_uT, s_uW, s_uCS, s_uCM, s_uAMB, s_uLP, s_uLC, s_uLF, s_uLA, s_uLK, s_uLD, s_bCpu;
+static int s_uF, s_uP, s_uN, s_uT, s_uTQ, s_uTQ1, s_uW, s_uCS, s_uCM, s_uAMB, s_uLP, s_uLC, s_uLF, s_uLA, s_uLK, s_uLD, s_bCpu;
 static int s_bLit, s_bL[2], s_bA[2], s_bS[2], s_bTu[3], s_bTd[3], s_bPj; /* the GX shader's per-draw shortcuts */
+static int s_projShader; /* gx_proj.v.pica is bound (pica_set_projective_shader) */
 static C3D_Tex s_projTex; /* unit 0's texture in projection mode (PicaState.proj0) */
 enum { MODE_NONE = -1, MODE_CPU = 0, MODE_GX = 1 };
 static int s_mode = MODE_NONE;
@@ -53,6 +55,7 @@ static int s_gxLayoutValid;
 static int s_gxMatricesLoaded;
 static C3D_Mtx s_projTop; /* EFB pixels onto the rotated top screen (the present quad) */
 static C3D_Mtx s_projEfb; /* EFB pixels onto the EFB texture (game draws) */
+static C3D_Tex s_efbDepthTex; /* the EFB's depth buffer as an RGBA8 texture (Z copies) */
 
 static uint8_t* s_vring[2];
 static uint8_t* s_iring[2];
@@ -121,6 +124,65 @@ static uint8_t* s_copyArena;
 static uint8_t s_copyUnitUsed[COPY_UNITS];
 static uint32_t s_copyUnits, s_copyUnitsPeak;
 
+/* The GX shader's uniform registers (gx_pass.v.pica or gx_proj.v.pica, whichever is bound). */
+static void gx_shader_uniforms(void)
+{
+	shaderInstance_s* vs = s_prog.vertexShader;
+	s_uF = shaderInstanceGetUniformLocation(vs, "F");
+	s_uP = shaderInstanceGetUniformLocation(vs, "P");
+	s_uN = shaderInstanceGetUniformLocation(vs, "N");
+	s_uT = shaderInstanceGetUniformLocation(vs, "T");
+	s_uTQ = shaderInstanceGetUniformLocation(vs, "TQ");
+	s_uTQ1 = shaderInstanceGetUniformLocation(vs, "TQ1");
+	s_uW = shaderInstanceGetUniformLocation(vs, "W");
+	s_uCS = shaderInstanceGetUniformLocation(vs, "CS");
+	s_uCM = shaderInstanceGetUniformLocation(vs, "CM");
+	s_uAMB = shaderInstanceGetUniformLocation(vs, "AMB");
+	s_uLP = shaderInstanceGetUniformLocation(vs, "LP");
+	s_uLC = shaderInstanceGetUniformLocation(vs, "LC");
+	s_uLF = shaderInstanceGetUniformLocation(vs, "LF");
+	s_uLA = shaderInstanceGetUniformLocation(vs, "LA");
+	s_uLK = shaderInstanceGetUniformLocation(vs, "LK");
+	s_uLD = shaderInstanceGetUniformLocation(vs, "LD");
+	s_bCpu = shaderInstanceGetUniformLocation(vs, "cpu");
+	s_bLit = shaderInstanceGetUniformLocation(vs, "lit");
+	s_bL[0] = shaderInstanceGetUniformLocation(vs, "l0");
+	s_bL[1] = shaderInstanceGetUniformLocation(vs, "l1");
+	s_bA[0] = shaderInstanceGetUniformLocation(vs, "a0");
+	s_bA[1] = shaderInstanceGetUniformLocation(vs, "a1");
+	s_bS[0] = shaderInstanceGetUniformLocation(vs, "s0");
+	s_bS[1] = shaderInstanceGetUniformLocation(vs, "s1");
+	s_bPj = shaderInstanceGetUniformLocation(vs, "pj");
+	for (int k = 0; k < 3; k++) {
+		char n[4] = {'t', 'u', (char)('0' + k), 0};
+		s_bTu[k] = shaderInstanceGetUniformLocation(vs, n);
+		n[1] = 'd';
+		s_bTd[k] = shaderInstanceGetUniformLocation(vs, n);
+	}
+}
+
+/* gx_proj.v.pica in place of gx_pass (settings.txt gpu_projective = on): draws with projective
+ * texgens on the GPU path (pica_gx_projective). Called once, before the game draws. */
+int pica_set_projective_shader(int on)
+{
+	if (!on || s_projShader) return s_projShader;
+	if (!pica_init()) return 0;
+	DVLB_s* d = DVLB_ParseFile((u32*)gx_proj_shbin, gx_proj_shbin_size);
+	if (!d) return 0;
+	shaderProgramFree(&s_prog);
+	DVLB_Free(s_dvlb);
+	s_dvlb = d;
+	shaderProgramInit(&s_prog);
+	shaderProgramSetVsh(&s_prog, &s_dvlb->DVLE[0]);
+	C3D_BindProgram(&s_prog);
+	gx_shader_uniforms();
+	s_mode = MODE_NONE;
+	s_projShader = s_uTQ >= 0 && s_uTQ1 >= 0;
+	return s_projShader;
+}
+
+int pica_gx_projective(void) { return s_projShader; }
+
 int pica_init(void)
 {
 	if (s_stopping) return 0;
@@ -136,42 +198,20 @@ int pica_init(void)
 	shaderProgramInit(&s_prog);
 	shaderProgramSetVsh(&s_prog, &s_dvlb->DVLE[0]);
 	C3D_BindProgram(&s_prog);
-	{
-		shaderInstance_s* vs = s_prog.vertexShader;
-		s_uF = shaderInstanceGetUniformLocation(vs, "F");
-		s_uP = shaderInstanceGetUniformLocation(vs, "P");
-		s_uN = shaderInstanceGetUniformLocation(vs, "N");
-		s_uT = shaderInstanceGetUniformLocation(vs, "T");
-		s_uW = shaderInstanceGetUniformLocation(vs, "W");
-		s_uCS = shaderInstanceGetUniformLocation(vs, "CS");
-		s_uCM = shaderInstanceGetUniformLocation(vs, "CM");
-		s_uAMB = shaderInstanceGetUniformLocation(vs, "AMB");
-		s_uLP = shaderInstanceGetUniformLocation(vs, "LP");
-		s_uLC = shaderInstanceGetUniformLocation(vs, "LC");
-		s_uLF = shaderInstanceGetUniformLocation(vs, "LF");
-		s_uLA = shaderInstanceGetUniformLocation(vs, "LA");
-		s_uLK = shaderInstanceGetUniformLocation(vs, "LK");
-		s_uLD = shaderInstanceGetUniformLocation(vs, "LD");
-		s_bCpu = shaderInstanceGetUniformLocation(vs, "cpu");
-		s_bLit = shaderInstanceGetUniformLocation(vs, "lit");
-		s_bL[0] = shaderInstanceGetUniformLocation(vs, "l0");
-		s_bL[1] = shaderInstanceGetUniformLocation(vs, "l1");
-		s_bA[0] = shaderInstanceGetUniformLocation(vs, "a0");
-		s_bA[1] = shaderInstanceGetUniformLocation(vs, "a1");
-		s_bS[0] = shaderInstanceGetUniformLocation(vs, "s0");
-		s_bS[1] = shaderInstanceGetUniformLocation(vs, "s1");
-		s_bPj = shaderInstanceGetUniformLocation(vs, "pj");
-		for (int k = 0; k < 3; k++) {
-			char n[4] = {'t', 'u', (char)('0' + k), 0};
-			s_bTu[k] = shaderInstanceGetUniformLocation(vs, n);
-			n[1] = 'd';
-			s_bTd[k] = shaderInstanceGetUniformLocation(vs, n);
-		}
-	}
+	gx_shader_uniforms();
 
 	if (!C3D_TexInitVRAM(&s_efbTex, EFB_TEX_W, EFB_TEX_H, GPU_RGBA8)) goto fail;
 	s_efb = C3D_RenderTargetCreateFromTex(&s_efbTex, GPU_TEXFACE_2D, 0, GPU_RB_DEPTH24_STENCIL8);
 	if (!s_efb) goto fail;
+	/* Its depth buffer read as a texture (Z copies): D24S8 texels are laid out as RGBA8 ones. */
+	memset(&s_efbDepthTex, 0, sizeof s_efbDepthTex);
+	s_efbDepthTex.data = s_efb->frameBuf.depthBuf;
+	s_efbDepthTex.fmt = GPU_RGBA8;
+	s_efbDepthTex.size = EFB_TEX_W * EFB_TEX_H * 4;
+	s_efbDepthTex.width = EFB_TEX_W;
+	s_efbDepthTex.height = EFB_TEX_H;
+	s_efbDepthTex.param = GPU_TEXTURE_MAG_FILTER(GPU_NEAREST) | GPU_TEXTURE_MIN_FILTER(GPU_NEAREST) |
+	                      GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
 	C3D_TexSetFilter(&s_efbTex, GPU_LINEAR, GPU_LINEAR);
 	C3D_TexSetWrap(&s_efbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
 	s_copyArena = (uint8_t*)vramAlloc(COPY_ARENA_BYTES);
@@ -238,6 +278,7 @@ static PicaTex* s_dead[2][MAX_DEFERRED];
 static int s_ndead[2];
 
 static void tex_count(const PicaTex* t, int sign);
+static void etc_count(const PicaTex* t, int sign);
 static void vram_unpend(PicaTex* t);
 static void vram_drop(PicaTex* t);
 static void copy_tex_mem_free(PicaTex* t);
@@ -263,6 +304,7 @@ static void release_dead(void)
 		if (t->rt) {
 			copy_tex_mem_free(t);
 		} else {
+			etc_count(t, -1);
 			LIN_LOCK();
 			C3D_TexDelete(&t->tex);
 			LIN_UNLOCK();
@@ -284,8 +326,9 @@ static void release_dead(void)
  * current scene draws with; copies of textures no draw has bound for a while make room
  * (vram_evict), for other textures and for the EFB-copy textures (pica_copy_tex_create). */
 /* VRAM kept free for EFB-copy textures that do not fit in the arena (s_copyArena), or for all of
- * them when it could not be made: at most 8 (the back end's kMaxEfbCopies), one more while a
- * replaced one waits out its two frames, each at most a whole-EFB texture. */
+ * them when it could not be made: 8 of them (the back end keeps up to 16, kMaxEfbCopies, most of
+ * them small goop maps), one more while a replaced one waits out its two frames, each at most a
+ * whole-EFB texture. */
 #define COPY_TEX_BYTES (EFB_TEX_W * EFB_TEX_H * 4u)
 static uint32_t copy_reserve(void)
 {
@@ -545,6 +588,42 @@ static void tex_flush(PicaTex* t)
 	if (t->vram && !t->noVram) vram_copy(t);
 }
 
+/* ETC1 textures (settings.txt etc1_textures): encoded on upload (etc1_enc.c), counted for [perf]. */
+uint64_t etc1_encode_tex(void* dst, uint32_t w, uint32_t h, const uint8_t* rgba, int alpha);
+static uint32_t s_etcCount, s_etcBytes, s_etcEncodes;
+static uint64_t s_etcTicks, s_etcErr, s_etcTexels;
+static void etc_count(const PicaTex* t, int sign)
+{
+	if (t->fmt < PICA_TF_ETC1) return;
+	s_etcCount += (uint32_t)sign;
+	s_etcBytes += (uint32_t)sign * t->bytes;
+}
+static void etc_encode(void* dst, uint32_t w, uint32_t h, const uint8_t* rgba, int fmt)
+{
+	const uint64_t t0 = svcGetSystemTick();
+	const uint64_t err = etc1_encode_tex(dst, w, h, rgba, fmt == PICA_TF_ETC1A4);
+	s_etcTicks += svcGetSystemTick() - t0;
+	s_etcEncodes++;
+	s_etcErr += err;
+	s_etcTexels += (uint64_t)w * h;
+	/* the worst ones, for the log: under 32 dB (mean squared error over 3 channels above ~41) */
+	const double mse = (double)err / (3.0 * w * h);
+	if (mse > 41.0) {
+		static int s_said;
+		if (s_said++ < 40)
+			fprintf(stderr, "[pica] ETC1%s %lux%lu texture at %.1f dB\n", fmt == PICA_TF_ETC1A4 ? "A4" : "",
+			        (unsigned long)w, (unsigned long)h, 10.0 * log10(255.0 * 255.0 / mse));
+	}
+}
+void pica_etc1_stats(uint32_t* count, uint32_t* kb, uint32_t* encodes, float* ms, float* db)
+{
+	*db = s_etcTexels && s_etcErr ? (float)(10.0 * log10(255.0 * 255.0 * 3.0 * (double)s_etcTexels / (double)s_etcErr)) : 0.f;
+	*count = s_etcCount;
+	*kb = s_etcBytes >> 10;
+	*encodes = s_etcEncodes;
+	*ms = (float)((double)s_etcTicks * 1000.0 / SYSCLOCK_ARM11);
+}
+
 static PicaTex* tex_create(uint32_t w, uint32_t h, GPU_TEXCOLOR fmt, uint32_t bpp)
 {
 	if (!pica_init()) return NULL;
@@ -555,7 +634,8 @@ static PicaTex* tex_create(uint32_t w, uint32_t h, GPU_TEXCOLOR fmt, uint32_t bp
 		free(t);
 		return NULL;
 	}
-	t->bytes = w * h * bpp;
+	(void)bpp;
+	t->bytes = t->tex.size; /* (ETC1: half a byte a texel) */
 	tex_count(t, 1);
 	return t;
 }
@@ -563,11 +643,12 @@ static PicaTex* tex_create(uint32_t w, uint32_t h, GPU_TEXCOLOR fmt, uint32_t bp
 PicaTex* pica_tex_create(uint32_t w, uint32_t h) { return tex_create(w, h, GPU_RGBA8, 4); }
 PicaTex* pica_tex_create_fmt(uint32_t w, uint32_t h, int fmt)
 {
-	static const GPU_TEXCOLOR kGpu[] = {GPU_RGBA8, GPU_RGB565, GPU_RGBA5551, GPU_RGBA4, GPU_LA8, GPU_L8};
-	static const uint8_t kBpp[] = {4, 2, 2, 2, 2, 1};
-	if (fmt < 0 || fmt > PICA_TF_L8) fmt = PICA_TF_RGBA8;
+	static const GPU_TEXCOLOR kGpu[] = {GPU_RGBA8, GPU_RGB565, GPU_RGBA5551, GPU_RGBA4, GPU_LA8, GPU_L8, GPU_ETC1, GPU_ETC1A4};
+	static const uint8_t kBpp[] = {4, 2, 2, 2, 2, 1, 0, 1};
+	if (fmt < 0 || fmt > PICA_TF_ETC1A4) fmt = PICA_TF_RGBA8;
 	PicaTex* t = tex_create(w, h, kGpu[fmt], kBpp[fmt]);
 	if (t) t->fmt = fmt;
+	if (t) etc_count(t, 1);
 	return t;
 }
 int pica_tex_format(const PicaTex* t) { return t ? t->fmt : PICA_TF_RGBA8; }
@@ -632,7 +713,9 @@ static void tex_swizzle_small(void* dst, uint32_t w, uint32_t h, const uint8_t* 
 void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
 {
 	if (!t) return;
-	if (t->fmt == PICA_TF_RGBA8)
+	if (t->fmt >= PICA_TF_ETC1)
+		etc_encode(t->tex.data, t->tex.width, t->tex.height, rgba, t->fmt);
+	else if (t->fmt == PICA_TF_RGBA8)
 		tex_swizzle((uint32_t*)t->tex.data, t->tex.width, t->tex.height, rgba);
 	else
 		tex_swizzle_small(t->tex.data, t->tex.width, t->tex.height, rgba, t->fmt);
@@ -641,9 +724,9 @@ void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
 
 PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias, int fmt)
 {
-	static const GPU_TEXCOLOR kGpu[] = {GPU_RGBA8, GPU_RGB565, GPU_RGBA5551, GPU_RGBA4, GPU_LA8, GPU_L8};
+	static const GPU_TEXCOLOR kGpu[] = {GPU_RGBA8, GPU_RGB565, GPU_RGBA5551, GPU_RGBA4, GPU_LA8, GPU_L8, GPU_ETC1, GPU_ETC1A4};
 	if (!pica_init() || levels < 1) return NULL;
-	if (fmt < 0 || fmt > PICA_TF_L8) fmt = PICA_TF_RGBA8;
+	if (fmt < 0 || fmt > PICA_TF_ETC1A4) fmt = PICA_TF_RGBA8;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
 	if (!t) return NULL;
 	const bool ok = tex_init(&t->tex, w, h, levels - 1, kGpu[fmt]);
@@ -656,6 +739,7 @@ PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias, 
 	C3D_TexSetLodBias(&t->tex, lodBias);
 	t->bytes = C3D_TexCalcTotalSize(t->tex.size, levels - 1);
 	tex_count(t, 1);
+	etc_count(t, 1);
 	return t;
 }
 
@@ -663,7 +747,9 @@ void pica_tex_upload_level(PicaTex* t, int level, const uint8_t* rgba)
 {
 	if (!t || level > t->tex.maxLevel) return;
 	void* dst = C3D_Tex2DGetImagePtr(&t->tex, level, NULL);
-	if (t->fmt == PICA_TF_RGBA8)
+	if (t->fmt >= PICA_TF_ETC1)
+		etc_encode(dst, t->tex.width >> level, t->tex.height >> level, rgba, t->fmt);
+	else if (t->fmt == PICA_TF_RGBA8)
 		tex_swizzle((uint32_t*)dst, t->tex.width >> level, t->tex.height >> level, rgba);
 	else
 		tex_swizzle_small(dst, t->tex.width >> level, t->tex.height >> level, rgba, t->fmt);
@@ -682,6 +768,51 @@ void pica_tex_free(PicaTex* t)
 }
 
 uint32_t pica_tex_bytes(const PicaTex* t) { return t ? t->bytes : 0; }
+
+/* Draw trace check: level 0 of t against what an upload of rgba (RGBA8, the texture's size), or
+ * of raw (already in t's layout), would have written, as the GPU reads it (the CPU's cache lines
+ * of it dropped first; uploads write them back). Returns how many bytes differ (*first: the
+ * first's offset); *bytes: level 0's size. */
+uint32_t pica_tex_check(PicaTex* t, const uint8_t* rgba, const void* raw, uint32_t* bytes, uint32_t* first)
+{
+	*bytes = 0;
+	*first = 0;
+	if (!t || !t->tex.data || t->rt) return 0;
+	const uint32_t w = t->tex.width, h = t->tex.height;
+	const uint32_t n = t->tex.size; /* level 0 */
+	static uint8_t* s_exp;
+	static uint32_t s_expBytes;
+	if (s_expBytes < n) {
+		free(s_exp);
+		s_exp = (uint8_t*)malloc(n);
+		s_expBytes = s_exp ? n : 0;
+		if (!s_exp) return 0;
+	}
+	if (raw)
+		memcpy(s_exp, raw, n);
+	else if (t->fmt >= PICA_TF_ETC1)
+		(void)etc1_encode_tex(s_exp, w, h, rgba, t->fmt == PICA_TF_ETC1A4);
+	else if (t->fmt == PICA_TF_RGBA8)
+		tex_swizzle((uint32_t*)s_exp, w, h, rgba);
+	else
+		tex_swizzle_small(s_exp, w, h, rgba, t->fmt);
+	cache_invalidate(t->tex.data, n);
+	const uint8_t* a = (const uint8_t*)t->tex.data;
+	uint32_t diff = 0;
+	for (uint32_t i = 0; i < n; i++)
+		if (a[i] != s_exp[i]) {
+			if (!diff) *first = i;
+			diff++;
+		}
+	*bytes = n;
+	return diff;
+}
+uint32_t pica_tex_phys(const PicaTex* t, int vram)
+{
+	if (!t) return 0;
+	const void* p = vram ? t->vram : t->tex.data;
+	return p ? osConvertVirtToPhys(p) : 0;
+}
 /* 1: draws bind its VRAM copy; 2: it is kept in FCRAM for good (rewritten often); 0: in FCRAM. */
 int pica_tex_where(const PicaTex* t)
 {
@@ -1591,6 +1722,10 @@ static int gx_setup(const void* verts, const PicaGxLayout* L, const PicaGxUnifor
 		vunif(s_uT + r, u->T[r][0], u->T[r][1], u->T[r][2], u->T[r][3]);
 		vunif(s_uW + r, u->W[r][0], u->W[r][1], u->W[r][2], u->W[r][3]);
 	}
+	if (s_projShader && st && st->proj0) {
+		vunif(s_uTQ, u->TQ[0], u->TQ[1], u->TQ[2], u->TQ[3]);
+		vunif(s_uTQ1, u->TQ1[0], u->TQ1[1], u->TQ1[2], u->TQ1[3]);
+	}
 	vunif(s_uCS, u->CS[0], u->CS[1], u->CS[2], u->CS[3]);
 	vunif(s_uCM, u->CM[0], u->CM[1], u->CM[2], u->CM[3]);
 	gx_shortcuts(u);
@@ -1864,10 +1999,15 @@ static void* copy_arena_alloc(uint32_t bytes, PicaTex* t)
 	uint32_t n = 1;
 	while (n * COPY_UNIT < bytes) n <<= 1;
 	if (!s_copyArena || n > COPY_UNITS) return NULL;
-	for (uint32_t at = 0; at + n <= COPY_UNITS; at += n) {
+	/* First fit at any unit (textures need far less than 4 KB alignment): placed only at multiples of
+	 * their own size, a 512 KB copy found no room in an arena with 512 KB free (Sirena Beach). */
+	for (uint32_t at = 0; at + n <= COPY_UNITS;) {
 		uint32_t k = 0;
 		while (k < n && !s_copyUnitUsed[at + k]) k++;
-		if (k < n) continue;
+		if (k < n) {
+			at += k + 1;
+			continue;
+		}
 		memset(&s_copyUnitUsed[at], 1, n);
 		t->arenaUnit = (uint16_t)at;
 		t->arenaUnits = (uint16_t)n;
@@ -1903,10 +2043,10 @@ static uint32_t near_pow2(float v, uint32_t max)
 	return p;
 }
 
-void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, uint16_t* tw, uint16_t* th,
-                          float win[4])
+void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, float yscale, uint16_t* tw,
+                          uint16_t* th, float win[4])
 {
-	const float kx = (float)EFB_TEX_W / PICA_EFB_WIDTH, ky = (float)EFB_TEX_H / PICA_EFB_HEIGHT;
+	const float kx = (float)EFB_TEX_W / PICA_EFB_WIDTH, ky = (float)EFB_TEX_H / PICA_EFB_HEIGHT / yscale;
 	if (exact) {
 		/* The rectangle's EFB texels as they are, in a window of the EFB texture of power-of-two
 		 * sides: drawn back into the EFB and copied again, it comes back unchanged. */
@@ -1958,26 +2098,22 @@ PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
 		mem = vramAlloc(bytes);
 	}
 	if (!mem) {
-		/* No VRAM left (the arena full, the scene's textures in use): linear FCRAM, slower to draw
-		 * into and sample but there. Without a texture the copy is lost, and draws that sample it
-		 * read the destination's memory, which the GPU never wrote (Bianco Hills' lake, which shows
-		 * the screen copy, went black for moments when copies were replaced every frame). */
-		LIN_LOCK();
-		mem = linearMemAlign(bytes, 0x80);
-		LIN_UNLOCK();
-		if (mem) {
-			t->copyLinear = 1;
-			static int s_said;
-			if (!s_said) {
-				s_said = 1;
-				fprintf(stderr, "[pica] no VRAM for a %lux%lu EFB-copy texture (%lu KB free): in FCRAM\n",
-				        (unsigned long)tw, (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10));
-			}
+		/* No VRAM left (the arena full, the scene's textures in use). Not linear FCRAM: citro3d makes
+		 * render targets in VRAM only (C3D_RenderTargetCreateFromTex returns none for other memory),
+		 * so that fallback lost the copy every time, and draws sampling it read the destination's
+		 * memory, which the GPU never wrote: on a console whatever the heap held there (Sirena Beach's
+		 * Phantamanta tinted the screen by its alpha copy: noise in the manta's colour). The caller
+		 * tries a smaller texture. Logged once per size. */
+		static uint32_t s_said[8];
+		const uint32_t key = tw << 16 | th << 1 | (rgb565 ? 1u : 0u);
+		int k = 0;
+		while (k < 8 && s_said[k] && s_said[k] != key) k++;
+		if (k < 8 && !s_said[k]) {
+			s_said[k] = key;
+			fprintf(stderr, "[pica] no VRAM for a %lux%lu EFB-copy texture (%lu KB free, arena %lu of %lu KB used)\n",
+			        (unsigned long)tw, (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10),
+			        (unsigned long)(s_copyUnits * (COPY_UNIT >> 10)), (unsigned long)(COPY_ARENA_BYTES >> 10));
 		}
-	}
-	if (!mem) {
-		fprintf(stderr, "[pica] no memory for a %lux%lu EFB-copy texture (%lu KB of VRAM free)\n", (unsigned long)tw,
-		        (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10));
 		free(t);
 		return NULL;
 	}
@@ -2079,7 +2215,7 @@ static void draw_efb_quad_ch(int alpha_one, C3D_Tex* src, int chan, float x, flo
 	s_last_valid = 0;
 }
 
-void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[4])
+void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[4], float yscale)
 {
 	if (!dst || !dst->rt || !pica_init()) return;
 	const float x = win[0], y = win[1], w = win[2], h = win[3];
@@ -2094,7 +2230,7 @@ void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[
 	/* A draw pass, not a texture copy: it stays in the frame's command list (no CPU wait) and
 	 * can fix alpha, as the GameCube's copy does for EFB formats without alpha. */
 	draw_on(dst->rt);
-	draw_efb_quad_ch(alpha_one, &s_efbTex, chan, x, y, w, h);
+	draw_efb_quad_ch(alpha_one, &s_efbTex, chan, x, y / yscale, w, h / yscale);
 	draw_on(s_efb);
 	{
 		char what[96];
@@ -2102,6 +2238,25 @@ void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[
 		         dst->tex.height, (int)dst->tex.fmt);
 		gpu_check(what, NULL, 6, NULL);
 	}
+	s_copies++;
+	if (s_nFrameCopies < MAX_VIEW_COPIES) s_frameCopies[s_nFrameCopies++] = dst;
+}
+
+void pica_efb_depth_copy_to(PicaTex* dst, const float win[4], float yscale)
+{
+	if (!dst || !dst->rt || !pica_init()) return;
+	const float x = win[0], y = win[1], w = win[2], h = win[3];
+	dst->wx = x;
+	dst->wy = y;
+	dst->ww = w;
+	dst->wh = h;
+	if (!s_in_frame) frame_begin();
+	if (test_skips(SKIP_COPY)) return;
+	s_fx[FX_COPY]++;
+	s_fx[FX_COPY_PX] += (uint32_t)dst->rt->frameBuf.width * dst->rt->frameBuf.height;
+	draw_on(dst->rt);
+	draw_efb_quad_ch(0, &s_efbDepthTex, -1, x, y / yscale, w, h / yscale);
+	draw_on(s_efb);
 	s_copies++;
 	if (s_nFrameCopies < MAX_VIEW_COPIES) s_frameCopies[s_nFrameCopies++] = dst;
 }
@@ -2233,11 +2388,13 @@ static void readback_queue(void)
 
 /* A one-byte GX texture (8x4 tiles) as a PGM image, for looking at what the readback writes.
  * Off unless asked for (pica_set_readback_dumps): each file cost about a second of SD writes. */
-static int s_rbDumps;
+static int s_rbDumps, s_rbDumpAll;
 void pica_set_readback_dumps(int on) { s_rbDumps = on; }
+/* Each map's next readback written as goop-<its address>.pgm (autorun.txt goop_dump_at). */
+void pica_request_goop_dumps(void) { s_rbDumpAll = 1; }
 static void rb_dump(const char* tag, const Readback* r)
 {
-	if (!s_rbDumps) return;
+	if (!s_rbDumps && !s_rbDumpAll) return;
 	char path[64];
 	snprintf(path, sizeof path, "sdmc:/sms/goop-%s.pgm", tag);
 	FILE* f = fopen(path, "wb");
@@ -2311,6 +2468,35 @@ static void readback_rows(const Readback* r)
 	}
 }
 
+/* A depth copy's readback (chan 6) as GX's Z24X8: 4x4 texel tiles of 64 bytes, the first 32 the
+ * texels' X and depth's high byte, the next 32 its middle and low bytes. The copy texture's texels
+ * hold the depth buffer's bytes as they were (low, middle, high, stencil). */
+static void readback_rows_z24(const Readback* r)
+{
+	const int dw = r->dw, dh = r->dh, tw = r->tw, th = r->th;
+	const uint32_t rowBytes = (uint32_t)tw * 8 * 4, tileRow = (uint32_t)r->tilesPerRow * 64;
+	const float sx = r->w / r->dw, sy = r->h / r->dh;
+	const float ku = tw / r->ww, kv = th / r->wh;
+	for (int y = 0; y < dh; y++) {
+		int v = (int)((r->y + (y + 0.5f) * sy - r->wy) * kv);
+		v = v < 0 ? 0 : v > th - 1 ? th - 1 : v;
+		const int vy = v & 7;
+		const uint8_t* trow = r->buf + (uint32_t)(v >> 3) * rowBytes + (uint32_t)((vy & 1) << 1 | (vy & 2) << 2 | (vy & 4) << 3) * 4;
+		uint8_t* drow = r->dest + (uint32_t)(y >> 2) * tileRow + (uint32_t)(y & 3) * 8;
+		for (int x = 0; x < dw; x++) {
+			int u = (int)((r->x + (x + 0.5f) * sx - r->wx) * ku);
+			u = u < 0 ? 0 : u > tw - 1 ? tw - 1 : u;
+			const int ux = u & 7;
+			const uint8_t* px = trow + ((uint32_t)(u >> 3) * 64 + (uint32_t)((ux & 1) | (ux & 2) << 1 | (ux & 4) << 2)) * 4;
+			uint8_t* d = drow + (x >> 2) * 64 + (x & 3) * 2;
+			d[0] = 0xFF;
+			d[1] = px[2];
+			d[32] = px[1];
+			d[33] = px[0];
+		}
+	}
+}
+
 /* The queue that ran the last frame has finished: its copies are in their buffers. */
 static void readback_arrived(void)
 {
@@ -2327,6 +2513,15 @@ static void readback_finish(void)
 		end_mark(PICA_END_RB_CONVERT);
 		cache_invalidate(r->buf, (uint32_t)r->th * r->tw * 4);
 		end_mark(PICA_END_RB_INVAL);
+		if (r->chan == 6) {  /* a depth copy */
+			readback_rows_z24(r);
+			LIN_LOCK();
+			linearFree(r->buf);
+			LIN_UNLOCK();
+			r->buf = NULL;
+			s_rbDone++;
+			continue;
+		}
 		const uint32_t bytes = (uint32_t)((r->dh + 3) / 4) * r->tilesPerRow * 32;
 		uint32_t before = 0, after = 0, maxv = 0;
 		const int logIt = s_rbDone % 150 == 0;
@@ -2334,7 +2529,11 @@ static void readback_finish(void)
 			for (uint32_t k = 0; k < bytes; k++) before += r->dest[k] > 100;
 		if (s_rbDone == 0) rb_dump("cpu", r);
 		readback_rows(r);
-		if (s_rbDone == 0 || s_rbDone == 1 || s_rbDone == 30 || s_rbDone == 300) {
+		if (s_rbDumpAll) {
+			char tag[16];
+			snprintf(tag, sizeof tag, "%08lx", (unsigned long)(uintptr_t)r->dest);
+			rb_dump(tag, r);
+		} else if (s_rbDumps && (s_rbDone == 0 || s_rbDone == 1 || s_rbDone == 30 || s_rbDone == 300)) {
 			char tag[16];
 			snprintf(tag, sizeof tag, "gpu%u", (unsigned)s_rbDone);
 			rb_dump(tag, r);
@@ -2354,6 +2553,7 @@ static void readback_finish(void)
 		r->buf = NULL;
 		s_rbDone++;
 	}
+	if (s_nrbArrived) s_rbDumpAll = 0;
 	s_nrbArrived = 0;
 }
 

@@ -1,0 +1,62 @@
+--- a/src/Enemy/bossManta.cpp
++++ b/src/Enemy/bossManta.cpp
+@@ -24,6 +24,13 @@
+ #include <System/ParamInst.hpp>
+ #include <System/Resolution.hpp>
+ #include <MarioUtil/ReinitGX.hpp>
++#if defined(__3DS__)
++// 3DS port (decomp patch 3ds-0035, settings.txt lite_manta_shadows): the shadow volumes of only the
++// SMS3DS_LiteMantaShadows mantas nearest Mario (0: all, as the game). Split into its smallest pieces
++// the Phantamanta is ~70 mantas, and their volumes, each drawn twice, were 75% of a frame's
++// vertices (82 ms frames on a New 3DS). The far ones only lose the glow on the ground under them.
++extern "C" int SMS3DS_LiteMantaShadows;
++#endif
+ #include <GC2D/GCConsole2.hpp>
+ #include <System/MarDirector.hpp>
+ #include <System/FlagManager.hpp>
+@@ -1297,10 +1304,45 @@
+ {
+ 	setupEfbAlpha(graphics);
+ 
++#if defined(__3DS__)
++	// The squared distance from Mario of the N-th nearest live manta: the farther ones are left out.
++	f32 limit2 = 3.4e38f;
++	const int keep = SMS3DS_LiteMantaShadows < 32 ? SMS3DS_LiteMantaShadows : 32;
++	if (keep > 0 && getActiveObjNum() > keep) {
++		f32 nearest[32];  // the keep smallest so far, in order
++		int n = 0;
++		for (int i = 0; i < getActiveObjNum(); ++i) {
++			TSpineEnemy* enemy = getObj(i);
++			if (enemy->checkLiveFlag(LIVE_FLAG_DEAD | LIVE_FLAG_CLIPPED_OUT))
++				continue;
++			const f32 dx = enemy->mPosition.x - gpMarioPos->x, dy = enemy->mPosition.y - gpMarioPos->y,
++			          dz = enemy->mPosition.z - gpMarioPos->z;
++			const f32 d2 = dx * dx + dy * dy + dz * dz;
++			if (n == keep && d2 >= nearest[keep - 1])
++				continue;
++			int at = n < keep ? n++ : keep - 1;
++			while (at > 0 && nearest[at - 1] > d2) {
++				nearest[at] = nearest[at - 1];
++				--at;
++			}
++			nearest[at] = d2;
++		}
++		if (n == keep)
++			limit2 = nearest[keep - 1];
++	}
++#endif
+ 	for (int i = 0; i < getActiveObjNum(); ++i) {
+ 		TSpineEnemy* enemy = getObj(i);
+ 		if (enemy->checkLiveFlag(LIVE_FLAG_DEAD | LIVE_FLAG_CLIPPED_OUT))
+ 			continue;
++#if defined(__3DS__)
++		{
++			const f32 dx = enemy->mPosition.x - gpMarioPos->x, dy = enemy->mPosition.y - gpMarioPos->y,
++			          dz = enemy->mPosition.z - gpMarioPos->z;
++			if (dx * dx + dy * dy + dz * dz > limit2)
++				continue;
++		}
++#endif
+ 
+ 		GXSetCullMode(GX_CULL_FRONT);
+ 		GXSetBlendMode(GX_BM_BLEND, GX_BL_ONE, GX_BL_ONE, GX_LO_NOOP);

@@ -1,0 +1,55 @@
+--- a/platform/gx/src/gx_api.cpp
++++ b/platform/gx/src/gx_api.cpp
+@@ -2585,8 +2585,18 @@
+     u32 n = pixMetricRead();
+     *topIn = *botIn = *clrIn = n;
+     *topOut = *botOut = *copyClks = 0;
++}
++#if defined(__3DS__)
++// 3DS port: the clear goes down the command stream (BP 0x57, as the SDK's), so the renderer starts
++// counting where the game asked, between the draws (on the GX thread). Each write differs (the
++// redundant-write filter would drop a repeat).
++void GXClearPixMetric(void) {
++    static uint32_t seq;
++    apiBP(0x57, ++seq & 0xFFFFFF);
+ }
++#else
+ void GXClearPixMetric(void) { pixMetricClear(); }
++#endif
+ void GXSetVCacheMetric(GXVCachePerf) {}
+ void GXReadVCacheMetric(u32* a, u32* b, u32* c) { *a = *b = *c = 0; }
+ void GXClearVCacheMetric(void) {}
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -341,6 +341,7 @@
+         is[BP_COPY_EXEC] = is[BP_PE_TOKEN_INT] = is[BP_PE_TOKEN] = is[BP_DRAWDONE] = 1;
+         is[BP_LOADTLUT1] = is[BP_TEXINVALIDATE] = is[BP_COPY_DST] = 1;
+         for (int i = 0; i < 4; i++) is[BP_TX_IMAGE3 + i] = is[BP_TX_IMAGE3 + 0x20 + i] = 1;
++        is[0x57] = 1;  // GXClearPixMetric (3DS port, writeBPImpl)
+     }
+ } s_bpSpecial;
+ #endif
+@@ -390,7 +391,13 @@
+         onStateChange();
+         g.bp[reg] = data;
+         executeCopy(data);
++        return;
++#if defined(__3DS__)
++    case 0x57:  // GXClearPixMetric (3DS port): the pixel count starts after the draws so far
++        flushBatch();
++        pixMetricClear();
+         return;
++#endif
+     case BP_PE_TOKEN_INT:
+     case BP_PE_TOKEN:
+         g.bp[reg] = data;
+@@ -2867,6 +2874,9 @@
+             switch (reg) {
+             case BP_COPY_EXEC: case BP_PE_TOKEN_INT: case BP_PE_TOKEN: case BP_DRAWDONE: case BP_LOADTLUT1:
+             case BP_TEXINVALIDATE: case BP_COPY_DST:
++#if defined(__3DS__)
++            case 0x57:
++#endif
+                 ok = false;
+                 continue;
+             default: break;

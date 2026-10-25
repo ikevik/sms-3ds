@@ -213,6 +213,7 @@ int SMS3DS_LiteMirror;
 float SMS3DS_LiteFar;
 float SMS3DS_LiteActorFar;  // NPCs' and map objects' clip distance cap (decomp patch 3ds-0034; 0: the game's)
 int SMS3DS_LiteSeaStep;     // the sea's grid, every this many columns and rows (decomp patch 3ds-0034)
+int SMS3DS_LiteMantaShadows;  // the Phantamanta's shadow volumes for only this many mantas, those nearest Mario (decomp patch 3ds-0035; 0: all)
 uint64_t GX3DS_GameWaitTicks(void);  // gx3ds_backend.cpp: the game thread's waits for the GX thread
 double port_idle_seconds(void);      // os_thread.cpp: the game's pacing waits so far
 int SMS3DS_ProfSkip(const void* vtable, const char* name);
@@ -1813,6 +1814,9 @@ void skipGate() { SMS3DS_ProfSkipOn = s_trade != 0 || s_skipNow != nullptr || SM
 // it on): shadows' distance, particles, mirror, draw distance.
 float s_liteShadowDist = 2000.0f, s_liteFar = 4000.0f, s_liteActorFar = 0.0f;
 int s_liteParticles = 2, s_liteSeaStep = 1;
+// Split into its smallest pieces the Phantamanta is ~70 mantas, and their shadow volumes (each drawn
+// twice: Sirena Beach's first episode) were 75% of a frame's vertices: 82 ms frames on a New 3DS.
+int s_liteMantaShadows = 8;
 bool s_liteShine = true;  // the Shine's shadow volume drawn
 // Stages with a draw distance of their own (settings.txt lite_stage_draw_distance; lite = plus gives
 // Bianco Hills one): -1 none (lite_draw_distance's), 0 no limit. s_stageNow: the stage loaded (main.cpp).
@@ -1830,6 +1834,7 @@ void liteApply(bool on) {
 	SMS3DS_LiteFar = on ? liteFarNow() : 0.0f;
 	SMS3DS_LiteActorFar = on ? s_liteActorFar : 0.0f;
 	SMS3DS_LiteSeaStep = on ? s_liteSeaStep : 0;
+	SMS3DS_LiteMantaShadows = on ? s_liteMantaShadows : 0;
 	SMS3DS_ProfDrawSkip = (SMS3DS_ProfDrawSkip & ~1) | (on && !s_liteShine ? 1 : 0);  // 1: the Shine's shadow volume
 	GXPC_CullFar = SMS3DS_LiteFar;
 	skipGate();
@@ -2387,8 +2392,9 @@ extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist) {
 	if (s_liteOn)
 		fprintf(stderr, "[3ds] lite: on (shadows only within %.0f besides Mario's and Yoshi's, one particle in %d, nothing "
 		        "drawn wholly past %.0f (0: no limit), no mirror, NPCs and objects clipped past %.0f (0: the game's), the sea's grid every "
-		        "%d, the Shine's shadow %s)\n", double(s_liteShadowDist), s_liteParticles, double(s_liteFar),
-		        double(s_liteActorFar), s_liteSeaStep, s_liteShine ? "drawn" : "not drawn");
+		        "%d, the Shine's shadow %s, the Phantamanta's shadow for the %d mantas nearest Mario (0: all))\n", double(s_liteShadowDist),
+		        s_liteParticles, double(s_liteFar), double(s_liteActorFar), s_liteSeaStep, s_liteShine ? "drawn" : "not drawn",
+		        s_liteMantaShadows);
 }
 // settings.txt lite_stage_draw_distance (main.cpp), before SMS3DS_SetLite: stage's own draw distance
 // (0: no limit; negative: lite_draw_distance's).
@@ -2411,6 +2417,11 @@ extern "C" void SMS3DS_SetLiteParts(int particles, int seaStep, int actorDist, i
 	if (seaStep >= 0) s_liteSeaStep = seaStep;
 	if (actorDist >= 0) s_liteActorFar = float(actorDist);
 	if (shineOff >= 0) s_liteShine = !shineOff;
+}
+// settings.txt lite_manta_shadows (main.cpp), before SMS3DS_SetLite: the mantas whose shadow volumes
+// are drawn, the nearest Mario (0: all; negative: the default, 8).
+extern "C" void SMS3DS_SetLiteMantaShadows(int n) {
+	if (n >= 0) s_liteMantaShadows = n;
 }
 // autorun.txt profile_steps = liteplus (main.cpp): more trims on top of lite (kLitePlusSteps).
 extern "C" void SMS3DS_ProfLitePlusSteps(void) {

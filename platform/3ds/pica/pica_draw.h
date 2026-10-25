@@ -69,6 +69,10 @@ typedef struct {
 
 /* Lazily initialises citro3d and the top-screen render target. Returns 0 on failure. */
 int pica_init(void);
+/* The GX shader with projective texgens on the GPU path (shaders/gx_proj.v.pica) in place of
+ * gx_pass (settings.txt gpu_projective = on), before the game draws; pica_gx_projective: it is. */
+int pica_set_projective_shader(int on);
+int pica_gx_projective(void);
 
 /* Room for `nverts` vertices and `nidx` indices in this frame's GPU-visible ring. Begins a
  * frame first if none is open. Returns 0 (and draws nothing) when the ring or the command
@@ -85,7 +89,10 @@ PicaTex* pica_tex_create(uint32_t w, uint32_t h);
 void pica_tex_upload(PicaTex* t, const uint8_t* rgba);
 /* The same in a smaller texel format (pica_tex_upload still takes RGBA8 and packs it): half or a
  * quarter of the memory and of the GPU's texture reads. */
-enum { PICA_TF_RGBA8, PICA_TF_RGB565, PICA_TF_RGBA5551, PICA_TF_RGBA4, PICA_TF_LA8, PICA_TF_L8 };
+enum { PICA_TF_RGBA8, PICA_TF_RGB565, PICA_TF_RGBA5551, PICA_TF_RGBA4, PICA_TF_LA8, PICA_TF_L8, PICA_TF_ETC1, PICA_TF_ETC1A4 };
+/* ETC1 textures (PICA_TF_ETC1, ETC1A4: encoded from RGBA8 on upload): how many there are, their
+ * KB, the encodes so far, the milliseconds they took and their colour error as PSNR (dB). */
+void pica_etc1_stats(uint32_t* count, uint32_t* kb, uint32_t* encodes, float* ms, float* db);
 PicaTex* pica_tex_create_fmt(uint32_t w, uint32_t h, int fmt);
 int pica_tex_format(const PicaTex* t);
 void pica_tex_free(PicaTex* t);
@@ -103,6 +110,10 @@ PicaTex* pica_tex_create_la8(uint32_t w, uint32_t h);
 void* pica_tex_data(PicaTex* t);
 void pica_tex_written(PicaTex* t);
 uint32_t pica_tex_bytes(const PicaTex* t);
+/* Draw trace checks: level 0 against an upload of rgba (or raw, in its layout) as the GPU reads it,
+ * the differing bytes returned; and the physical address of its memory (vram: of its VRAM copy). */
+uint32_t pica_tex_check(PicaTex* t, const uint8_t* rgba, const void* raw, uint32_t* bytes, uint32_t* first);
+uint32_t pica_tex_phys(const PicaTex* t, int vram);
 
 /* EFB copies: a copy texture holds a window of the EFB (EFB pixels: x, y, w, h) stretched over
  * the whole of it, the window's top row at t = 1. pica_copy_tex_layout gives the texture's size
@@ -111,21 +122,29 @@ uint32_t pica_tex_bytes(const PicaTex* t);
  * drawn back and copied again comes back unchanged (maps the game edits this way, as the
  * goop's); otherwise the window is the rectangle, at the EFB texture's resolution or the GX
  * copy's size when smaller, each side the nearest power of two. rgb565: a copy without alpha
- * (half the bytes). pica_efb_uv maps an EFB pixel position to texture coordinates in the EFB
- * texture. */
-void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, uint16_t* tw, uint16_t* th,
-                          float win[4]);
+ * (half the bytes). yscale: GX rows per EFB row in the pass that drew it (more than 1 when its
+ * viewport reaches past the EFB's PICA_EFB_HEIGHT rows, which the pass was drawn squeezed into:
+ * a goop map 512 rows tall); the window stays in GX rows. pica_efb_uv maps an EFB pixel position
+ * to texture coordinates in the EFB texture. */
+void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, float yscale, uint16_t* tw,
+                          uint16_t* th, float win[4]);
 PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565);
 int pica_copy_tex_fits(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565);
-/* Draws the window win (x, y, w, h; EFB pixels) of the EFB into dst. alpha_one: the EFB format
- * has no alpha. chan: -1 as is; 0-3 that channel (r, g, b, a) in all four (one-channel copy
- * formats, as GX reads them back); 5 red in rgb, alpha kept (RA4, RA8). */
-void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[4]);
+/* Draws the window win (x, y, w, h; EFB pixels, rows as GX's: divided by yscale in the EFB) of the
+ * EFB into dst. alpha_one: the EFB format has no alpha. chan: -1 as is; 0-3 that channel (r, g, b,
+ * a) in all four (one-channel copy formats, as GX reads them back); 5 red in rgb, alpha kept (RA4,
+ * RA8). */
+void pica_efb_copy_to_ch(PicaTex* dst, int alpha_one, int chan, const float win[4], float yscale);
+/* The same from the EFB's depth buffer (a Z copy: GX's pixel format Z24): its 32-bit texels as
+ * they are, depth's three bytes and the stencil byte (pica_efb_readback chan 6 makes GX's Z24X8
+ * of them). */
+void pica_efb_depth_copy_to(PicaTex* dst, const float win[4], float yscale);
 void pica_efb_uv(float x, float y, float* s, float* t);
 /* Asks for the copy just made into t (an RGBA8 copy texture) to be written to the game's memory
  * at dest (two frames later): dw x dh texels of a one-byte GX format (8x4 tiles, tilesPerRow
  * tiles a row), channel chan (0-3: r, g, b, a; 4: luminance) of the source rectangle (EFB
- * pixels). */
+ * pixels); chan 6: a depth copy (pica_efb_depth_copy_to) as GX's Z24X8 (4x4 tiles of 64 bytes,
+ * tilesPerRow of them a row). */
 void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, int chan, float x, float y, float w,
                        float h);
 /* The EFB-copy textures' VRAM arena: in use now, most in use so far, and its size (0: none). */
@@ -153,6 +172,8 @@ typedef struct {
 typedef struct {
 	float F[4][4];  /* view space -> clip: pica_gx_projection */
 	float T[6][4];  /* texture unit u: rows 2u, 2u+1 over its source vector */
+	float TQ[4];    /* unit 0's q row when its texgen is projective (PicaState.proj0), as texcoord0w */
+	float TQ1[4];   /* then units 1 and 2's, divided per vertex: their q row, or (0, 0, 0, 1) */
 	float W[6][4];  /* unit u's source: W[2u] = (pos, normal, tex a, tex b), W[2u+1].x = tex c */
 	float CS[4];    /* colour = vertex colour * CS + CM (0..1): the channel's material */
 	float CM[4];
@@ -165,6 +186,7 @@ typedef struct {
 	float LA[2][4], LK[2][4], LD[2][4];
 	uint8_t lit, lights; /* lit: lighting with normals; lights: 0-2 */
 	uint8_t attn;        /* bit i: light i is attenuated (LA, LK, LD); bit 4 + i: as a specular light */
+	uint8_t pdv;         /* units 1 and 2's texgens are projective, with one q row (TQ1) */
 } PicaGxUniforms;
 
 /* The free tail of this frame's vertex ring (begins a frame if none is open): a batch can be

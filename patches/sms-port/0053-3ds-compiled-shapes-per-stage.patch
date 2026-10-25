@@ -1,0 +1,85 @@
+--- a/platform/gx/src/gx_fifo.cpp
++++ b/platform/gx/src/gx_fifo.cpp
+@@ -2003,10 +2003,17 @@
+ // Bumped when an entry a compiled shape draws from is recorded again, and when the cache is
+ // cleared: compiled shapes made before then are not used (native J3D, natPkgDraw).
+ static uint32_t s_dlEpoch = 1;
++#endif
++#if defined(__3DS__)
++static void natPkgClear();  // (below)
+ #endif
+ static void dlClear() {
+ #if defined(__3DS__)
+     s_dlEpoch++;
++    // The compiled shapes drawn from the entries go too: none of them would be used again (their
++    // epoch no longer matches), but their memory stayed until their table filled, some 1500 later,
++    // across stages, in blocks among everything else on the heap.
++    natPkgClear();
+ #endif
+     s_dlEntries.clear();
+     s_dlIndex.clear();
+@@ -3300,6 +3307,7 @@
+     bool beDef;
+     uint16_t ncp, nxf, nranges, run0[9];  // group g's runs: [run0[g], run0[g + 1])
+     uint32_t verts[8];                    // the vertices each group's entry loads ([perf])
++    uint32_t bytes;                       // its allocation (this and the arrays below)
+     std::pair<uint8_t, uint32_t>* cp;     // the vertex-format list's CP writes
+     J3DImage::Xf* xf;                     // and XF writes
+     NatPkgRun* runs;
+@@ -3309,32 +3317,41 @@
+ enum { kPkgSlots = 2048 };
+ static uint32_t s_pkgKey[kPkgSlots];
+ static NatPkg* s_pkg[kPkgSlots];
+-static uint32_t s_pkgUsed;
++static uint32_t s_pkgUsed, s_pkgBytes;
+ static inline uint32_t natPkgHash(uint32_t shape) { return (shape * 2654435761u) >> (32 - 11); }
+ static NatPkg* natPkgGet(uint32_t shape) {
+     for (uint32_t i = natPkgHash(shape);; i = (i + 1) & (kPkgSlots - 1)) {
+         if (s_pkgKey[i] == shape) return s_pkg[i];
+         if (!s_pkgKey[i]) return nullptr;
+     }
++}
++static void natPkgClear() {
++    for (uint32_t i = 0; i < kPkgSlots; i++) free(s_pkg[i]);
++    memset(s_pkgKey, 0, sizeof s_pkgKey);
++    memset(s_pkg, 0, sizeof s_pkg);
++    s_pkgUsed = 0;
++    s_pkgBytes = 0;
++    GXPC_J3DPkgStats[3] = 0;
+ }
+ static void natPkgPut(uint32_t shape, NatPkg* k) {
+-    if (s_pkgUsed >= kPkgSlots * 3 / 4) {  // full: start over
+-        for (uint32_t i = 0; i < kPkgSlots; i++) free(s_pkg[i]);
+-        memset(s_pkgKey, 0, sizeof s_pkgKey);
+-        memset(s_pkg, 0, sizeof s_pkg);
+-        s_pkgUsed = 0;
+-    }
++    if (s_pkgUsed >= kPkgSlots * 3 / 4) natPkgClear();  // full: start over
+     uint32_t i = natPkgHash(shape);
+     while (s_pkgKey[i] && s_pkgKey[i] != shape) i = (i + 1) & (kPkgSlots - 1);
+     if (s_pkgKey[i]) {
++        s_pkgBytes -= s_pkg[i]->bytes;
+         free(s_pkg[i]);
+     } else {
+         s_pkgKey[i] = shape;
+         s_pkgUsed++;
+     }
+     s_pkg[i] = k;
++    s_pkgBytes += k->bytes;
+     GXPC_J3DPkgStats[3] = s_pkgUsed;
+ }
++}  // namespace gx
++// 3DS port: the compiled shapes' memory, for the [perf] lines' host memory figures.
++extern "C" uint32_t GXPC_J3DPkgBytes(void) { return gx::s_pkgBytes; }
++namespace gx {
+ 
+ // True when the vertex state the entry was decoded with follows from the shape's vertex-format list
+ // and its op alone (no register left by earlier commands decides how its lists decode).
+@@ -3391,6 +3408,7 @@
+     uint8_t* mem = static_cast<uint8_t*>(malloc(total));
+     if (!mem) return;
+     NatPkg* k = new (mem) NatPkg();
++    k->bytes = uint32_t(total);
+     k->shape = op.shape;
+     k->vcdvat = op.vcdvat;
+     k->pos = op.pos;

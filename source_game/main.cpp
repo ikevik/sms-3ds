@@ -5,6 +5,8 @@
 // Everything the port logs (port_log -> stderr) goes to sdmc:/sms/log.txt.
 #include <3ds.h>
 #include "pad_3ds.h"
+#include <malloc.h>
+#include <new>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -83,12 +85,13 @@ static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
 // ~90K vertices a frame 20000 leaves out ~31K (mostly behind the hills nearby), 15000 ~43K, 25000 ~21K;
 // 10000 and less showed in wide views.
 static const int kPlusBiancoFar = 20000;
-// autorun.txt buttons = <seconds>:<keys>,... (keys A B X Y L R START SELECT UP DOWN LEFT RIGHT,
-// joined by '+'): those buttons held for 0.25 s from that many seconds after launch (pad_3ds.c,
-// pad3ds_script). shots = <seconds>,...: the frame drawn then saved as sdmc:/sms/shot-<tenths of a
+// autorun.txt buttons = <seconds>:<keys>[:<hold seconds>],... (keys A B X Y L R START SELECT UP
+// DOWN LEFT RIGHT, the Circle Pad pushed all the way SUP SDOWN SLEFT SRIGHT, the C-stick CUP CDOWN
+// CLEFT CRIGHT, joined by '+'): those held for 0.25 s (or the hold given) from that many seconds
+// after launch (pad_3ds.c, pad3ds_script). shots = <seconds>,...: the frame drawn then saved as sdmc:/sms/shot-<tenths of a
 // second>.ppm (pica_draw.c).
 struct ScriptPress {
-	float at;
+	float at, hold;
 	u32 keys;
 };
 static ScriptPress s_press[64];
@@ -97,8 +100,11 @@ static float s_shotAt[64];
 static int s_nShot, s_shotNext;
 static float s_newStageAt[16];  // autorun.txt new_stage_at = <seconds>,...: the renderer told a new stage loads (testing)
 static int s_nNewStage, s_newStageNext;
+static float s_memTestAt = -1.0f;  // autorun.txt mem_test = <seconds>: the heap run out then (the reserve's path, testing)
 static float s_cpuPathAt = -1.0f;  // autorun.txt cpu_path_at = <seconds>: the CPU vertex path from then on (comparing the paths)
 static float s_traceAt = -1.0f;  // autorun.txt trace_at = <seconds>: that frame's GX commands traced (sdmc:/sms/trace-N.txt)
+static float s_goopDumpAt = -1.0f;  // autorun.txt goop_dump_at = <seconds>: each map's next readback written (sdmc:/sms/goop-<address>.pgm)
+extern "C" void pica_request_goop_dumps(void);  // pica_draw.c
 static u64 s_launchMs;
 extern "C" void pica_request_shot(int id);  // pica_draw.c
 static u32 script_keys(const char* s)
@@ -108,7 +114,9 @@ static u32 script_keys(const char* s)
 		u32 key;
 	} kKeys[] = {{"A", KEY_A},         {"B", KEY_B},          {"X", KEY_X},         {"Y", KEY_Y},
 	             {"L", KEY_L},         {"R", KEY_R},          {"START", KEY_START}, {"SELECT", KEY_SELECT},
-	             {"UP", KEY_DUP},      {"DOWN", KEY_DDOWN},   {"LEFT", KEY_DLEFT},  {"RIGHT", KEY_DRIGHT}};
+	             {"UP", KEY_DUP},      {"DOWN", KEY_DDOWN},   {"LEFT", KEY_DLEFT},  {"RIGHT", KEY_DRIGHT},
+	             {"SUP", KEY_CPAD_UP}, {"SDOWN", KEY_CPAD_DOWN}, {"SLEFT", KEY_CPAD_LEFT}, {"SRIGHT", KEY_CPAD_RIGHT},
+	             {"CUP", KEY_CSTICK_UP}, {"CDOWN", KEY_CSTICK_DOWN}, {"CLEFT", KEY_CSTICK_LEFT}, {"CRIGHT", KEY_CSTICK_RIGHT}};
 	u32 keys = 0;
 	while (*s) {
 		size_t n = strcspn(s, "+");
@@ -261,8 +269,20 @@ static SceneState read_scene()
 
 // Logs once a second, and at once whenever the state, area, movie or director changes.
 // frames and batches are GX3DS_GetStats totals; draws/frame is over the time since the last line.
+// autorun.txt flags_on = <flag>,...: those game flags kept set (testing: Delfino Plaza's gates
+// open without a save that has them, flags 0x10385 to 0x10387; TModelGate::loadAfter).
+class TFlagManager {
+public:
+	static TFlagManager* smInstance;
+	void setBool(bool value, u32 flag);
+};
+static u32 s_flagsOn[16];
+static int s_nFlagsOn;
+
 static void log_scene(uint32_t frames, uint32_t batches)
 {
+	if (TFlagManager* fm = TFlagManager::smInstance)
+		for (int i = 0; i < s_nFlagsOn; i++) fm->setBool(true, s_flagsOn[i]);
 	static uint32_t last_frames, last_batches;
 	static SceneState last;
 	static bool have_last;
@@ -440,6 +460,16 @@ static const char kDefaultSettings[] =
     "# original (off). The same vertices, bit for bit; on saves most of its exact sines.\n"
     "sea_precomputed = on\n"
     "\n"
+    "# Materials the renderer's stage-by-stage translation gets wrong (NPCs' colours, the Shine\n"
+    "# Gate's graffiti, the hot Chain Chomp) compiled through their algebra and checked against the\n"
+    "# GameCube's arithmetic (on), or drawn as translated (off).\n"
+    "tev_compiler = on\n"
+    "\n"
+    "# Draws with projective texgens (the sea's and Bowser's hot tub's lookups of the screen) on the\n"
+    "# GPU path through a second shader (on), or on the CPU path (off). Not working yet: its first\n"
+    "# try locked a New 3DS's GPU up at the title screen, and the title's sky still comes out black.\n"
+    "# gpu_projective = off\n"
+    "\n"
     "# The news ticker's glyphs wholly outside its window left out (on), or every glyph of the\n"
     "# message drawn each frame as the original (off). The same pixels: the window's scissor\n"
     "# leaves nothing of a glyph outside it.\n"
@@ -465,7 +495,13 @@ static const char kDefaultSettings[] =
 #ifndef SMS3DS_MIPS_DEFAULT
 #define SMS3DS_MIPS_DEFAULT 1
 #endif
+#ifndef SMS3DS_ETC1_DEFAULT  // etc1_textures when settings.txt does not say (Makefile ETC1=1: on)
+#define SMS3DS_ETC1_DEFAULT 0
+#endif
 extern "C" void GX3DS_SetMips(int on);
+extern "C" void GX3DS_SetEtc1(int on);  // gx3ds_backend.cpp: settings.txt etc1_textures
+extern "C" void GX3DS_SetTevCompiler(int on);  // gx3ds_backend.cpp: settings.txt tev_compiler
+extern "C" int pica_set_projective_shader(int on);  // pica_draw.c: settings.txt gpu_projective
 // The game's GX state resets as precomputed blocks (sms-pc-port patch 0031; settings.txt gx_state_blocks).
 #ifndef SMS3DS_STATE_BLOCKS_DEFAULT
 #define SMS3DS_STATE_BLOCKS_DEFAULT 1
@@ -504,6 +540,7 @@ extern "C" void SMS3DS_ProfLiteSteps(void);     // ... profile_steps = lite
 extern "C" void SMS3DS_SetLite(int on, int drawDist, int shadowDist);  // prof_3ds.cpp: settings.txt lite
 extern "C" void SMS3DS_SetStageFar(int stage, int dist);  // ... lite_stage_draw_distance
 extern "C" void SMS3DS_SetLiteParts(int particles, int seaStep, int actorDist, int shineOff);
+extern "C" void SMS3DS_SetLiteMantaShadows(int n);  // prof_3ds.cpp: settings.txt lite_manta_shadows
 extern "C" void SMS3DS_ProfLitePlusSteps(void);  // ... profile_steps = liteplus
 extern "C" void SMS3DS_ProfLightingSteps(void);  // ... profile_steps = lighting
 extern "C" void GX3DS_SetGxPoll(int on);        // gx3ds_backend.cpp: settings.txt gx_poll
@@ -703,6 +740,9 @@ static void* game_thread(void*)
 			const int ad = setting_value(kSettingsPath, "lite_actor_distance", v, sizeof v) ? atoi(v) : -1;
 			const int so = setting_value(kSettingsPath, "lite_shine_shadow", v, sizeof v) ? strcmp(v, "off") == 0 : plus ? 1 : -1;
 			SMS3DS_SetLiteParts(pn, ss, ad, so);
+			// lite_manta_shadows = N: the Phantamanta's shadow volumes (Sirena Beach) for only the N mantas
+			// nearest Mario (default 8; 0: all of them, as the game).
+			SMS3DS_SetLiteMantaShadows(setting_value(kSettingsPath, "lite_manta_shadows", v, sizeof v) ? atoi(v) : -1);
 			// lite_stage_draw_distance = <stage>:<distance>,...: a stage's own draw distance in place of
 			// lite_draw_distance (0: no limit; stages as the log's [scene] area= gives them: 0 Delfino
 			// Airstrip, 1 Delfino Plaza, 2 Bianco Hills, 3 Ricco Harbor). lite = plus gives Bianco Hills
@@ -731,6 +771,39 @@ static void* game_thread(void*)
 		}
 		if (setting_value(kAutoPath, "skip_movies", v, sizeof v) && strcmp(v, "on") == 0)
 			setenv("SMS_SKIP_MOVIES", "1", 1);
+		// etc1_textures = on: CMPR textures as ETC1 (ETC1A4 with alpha): less memory, more of them in VRAM,
+		// some loss of quality. Off by default (on in Makefile ETC1=1 builds); off turns it off there.
+		{
+			int etc1 = SMS3DS_ETC1_DEFAULT;
+			if (setting_value(kAutoPath, "etc1_textures", v, sizeof v) || setting_value(kSettingsPath, "etc1_textures", v, sizeof v))
+				etc1 = strcmp(v, "on") == 0;
+			GX3DS_SetEtc1(etc1);
+			fprintf(stderr, "[3ds] CMPR textures: %s (etc1_textures)\n", etc1 ? "as ETC1" : "as decoded (RGB565 or RGBA5551)");
+		}
+		// tev_compiler = off: materials drawn as the stage-by-stage translation gives them, never
+		// compiled through their algebra (gx3ds_tevsym.cpp; on by default).
+		{
+			const bool tevc = !((setting_value(kAutoPath, "tev_compiler", v, sizeof v) ||
+			                     setting_value(kSettingsPath, "tev_compiler", v, sizeof v)) &&
+			                    strcmp(v, "off") == 0);
+			GX3DS_SetTevCompiler(tevc);
+			fprintf(stderr, "[3ds] materials the translation gets wrong: %s (tev_compiler)\n",
+			        tevc ? "compiled through their algebra" : "drawn as translated");
+		}
+		// gpu_projective = on: draws with projective texgens (the screen-copy lookups of the sea and of
+		// Bowser's hot tub's water) on the GPU path, through shaders/gx_proj.v.pica. Not working yet:
+		// the first try of it locked a New 3DS's GPU up at the title screen, and in Azahar the title's
+		// sky still comes out black. Off: the CPU path.
+		if ((setting_value(kAutoPath, "gpu_projective", v, sizeof v) || setting_value(kSettingsPath, "gpu_projective", v, sizeof v)) &&
+		    strcmp(v, "on") == 0) {
+			const int ok = pica_set_projective_shader(1);
+			fprintf(stderr, "[3ds] projective texgens: %s (gpu_projective)\n", ok ? "on the GPU path (gx_proj shader)" : "shader not loaded: CPU path");
+		}
+		// autorun.txt vram_textures = off: every texture drawn from FCRAM, as holding ZL at launch (testing).
+		if (setting_value(kAutoPath, "vram_textures", v, sizeof v) && strcmp(v, "off") == 0) {
+			pica_set_vram_textures(0);
+			fprintf(stderr, "[3ds] autorun.txt: textures in FCRAM only (no VRAM textures)\n");
+		}
 		if (setting_value(kAutoPath, "quit_after", v, sizeof v)) s_quitAfter = atoi(v);
 		// renderer_log = on: the renderer's once-per-kind [tevdump], [tev] and [copy] lines (as holding
 		// X at launch, without the goop map files).
@@ -754,15 +827,22 @@ static void* game_thread(void*)
 					char* c = strchr(p, ':');
 					if (!c) continue;
 					*c = 0;
-					s_press[s_nPress++] = ScriptPress{float(atof(p)), script_keys(c + 1)};
+					char* h = strchr(c + 1, ':');
+					if (h) *h = 0;
+					s_press[s_nPress++] = ScriptPress{float(atof(p)), h ? float(atof(h + 1)) : 0.25f, script_keys(c + 1)};
 				}
 			if (setting_value(kAutoPath, "shots", list, sizeof list))
 				for (char* p = strtok(list, ","); p && s_nShot < 64; p = strtok(nullptr, ",")) s_shotAt[s_nShot++] = float(atof(p));
 			if (setting_value(kAutoPath, "trace_at", list, sizeof list)) s_traceAt = float(atof(list));
+			if (setting_value(kAutoPath, "goop_dump_at", list, sizeof list)) s_goopDumpAt = float(atof(list));
 			if (setting_value(kAutoPath, "cpu_path_at", list, sizeof list)) s_cpuPathAt = float(atof(list));
+			if (setting_value(kAutoPath, "mem_test", list, sizeof list)) s_memTestAt = float(atof(list));
 			if (setting_value(kAutoPath, "new_stage_at", list, sizeof list))
 				for (char* p = strtok(list, ","); p && s_nNewStage < 16; p = strtok(nullptr, ","))
 					s_newStageAt[s_nNewStage++] = float(atof(p));
+			if (setting_value(kAutoPath, "flags_on", list, sizeof list))
+				for (char* p = strtok(list, ","); p && s_nFlagsOn < 16; p = strtok(nullptr, ","))
+					s_flagsOn[s_nFlagsOn++] = (u32)strtoul(p, nullptr, 0);
 			if (s_nPress || s_nShot)
 				fprintf(stderr, "[3ds] autorun.txt: %d scripted button presses, %d screenshots\n", s_nPress, s_nShot);
 		}
@@ -958,8 +1038,50 @@ void __libctru_exit(int rc)
 }
 }
 
+// Out of heap (an operator new with no room). After two hours of play a console's heap was taken to
+// 85 of its 86 MB, 71 MB in use and the rest in pieces, and recording Pianta Village's display lists
+// found no block for a buffer: std::bad_alloc ended the game. A reserve is held from the start: the
+// first failure gives it back (the allocation is tried again, in its room), and the GX thread then
+// empties its caches between two frames, as for a new stage, and takes the reserve again
+// (SMS3DS_MemReserveSpent, SMS3DS_MemReserveRestore). Only with the reserve spent does the
+// allocation fail as before (the process ends: the [3ds] exiting lines name the thread and its stack).
+static const size_t kMemReserve = 4u << 20;
+static void* s_memReserve;
+static volatile int s_memReserveSpent;
+static void out_of_memory()
+{
+	const struct mallinfo mi = mallinfo();
+	if (s_memReserve) {
+		free(s_memReserve);
+		s_memReserve = nullptr;
+		s_memReserveSpent = 1;
+		fprintf(stderr, "[mem] out of memory (%lu KB in use, arena %lu of %lu KB): the %lu KB reserve given back, the caches "
+		        "to be emptied\n", (unsigned long)mi.uordblks >> 10, (unsigned long)mi.arena >> 10,
+		        (unsigned long)__ctru_heap_size >> 10, (unsigned long)(kMemReserve >> 10));
+		return;  // (operator new tries again)
+	}
+	fprintf(stderr, "[mem] out of memory: %lu KB in use, arena %lu of %lu KB (the rest free in pieces too small), no reserve left\n",
+	        (unsigned long)mi.uordblks >> 10, (unsigned long)mi.arena >> 10, (unsigned long)__ctru_heap_size >> 10);
+	fflush(stderr);
+	std::set_new_handler(nullptr);
+}
+// The GX thread (gx3ds_backend.cpp), between two frames: whether the reserve went, and taking it again
+// once its caches are emptied.
+extern "C" int SMS3DS_MemReserveSpent(void) { return s_memReserveSpent; }
+extern "C" void SMS3DS_MemReserveRestore(void)
+{
+	if (s_memReserve) return;
+	s_memReserve = malloc(kMemReserve);
+	const struct mallinfo mi = mallinfo();
+	fprintf(stderr, "[mem] caches emptied: %lu KB in use, arena %lu KB; the reserve %s\n", (unsigned long)mi.uordblks >> 10,
+	        (unsigned long)mi.arena >> 10, s_memReserve ? "taken again" : "not taken again (no room): the next failure ends the game");
+	if (s_memReserve) s_memReserveSpent = 0;
+}
+
 int main()
 {
+	std::set_new_handler(out_of_memory);
+	s_memReserve = malloc(kMemReserve);
 	s_launchMs = osGetTime();
 	svcGetThreadId(&s_mainThreadId, CUR_THREAD_HANDLE);  // (__appExit: who ended the process)
 	osSetSpeedupEnable(true);
@@ -1181,20 +1303,34 @@ int main()
 		// presses before hidKeysDown() saw them). START alone is the game's Start button, so quitting
 		// needs START+SELECT.
 		hidScanInput();
-		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_cpuPathAt >= 0.0f || s_nNewStage) {  // autorun.txt timed keys
+		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_goopDumpAt >= 0.0f || s_cpuPathAt >= 0.0f || s_nNewStage) {  // autorun.txt timed keys
 			const float t = float(osGetTime() - s_launchMs) / 1000.0f;
 			while (s_newStageNext < s_nNewStage && t >= s_newStageAt[s_newStageNext]) s_newStageNext++, GX3DS_NewStage();
 			if (s_cpuPathAt >= 0.0f && t >= s_cpuPathAt) {
 				GX3DS_SetGpuTransform(0);
 				s_cpuPathAt = -1.0f;
 			}
+			if (s_memTestAt >= 0.0f && t >= s_memTestAt) {
+				s_memTestAt = -1.0f;
+				// Megabytes taken until operator new finds no room (out_of_memory gives the reserve back
+				// and the last one is placed in it), then all given back: the game goes on.
+				static char* blocks[128];
+				int n = 0;
+				while (n < 128 && !s_memReserveSpent) blocks[n++] = new (std::nothrow) char[1u << 20];
+				for (int i = 0; i < n; i++) delete[] blocks[i];
+				fprintf(stderr, "[mem] test: %d MB taken before the heap ran out, given back\n", n);
+			}
 			if (s_traceAt >= 0.0f && t >= s_traceAt) {
 				GX3DS_TraceNextFrame();
 				s_traceAt = -1.0f;
 			}
+			if (s_goopDumpAt >= 0.0f && t >= s_goopDumpAt) {
+				pica_request_goop_dumps();
+				s_goopDumpAt = -1.0f;
+			}
 			u32 keys = 0;
 			for (int i = 0; i < s_nPress; i++)
-				if (t >= s_press[i].at && t < s_press[i].at + 0.25f) keys |= s_press[i].keys;
+				if (t >= s_press[i].at && t < s_press[i].at + s_press[i].hold) keys |= s_press[i].keys;
 			pad3ds_script = keys;
 			while (s_shotNext < s_nShot && t >= s_shotAt[s_shotNext]) pica_request_shot(int(s_shotAt[s_shotNext++] * 10.0f + 0.5f));
 		}

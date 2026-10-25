@@ -15,6 +15,7 @@
 // Interface is sms-pc-port's (MIT), the implementation is independent.
 #include "gx_internal.h"
 #include "../pica/pica_draw.h"
+#include "gx3ds_tevsym.h"
 #include <malloc.h>
 
 #include <math.h>
@@ -49,10 +50,19 @@ static bool s_ready;
 // settings.txt mipmaps).
 static bool s_mipsOn = true;
 extern "C" void GX3DS_SetMips(int on) { s_mipsOn = on != 0; }
+static bool s_etc1On;  // settings.txt etc1_textures (textureForMap)
+extern "C" void GX3DS_SetEtc1(int on) { s_etc1On = on != 0; }
+static bool s_tevSymOn = true;  // settings.txt tev_compiler (tevSymImprove)
+extern "C" void GX3DS_SetTevCompiler(int on) { s_tevSymOn = on != 0; }
 static uint64_t s_arenaDrawVerts, s_arenaUploadBytes; // resident vertices drawn, stored (display-list arena)
 // [perf]: the TEV cache's hits, misses and clears, and drawTriangles' TEV time by part: the
 // registers read (readTev), the state, key and lookup, the translation (misses), the rest.
 static uint64_t s_tevHits, s_tevMisses, s_tevClears, s_tevPartTicks[4];
+static uint32_t s_tevSymChecks, s_tevSymCompiles, s_tevSymUsed;  // tevSymImprove: checks, compiles, compiled setups drawn
+// Pixel metrics (pixMetricCount): counting since a clear (GX thread), its pixels passed and
+// triangles; the value a draw-sync callback reads (game thread, streamTokenPoll).
+static bool s_pmActive, s_pmInToken;
+static uint32_t s_pmCount, s_pmTris, s_pmTokenValue;
 static uint32_t s_tevEntries;
 // Vertex reuse in the resident runs drawn (runReuse): what the GPU's post-transform vertex cache
 // could save with duplicate vertices merged. Indices, vertices stored, then the run stats.
@@ -270,6 +280,9 @@ extern "C" float GXPC_CullFar;  // patch 0051: the profiler's far-geometry ceili
 extern "C" uint32_t GXPC_CullFarRuns, GXPC_CullFarVerts;
 static uint32_t s_perfCullRuns0, s_perfCullVerts0;
 extern "C" size_t GXPC_DlCacheBytes(void);
+extern "C" uint32_t GXPC_J3DPkgBytes(void);  // sms-port patch 0053: the compiled shapes' memory
+extern "C" __attribute__((weak)) int SMS3DS_MemReserveSpent(void);  // main.cpp: the heap's reserve given back
+extern "C" __attribute__((weak)) void SMS3DS_MemReserveRestore(void);
 extern "C" uint32_t GXPC_DlEntryCount(void);
 extern "C" int GXPC_DlCacheClearNow(void);  // gx_fifo.cpp (sms-port patch 0052)
 extern "C" uint32_t GXPC_DlFail[7];  // patch 0009: why cached lists could not be reused
@@ -373,6 +386,7 @@ static bool streamOn();
 static void streamPerf(uint64_t& gameWait, double perMs, bool print);
 
 static void texInventory(double frames);  // [perf]: textures drawn from outside VRAM (below)
+static void perfHostMemory();  // [perf]: the host side's caches on the heap (below)
 static void perfFrameEnd() {
 	const uint64_t now = svcGetSystemTick();
 	if (!s_perfWindowStart) {
@@ -461,6 +475,13 @@ static void perfFrameEnd() {
 			fprintf(stderr, "[perf]   state lists' register words check: %u lists so far replayed both ways, %u differing\n",
 			        (unsigned)GXPC_FastListStats[0], (unsigned)GXPC_FastListStats[1]);
 		}
+		static uint32_t sc0, sp0, su0;
+		if (s_tevSymChecks != sc0 || s_tevSymCompiles != sp0)
+			fprintf(stderr, "[perf]   TEV compiler: %u setups checked, %u compiled, %u compiled ones drawn (per %.0f frames)\n",
+			        s_tevSymChecks - sc0, s_tevSymCompiles - sp0, s_tevSymUsed - su0, frames);
+		sc0 = s_tevSymChecks;
+		sp0 = s_tevSymCompiles;
+		su0 = s_tevSymUsed;
 		sd0 = s_drawsSameState;
 		dc0 = s_drawsCounted;
 		df0 = s_drawsFast;
@@ -630,6 +651,7 @@ static void perfFrameEnd() {
 		        (GXPC_DrawSyncCalls - s_perfDsCalls0) / frames, double(GXPC_DrawSyncTicks - s_perfDsTicks0) * perMs,
 		        double(port_os_switches() - s_perfSwitches0) / frames, port_os_live_hosts(), pica_kernel_threads(),
 		        (unsigned long)mallinfo().uordblks >> 10, (unsigned long)mallinfo().arena >> 10, __ctru_heap_size >> 10);
+		perfHostMemory();
 		s_perfDsCalls0 = GXPC_DrawSyncCalls;
 		s_perfDsTicks0 = GXPC_DrawSyncTicks;
 		s_perfSwitches0 = port_os_switches();
@@ -677,6 +699,12 @@ static void perfFrameEnd() {
 			        unsigned(vN), unsigned(vKB), unsigned(lN), unsigned(lKB), unsigned(vFree), (unsigned long)pica_vram_copies(),
 			        (unsigned long)pica_vram_evicted(), (unsigned long)pica_vram_animated(), unsigned(aUsed), unsigned(aSize),
 			        unsigned(aPeak));
+			uint32_t eN, eKB, eEnc;
+			float eMs, eDb;
+			pica_etc1_stats(&eN, &eKB, &eEnc, &eMs, &eDb);
+			if (eN || eEnc)
+				fprintf(stderr, "[perf]   ETC1 textures: %u (%u KB) | %lu encoded so far, in %.0f ms, %.1f dB against the decoded texels\n",
+				        unsigned(eN), unsigned(eKB), (unsigned long)eEnc, double(eMs), double(eDb));
 			texInventory(frames);
 		}
 		renderThreadPerf(frames);
@@ -795,6 +823,15 @@ static inline float xff(int r) {
 	memcpy(&f, &rs.xfReg[r], 4);
 	return f;
 }
+
+// GX rows per EFB row: 1, except in a pass whose viewport reaches past the EFB's last row, which
+// is drawn squeezed into the EFB's rows (the goop maps, 512 rows tall in Pianta Village and on
+// Delfino Airstrip, drawn in a 512x512 viewport and copied back texel for texel: the GameCube's
+// EFB has 528 rows). Its scissor, copy and clear rectangles are squeezed the same way.
+static float efbRowScale() {
+	const float bottom = xff(XFR_VIEWPORT + 4) - 342.0f + fabsf(xff(XFR_VIEWPORT + 1));
+	return bottom > PICA_EFB_HEIGHT + 2.0f ? bottom / float(PICA_EFB_HEIGHT) : 1.0f;
+}
 // XF memory's normal matrices: 3x3 each, matrix k's rows at 0x400 + 9 k (GXLoadNrmMtxImm's 0x400 + 3 id).
 // (sms-pc-port's renderer copies them to word 256 of its own block, gx_render.cpp; XF memory itself
 // has nothing there: until 2026-10-23 every lit draw here read zero normals.)
@@ -839,8 +876,9 @@ static void currentPicaState(PicaState& st) {
 	// Scissor (BP 0x20/0x21: coordinates + 342), off when it covers the EFB.
 	{
 		const uint32_t tl = rs.bp[BP_SCISSOR_TL], br = rs.bp[BP_SCISSOR_BR];
-		int top = int(tl & 0x7FF) - 342, left = int((tl >> 12) & 0x7FF) - 342;
-		int bottom = int(br & 0x7FF) - 342 + 1, right = int((br >> 12) & 0x7FF) - 342 + 1;
+		const float rows = efbRowScale();
+		int top = int(float(int(tl & 0x7FF) - 342) / rows), left = int((tl >> 12) & 0x7FF) - 342;
+		int bottom = int(ceilf(float(int(br & 0x7FF) - 342 + 1) / rows)), right = int((br >> 12) & 0x7FF) - 342 + 1;
 		auto clampi = [](int v, int hi) { return v < 0 ? 0 : v > hi ? hi : v; };
 		left = clampi(left, PICA_EFB_WIDTH), right = clampi(right, PICA_EFB_WIDTH);
 		top = clampi(top, PICA_EFB_HEIGHT), bottom = clampi(bottom, PICA_EFB_HEIGHT);
@@ -958,6 +996,7 @@ struct TexEntry {
 	uint32_t hashedFrame = 0, hashedClock = 0;  // when the data was last hashed (write-stamp clock)
 	int levels = 1;                              // mip levels uploaded
 	uint32_t draws = 0, draws0 = 0;              // draws that sampled it, so far and at the last report
+	uint32_t uploadFrame = 0;                    // when it was last uploaded
 };
 static std::unordered_map<TexKey, TexEntry, TexKeyHash> s_texCache;
 static uint32_t s_texBytes;
@@ -977,12 +1016,14 @@ struct EfbCopy {
 	uint32_t usedFrame;
 	uint32_t clock;  // writeClock() at the latest copy: CPU writes to dest after it make the snapshot stale
 	uint32_t fmt;    // copy texture format (1, 7-10: one byte a texel, a map such as the goop's)
+	bool reduced;    // at half its size: no VRAM was left for its own (see the copy below)
 };
 static std::vector<EfbCopy> s_efbCopies;
-// pica_draw.c's copy_reserve counts on this many. Bianco Hills copies to 7 destinations a frame
-// (5 goop maps, a 256x256 RGB5A3 copy, the screen texture): with fewer, one was replaced every
-// frame, and the replaced ones' textures, freed two frames late, ran VRAM out.
-static const size_t kMaxEfbCopies = 8;
+// Bianco Hills copies to 7 destinations a frame (5 goop maps, a 256x256 RGB5A3 copy, the screen
+// texture), Noki Bay to 11 (8 goop maps of 32x32 to 256x256): with fewer kept, some were replaced
+// every frame, and a goop map whose copy texture goes is drawn from its memory, two frames behind
+// (its last frame's cleaning lost: the goop never went). The copy arena (pica_draw.c) holds them.
+static const size_t kMaxEfbCopies = 16;
 static const uintptr_t kStampPage = 4096;  // the write stamps' granule (sms-pc-port's gx_fifo.cpp, kStampShift)
 
 // Logs each distinct kind of EFB copy once (destination, rectangle, format, flags).
@@ -998,7 +1039,8 @@ static void logCopyKind(const EfbCopy* c, uint32_t ctrl, uint32_t pix) {
 	fprintf(stderr,
 	        "[copy] dest %p rect %d,%d %dx%d fmt %u intensity %d half %d clear %d (AR %04x GB %04x) efb-pixfmt %u%s\n",
 	        c->dest, int(c->x), int(c->y), int(c->w), int(c->h), fmt, ((ctrl >> 15) & 3) == 3, (ctrl >> 9) & 1,
-	        (ctrl >> 11) & 1, rs.bp[BP_CLEAR_AR] & 0xFFFF, rs.bp[BP_CLEAR_GB] & 0xFFFF, pix, pix == 3 ? " (Z copy: not supported, colour copied)" : "");
+	        (ctrl >> 11) & 1, rs.bp[BP_CLEAR_AR] & 0xFFFF, rs.bp[BP_CLEAR_GB] & 0xFFFF, pix,
+	        pix == 3 ? (fmt == 6 ? " (Z copy: from the depth buffer, read back)" : " (Z copy: not supported, colour copied)") : "");
 }
 
 // GX coordinates (s, t) of a copy to its texture's: (s * as + bs, t * at + bt).
@@ -1020,6 +1062,36 @@ static EfbCopy* findEfbCopy(const void* p) {
 	for (EfbCopy& c : s_efbCopies)
 		if (c.dest == p) return &c;
 	return nullptr;
+}
+
+// A line about a copy destination, once per destination (a few of them).
+static void logCopyOnce(const void* d, const char* what, unsigned tw, unsigned th) {
+	static const void* s_said[16];
+	int i = 0;
+	while (i < 16 && s_said[i] && s_said[i] != d) i++;
+	if (i == 16 || s_said[i]) return;
+	s_said[i] = d;
+	fprintf(stderr, "[copy] dest %p (a %ux%u copy texture): %s\n", d, tw, th, what);
+}
+
+// A copy with no texture at all: its destination zeroed once (draws read the memory there), so
+// what they sample is nothing rather than whatever the heap held, as on Azahar, whose memory starts
+// zeroed. The GX size of the copy's format, so nothing past the destination is touched.
+static void lostCopy(const void* d, uint32_t cfmt, bool half, float rw, float rh, unsigned tw, unsigned th) {
+	static const void* s_zeroed[16];
+	int i = 0;
+	while (i < 16 && s_zeroed[i] && s_zeroed[i] != d) i++;
+	if (i == 16 || s_zeroed[i]) return;
+	s_zeroed[i] = d;
+	static const uint8_t kTexFmt[13] = {0, 1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 3, 3};  // copy format -> GX texture format
+	const uint32_t dw = uint32_t(half ? rw / 2 : rw), dh = uint32_t(half ? rh / 2 : rh);
+	const uint32_t bytes = cfmt < 13 ? texLevelBytes(kTexFmt[cfmt], dw, dh) : 0;
+	if (bytes) {
+		memset(const_cast<void*>(d), 0, bytes);
+		memoryWritten(d, bytes);
+	}
+	fprintf(stderr, "[copy] dest %p: no VRAM for a %ux%u copy texture, nor half that: lost, its %lu bytes zeroed once\n", d, tw,
+	        th, (unsigned long)bytes);
 }
 
 static inline uint32_t pow2Side(uint32_t v) {
@@ -1049,9 +1121,15 @@ static inline uint32_t morton8(uint32_t x, uint32_t y) {
 	return (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
 }
 
+static void i8ToLa8(const uint8_t* src, uint32_t w, uint32_t h, uint16_t* dst, uint32_t pw, uint32_t ph);
 static void uploadI8(const uint8_t* src, uint32_t w, uint32_t h, PicaTex* t, uint32_t pw, uint32_t ph) {
 	uint16_t* dst = static_cast<uint16_t*>(pica_tex_data(t));
 	if (!dst) return;
+	i8ToLa8(src, w, h, dst, pw, ph);
+	pica_tex_written(t);
+}
+// An I8 texture as LA8 (I, I) in the PICA's layout, resampled (nearest) to pw x ph.
+static void i8ToLa8(const uint8_t* src, uint32_t w, uint32_t h, uint16_t* dst, uint32_t pw, uint32_t ph) {
 	const uint32_t tileCols = (w + 7) / 8;
 	static std::vector<uint32_t> colSrc, colDst;  // per output column: source offset within a tile row, destination
 	colSrc.resize(pw);
@@ -1071,7 +1149,6 @@ static void uploadI8(const uint8_t* src, uint32_t w, uint32_t h, PicaTex* t, uin
 			drow[colDst[x] + morton8(x & 7, my)] = uint16_t(i | i << 8);
 		}
 	}
-	pica_tex_written(t);
 }
 
 // The smallest PICA texel format that holds decoded RGBA8 texels as they are (L8 and LA8 when
@@ -1101,14 +1178,16 @@ static int smallTexFormat(const uint8_t* px, size_t n, uint32_t fmt, uint32_t tl
 // and the ones drawn most (draws a frame, with their size): which ones a VRAM copy would help.
 // Render thread (perfFrameEnd).
 static void texInventory(double frames) {
-	static const char* const kFmt[] = {"RGBA8", "RGB565", "RGBA5551", "RGBA4", "LA8", "L8"};
+	static const char* const kFmt[] = {"RGBA8", "RGB565", "RGBA5551", "RGBA4", "LA8", "L8", "ETC1", "ETC1A4"};
+	const int kFmts = int(sizeof kFmt / sizeof kFmt[0]);  // (PICA_TF_*: the ETC1 two overran a table of six, crash dump 48)
 	struct Row {
 		uint32_t w, h, kb, gxFmt;
 		int fmt, levels, where;
 		double draws;
 	};
 	std::vector<Row> rows;
-	double kb[6][2] = {}, n[6][2] = {}, kept = 0, keptKB = 0;
+	double kb[8][2] = {}, n[8][2] = {}, kept = 0, keptKB = 0;
+	static_assert(sizeof kb / sizeof kb[0] == sizeof kFmt / sizeof kFmt[0], "a row per PICA_TF_* format");
 	for (auto& kv : s_texCache) {
 		TexEntry& e = kv.second;
 		const uint32_t d = e.draws - e.draws0;
@@ -1117,6 +1196,7 @@ static void texInventory(double frames) {
 		const int where = pica_tex_where(e.tex);
 		if (where == 1) continue;
 		const int f = pica_tex_format(e.tex);
+		if (f < 0 || f >= kFmts) continue;
 		const uint32_t k = pica_tex_bytes(e.tex) >> 10;
 		if (where == 2) {
 			kept++;
@@ -1128,7 +1208,7 @@ static void texInventory(double frames) {
 	}
 	char line[600];
 	int at = 0;
-	for (int f = 0; f < 6; f++)
+	for (int f = 0; f < kFmts; f++)
 		for (int m = 0; m < 2; m++)
 			if (n[f][m])
 				at += snprintf(line + at, sizeof line - at, "%s %s%s %.0f (%.0f KB)", at ? "," : "", kFmt[f],
@@ -1175,6 +1255,9 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 			}
 		}
 		if (inner) {
+			if (s_tracing)
+				fprintf(tf(), "[trace]   copy to %p (fmt %u) dropped: its memory was written after the copy (copy clock %lu, now %lu)\n",
+				        ptr, unsigned(c->fmt), (unsigned long)c->clock, (unsigned long)writeClock());
 			pica_tex_free(c->tex);
 			s_efbCopies.erase(s_efbCopies.begin() + (c - s_efbCopies.data()));
 			s_rsGen++;
@@ -1266,6 +1349,11 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		}
 		src = s_decodeBuf.data();
 		tf = smallTexFormat(src, total / 4, fmt, key.tlutFmt);
+		// settings.txt etc1_textures = on: CMPR textures (already 4 bits a texel, lossy) as ETC1, a
+		// quarter of RGB565's memory, or ETC1A4 with alpha, half of RGBA5551's: more of them fit in
+		// VRAM, at a second lossy step. Not for data rewritten lately (each upload is an encode).
+		if (s_etc1On && fmt == 14 && (!e.tex || s_rFrames - e.uploadFrame > 300))
+			tf = tf == PICA_TF_RGB565 || tf == PICA_TF_L8 ? PICA_TF_ETC1 : PICA_TF_ETC1A4;
 	} else {
 		tf = PICA_TF_LA8;
 	}
@@ -1289,6 +1377,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		uploadI8(ptr, w, h, e.tex, pw, ph);
 		e.dataHash = dh;
 		e.tlutHash = th;
+		e.uploadFrame = s_rFrames;
 		s_texUploads++;
 		evictTextures();
 		return e.tex;
@@ -1318,9 +1407,65 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	}
 	e.dataHash = dh;
 	e.tlutHash = th;
+	e.uploadFrame = s_rFrames;
 	s_texUploads++;
 	evictTextures();
 	return e.tex;
+}
+
+// For the draw trace: whether map's texture still holds what the game's data makes of it (its
+// level 0 as the GPU reads it, against a fresh conversion), whether that data changed since it
+// was uploaded (the cache missed a write), and where the texture lives.
+static void traceTexCheck(FILE* out, int u, int map, PicaTex* t) {
+	const uint32_t img0 = rs.bp[bpTexReg(BP_TX_IMAGE0, map)], tlutReg = rs.bp[bpTexReg(BP_TX_TLUT, map)];
+	const uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
+	const uint8_t* ptr = rs.texImage[map];
+	if (!t || !ptr) return;
+	static std::vector<PicaTex*> s_checked;  // each texture once per traced frame
+	static uint32_t s_checkedFrame = ~0u;
+	if (s_checkedFrame != s_rFrames) {
+		s_checked.clear();
+		s_checkedFrame = s_rFrames;
+	}
+	if (std::find(s_checked.begin(), s_checked.end(), t) != s_checked.end()) return;
+	s_checked.push_back(t);
+	const bool ci = fmt == 8 || fmt == 9 || fmt == 10;
+	const TexKey key{ptr, fmt, w, h, ci ? (tlutReg & 0x3FF) : 0, ci ? ((tlutReg >> 10) & 3) : 0};
+	const uint8_t* tlut = ci ? rs.tlutMem + ((tlutReg & 0x3FF) << 9) : nullptr;
+	auto it = s_texCache.find(key);
+	const char* data = "not in the cache";
+	if (it != s_texCache.end() && it->second.tex == t)
+		data = it->second.dataHash == 0                          ? "data not hashed at upload"
+		       : hashBytes(ptr, texLevelBytes(fmt, w, h)) == it->second.dataHash ? "data unchanged since upload"
+		                                                                         : "DATA CHANGED since upload";
+	const uint32_t pw = pow2Side(w), ph = pow2Side(h);
+	static std::vector<uint8_t> rgba, scaled;
+	static std::vector<uint16_t> la8;
+	uint32_t diff, bytes, first;
+	if (fmt == 1 && pica_tex_format(t) == PICA_TF_LA8) {
+		la8.assign(size_t(pw) * ph, 0);
+		i8ToLa8(ptr, w, h, la8.data(), pw, ph);
+		diff = pica_tex_check(t, nullptr, la8.data(), &bytes, &first);
+	} else {
+		rgba.resize(size_t(w) * h * 4);
+		decodeTexture(ptr, fmt, w, h, tlut, key.tlutFmt, rgba.data());
+		const uint8_t* src = rgba.data();
+		if (pw != w || ph != h) {
+			scaled.resize(size_t(pw) * ph * 4);
+			for (uint32_t y = 0; y < ph; y++)
+				for (uint32_t x = 0; x < pw; x++)
+					memcpy(&scaled[(size_t(y) * pw + x) * 4], &rgba[(size_t(y * h / ph) * w + x * w / pw) * 4], 4);
+			src = scaled.data();
+		}
+		diff = pica_tex_check(t, src, nullptr, &bytes, &first);
+	}
+	const int where = pica_tex_where(t);
+	fprintf(out, "[trace]   unit %d: texture %s at %08lx%s, %s, level 0 %s", u,
+	        where == 1 ? "drawn from its VRAM copy" : where == 2 ? "kept in FCRAM" : "in FCRAM",
+	        (unsigned long)pica_tex_phys(t, where == 1), where == 1 ? " (VRAM)" : "", data,
+	        diff ? "DIFFERS" : bytes ? "matches the data" : "not checked");
+	if (diff) fprintf(out, ": %lu of %lu bytes, first at +%lx", (unsigned long)diff, (unsigned long)bytes, (unsigned long)first);
+	fprintf(out, " (PICA format %d)\n", pica_tex_format(t));
 }
 
 // For the draw trace: the average colour (and smallest alpha) of map's texture as the game's data
@@ -1824,10 +1969,13 @@ struct TevSetup {
 	uint8_t pairFmt[kMaxPairs];       // its GX texture format
 	int nUnits;              // set by the translation
 	int unitPair[PICA_MAX_TEX];
+	int16_t symErrOld, symErrNew;  // tevSymImprove's checks (-1: none): the translation's error, the compiled one's
+	bool symUsed;                  // the compiled one drawn
 };
 
 static void readTev(TevSetup& t) {
 	memset(&t, 0, sizeof t);
+	t.symErrOld = t.symErrNew = -1;
 	t.numStages = ((rs.bp[BP_GENMODE] >> 10) & 15) + 1;
 	for (int p = 0; p < kMaxPairs; p++)
 		for (int i = 0; i < 4; i++) t.pairConst[p][i] = 255;
@@ -2609,6 +2757,122 @@ static bool translateTevFallback(TevSetup& tev, const bool pwhite[kMaxPairs], Pi
 	return ok;
 }
 
+// The setup checked against GX's arithmetic (gx3ds_tevsym.cpp, tevSymError) and, when the
+// translation is off by more than kTevSymAccept, compiled through its algebra (tevSymCompile);
+// the more accurate one is drawn. The decision is kept per setup with its constants left out
+// (tevStructKey): later setups that differ only there (colours animated every frame) reuse the
+// translation without a check, or compile with the variant chosen, without the search.
+static const int kTevSymAccept = 24, kTevSymMargin = 8;  // thousandths (as tevSymError)
+static std::unordered_map<uint64_t, int8_t> s_tevSymChoice;  // structure -> variant (-1: the translation)
+
+static uint64_t tevStructKey(const TevSetup& t, const bool pwhite[kMaxPairs]) {
+	uint64_t h = 1469598103934665603ull;
+	auto mix = [&](uint64_t x) { h = (h ^ x) * 1099511628211ull; };
+	mix(t.numStages);
+	for (uint32_t s = 0; s < t.numStages; s++) {
+		mix(t.colorEnv[s]);
+		mix(t.alphaEnv[s]);
+		mix(t.order[s]);
+		mix(t.ksel[s]);
+	}
+	for (int i = 0; i < 4; i++) mix(t.swap[i]);
+	uint32_t flags = 0;
+	for (int p = 0; p < t.nPairs; p++) flags |= uint32_t(pwhite[p]) << p;
+	for (int c = 0; c < 2; c++)
+		flags |= uint32_t(t.rgbVarying[c] | t.aVarying[c] << 1 | t.chanSpec[c] << 2) << (8 + 4 * c);
+	mix(flags | uint32_t(t.nPairs) << 16 | uint32_t(t.rasRgbChan) << 20 | uint32_t(t.rasAChan) << 22);
+	return h;
+}
+
+static void tevSymImprove(TevSetup& tev, const bool pwhite[kMaxPairs], PicaState& st, bool& translated) {
+	tev.symErrOld = tev.symErrNew = -1;
+	tev.symUsed = false;
+	if (tev.numStages < 2 || tev.nPairs > kTevSymPairs) return;
+	TevSymIn in;
+	memset(&in, 0, sizeof in);
+	in.numStages = int(tev.numStages);
+	for (uint32_t s = 0; s < tev.numStages; s++) {
+		in.ce[s] = tev.colorEnv[s];
+		in.ae[s] = tev.alphaEnv[s];
+		in.order[s] = tev.order[s];
+		in.ksel[s] = tev.ksel[s];
+		in.stagePair[s] = tev.stagePair[s];
+	}
+	for (int i = 0; i < 4; i++) in.swap[i] = uint8_t(tev.swap[i]);
+	for (int r = 0; r < 4; r++) {
+		const uint32_t ra = rs.bp[BP_TEV_REG + 2 * r], bg = rs.bp[BP_TEV_REG + 2 * r + 1];
+		in.reg[r][0] = int16_t(sext11(ra & 0x7FF));
+		in.reg[r][1] = int16_t(sext11((bg >> 12) & 0x7FF));
+		in.reg[r][2] = int16_t(sext11(bg & 0x7FF));
+		in.reg[r][3] = int16_t(sext11((ra >> 12) & 0x7FF));
+		const uint32_t ka = rs.kreg[2 * r], kb = rs.kreg[2 * r + 1];
+		in.konst[r][0] = uint8_t(ka & 0xFF);
+		in.konst[r][1] = uint8_t((kb >> 12) & 0xFF);
+		in.konst[r][2] = uint8_t(kb & 0xFF);
+		in.konst[r][3] = uint8_t((ka >> 12) & 0xFF);
+	}
+	in.nPairs = tev.nPairs;
+	for (int p = 0; p < tev.nPairs; p++) {
+		in.pairConst[p] = pwhite[p];
+		for (int c = 0; c < 4; c++) in.pairValue[p][c] = tev.pairConst[p][c];
+	}
+	in.rasRgbChan = tev.rasRgbChan;
+	in.rasAChan = tev.rasAChan;
+	for (int c = 0; c < 2; c++) {
+		in.rgbVarying[c] = tev.rgbVarying[c];
+		in.aVarying[c] = tev.aVarying[c];
+		in.chanSpec[c] = tev.chanSpec[c];
+		for (int k = 0; k < 4; k++) in.rasConst[c][k] = tev.rasConst[c][k];
+	}
+	TevSymOut out;
+	auto adopt = [&] {
+		memcpy(st.stage, out.stage, sizeof st.stage);
+		st.nstages = uint8_t(out.nstages);
+		st.buf_rgb = out.buf_rgb;
+		st.buf_alpha = out.buf_alpha;
+		st.buf_color = out.buf_color;
+		tev.nUnits = out.nUnits;
+		for (int u = 0; u < PICA_MAX_TEX; u++) tev.unitPair[u] = u < out.nUnits ? out.unitPair[u] : 0;
+		translated = true;
+		tev.symUsed = true;
+		s_tevSymUsed++;
+	};
+	const uint64_t key = tevStructKey(tev, pwhite);
+	auto it = s_tevSymChoice.find(key);
+	if (it != s_tevSymChoice.end()) {
+		if (it->second < 0) return;
+		if (tevSymCompileChoice(in, it->second, out)) {
+			adopt();
+			return;
+		}
+	}
+	TevSymOut old;
+	memset(&old, 0, sizeof old);
+	memcpy(old.stage, st.stage, sizeof old.stage);
+	old.nstages = st.nstages;
+	old.buf_rgb = st.buf_rgb;
+	old.buf_alpha = st.buf_alpha;
+	old.buf_color = st.buf_color;
+	old.nUnits = tev.nUnits;
+	for (int u = 0; u < PICA_MAX_TEX; u++) old.unitPair[u] = tev.unitPair[u];
+	const int eOld = translated ? tevSymError(in, old) : 1 << 14;
+	s_tevSymChecks++;
+	tev.symErrOld = int16_t(eOld);
+	int choice = -1;
+	if (eOld > kTevSymAccept) {
+		int eNew;
+		s_tevSymCompiles++;
+		if (tevSymCompile(in, out, &eNew, &choice) && eNew + kTevSymMargin < eOld) {
+			tev.symErrNew = int16_t(eNew);
+			adopt();
+		} else {
+			choice = -1;
+		}
+	}
+	if (s_tevSymChoice.size() >= 4096) s_tevSymChoice.clear();
+	s_tevSymChoice[key] = int8_t(choice);
+}
+
 // THP movies (THPPlayer's THPGXYuv2RgbSetup) convert Y, U, V textures to RGB through signed,
 // unclamped TEV intermediates, which PICA stages (clamped to 0..1) cannot hold. Per component,
 // the setup computes out = y + off + cu * u + cv * v (off, cu, cv from C0 and konst 0-1; green
@@ -2670,6 +2934,164 @@ static void translateThp(TevSetup& t, PicaState& st) {
 	st.buf_rgb = uint8_t(1u << 1 | 1u << 3);
 	st.buf_alpha = 0;
 	st.buf_color = rgb(duLo);
+}
+
+// A movie on a surface: THP's four conversion stages (as isThpSetup) followed by the material's
+// own stages (Delfino Plaza's warp gates, TModelGate: the movie inside the gate's shape, from a
+// frame texture and a mask; 7 stages and 5 textures). The conversion alone takes all six PICA
+// stages and all three textures, so the fallback dropped the stages after it, and with them the
+// mask's alpha that the gate's alpha compare reads: the gates were invisible. Here the frame is
+// converted to RGB on the CPU (thpRgbTexture) and the four stages become one that samples it,
+// placed where the material first reads or writes PREV (the gate's frame and mask stages first,
+// so that its last stage finds the movie in PREV and the two in the buffer).
+static bool isThpPrefix(const TevSetup& t) {
+	if (t.numStages <= 4) return false;
+	TevSetup h = t;
+	h.numStages = 4;
+	if (!isThpSetup(h)) return false;
+	for (int s = 0; s < 4; s++)  // the conversion writes PREV only, through swap table 0
+		if (((t.colorEnv[s] >> 22) & 3) || ((t.alphaEnv[s] >> 22) & 3) || (t.alphaEnv[s] & 15)) return false;
+	if (((t.alphaEnv[3] >> 4) & 0xFFF) != 0xFFF) return false;  // ... and alpha 0
+	for (uint32_t s = 4; s < t.numStages; s++)
+		for (int k = 0; k < 3; k++)
+			if (t.stagePair[s] >= 0 && t.stagePair[s] == t.stagePair[k]) return false;
+	return true;
+}
+
+// The frame of the planes isThpPrefix's stages read, as an RGB texture the size of the Y plane:
+// out = y + off + cu * u + cv * v per component (as translateThp), clamped. Converted when the
+// planes or the constants change, once a frame at most; the last few frames' textures are kept
+// (the player's three texture sets take turns).
+struct ThpRgb {
+	const uint8_t* y;
+	uint64_t hash;
+	uint32_t frame, pw, ph;
+	PicaTex* tex;
+};
+static ThpRgb s_thpRgb[4];
+static std::vector<uint8_t> s_thpPlane[3], s_thpOut;
+
+static PicaTex* thpRgbTexture(const TevSetup& t) {
+	const int map[3] = {t.pairMap[t.stagePair[0]], t.pairMap[t.stagePair[1]], t.pairMap[t.stagePair[2]]};  // U, V, Y
+	const uint8_t* src[3];
+	uint32_t w[3], h[3];
+	for (int i = 0; i < 3; i++) {
+		const uint32_t img0 = rs.bp[bpTexReg(BP_TX_IMAGE0, map[i])];
+		src[i] = rs.texImage[map[i]];
+		w[i] = (img0 & 0x3FF) + 1;
+		h[i] = ((img0 >> 10) & 0x3FF) + 1;
+		if (!src[i] || ((img0 >> 20) & 15) != 1) return nullptr;  // I8 planes
+	}
+	const uint32_t ra = rs.bp[BP_TEV_REG + 2], bg = rs.bp[BP_TEV_REG + 3];  // C0
+	const uint32_t konst[4] = {rs.kreg[0], rs.kreg[1], rs.kreg[2], rs.kreg[3]};
+	ThpRgb* e = nullptr;
+	for (ThpRgb& c : s_thpRgb)
+		if (c.tex && c.y == src[2]) e = &c;
+	if (e && e->frame == s_rFrames) return e->tex;
+	uint64_t hash = hashBytes(konst, sizeof konst) ^ (uint64_t(ra) << 32 | bg);
+	for (int i = 0; i < 3; i++) hash = hash * 0x100000001B3ull ^ hashBytes(src[i], texLevelBytes(1, w[i], h[i]));
+	const uint32_t pw = pow2Side(w[2]), ph = pow2Side(h[2]);
+	if (e && e->hash == hash && e->pw == pw && e->ph == ph) {
+		e->frame = s_rFrames;
+		return e->tex;
+	}
+	if (!e) {  // the least recently used
+		e = &s_thpRgb[0];
+		for (ThpRgb& c : s_thpRgb)
+			if (!c.tex || c.frame < e->frame) e = &c;
+	}
+	if (e->tex && (e->pw != pw || e->ph != ph)) {
+		s_texBytes -= pica_tex_bytes(e->tex);
+		pica_tex_free(e->tex);
+		e->tex = nullptr;
+	}
+	if (!e->tex) {
+		e->tex = pica_tex_create_fmt(pw, ph, PICA_TF_RGB565);
+		if (!e->tex) return nullptr;
+		s_texBytes += pica_tex_bytes(e->tex);
+	}
+	e->y = src[2];
+	e->hash = hash;
+	e->frame = s_rFrames;
+	e->pw = pw;
+	e->ph = ph;
+	for (int i = 0; i < 3; i++) {
+		s_thpPlane[i].resize(size_t(w[i]) * h[i] * 4);
+		decodeTexture(src[i], 1, w[i], h[i], nullptr, 0, s_thpPlane[i].data());
+	}
+	auto kc = [&](uint32_t i, int comp) {  // konst i, comp 0-3: r, g, b, a (0..1)
+		const uint32_t kra = konst[2 * i], kbg = konst[2 * i + 1];
+		return float(comp == 0 ? kra & 0xFF : comp == 1 ? (kbg >> 12) & 0xFF : comp == 2 ? kbg & 0xFF : (kra >> 12) & 0xFF) /
+		       255.f;
+	};
+	const float c0r = sext11(ra & 0x7FF) / 255.f, c0b = sext11(bg & 0x7FF) / 255.f, a0 = sext11((ra >> 12) & 0x7FF) / 255.f;
+	const float off[3] = {2 * c0r, a0, 2 * c0b};
+	const float cu[3] = {2 * kc(0, 0), -kc(0, 3), 2 * kc(0, 2)};
+	const float cv[3] = {2 * kc(1, 0), -kc(1, 3), 2 * kc(1, 2)};
+	// Per component, the u and v terms by texel value (with the offset and rounding in the u
+	// table), in 1/255 units: out = y + tu[u] + tv[v].
+	int16_t tu[3][256], tv[3][256];
+	for (int c = 0; c < 3; c++)
+		for (int i = 0; i < 256; i++) {
+			tu[c][i] = int16_t(lroundf((off[c] + cu[c] * (i / 255.f)) * 255.f));
+			tv[c][i] = int16_t(lroundf(cv[c] * (i / 255.f) * 255.f));
+		}
+	s_thpOut.resize(size_t(pw) * ph * 4);
+	uint32_t lastSy = ~0u;
+	for (uint32_t y = 0; y < ph; y++) {
+		uint8_t* row = &s_thpOut[size_t(y) * pw * 4];
+		const uint32_t sy = y * h[2] / ph;
+		if (sy == lastSy) {  // the power-of-two height repeats a row
+			memcpy(row, row - pw * 4, pw * 4);
+			continue;
+		}
+		lastSy = sy;
+		const uint8_t* yr = &s_thpPlane[2][size_t(sy) * w[2] * 4];
+		const uint8_t* ur = &s_thpPlane[0][size_t(sy * h[0] / h[2]) * w[0] * 4];
+		const uint8_t* vr = &s_thpPlane[1][size_t(sy * h[1] / h[2]) * w[1] * 4];
+		for (uint32_t x = 0; x < pw; x++) {
+			const uint32_t sx = x * w[2] / pw;
+			const int Y = yr[sx * 4], U = ur[(sx * w[0] / w[2]) * 4], V = vr[(sx * w[1] / w[2]) * 4];
+			uint8_t* o = row + x * 4;
+			for (int c = 0; c < 3; c++) o[c] = clampByte(Y + tu[c][U] + tv[c][V]);
+			o[3] = 255;
+		}
+	}
+	pica_tex_upload(e->tex, s_thpOut.data());
+	s_texUploads++;
+	return e->tex;
+}
+
+// isThpPrefix's stages with the conversion as one stage sampling the RGB frame through the Y
+// plane's pair (its texture made the frame by the caller).
+static void thpPrefixToTexture(TevSetup& t) {
+	const TevSetup o = t;
+	uint32_t at = 4;  // the first stage that reads or writes PREV
+	for (; at < o.numStages; at++) {
+		const uint32_t ce = o.colorEnv[at], ae = o.alphaEnv[at];
+		bool prev = ((ce >> 22) & 3) == 0 || ((ae >> 22) & 3) == 0;
+		for (int i = 0; i < 4; i++) prev |= ((ce >> (4 * i)) & 15) <= 1 || ((ae >> (4 + 3 * i)) & 7) == 0;
+		if (prev) break;
+	}
+	uint32_t n = 0;
+	auto put = [&](uint32_t s) {
+		t.colorEnv[n] = o.colorEnv[s];
+		t.alphaEnv[n] = o.alphaEnv[s];
+		t.order[n] = o.order[s];
+		t.ksel[n] = o.ksel[s];
+		t.stagePair[n] = o.stagePair[s];
+		n++;
+	};
+	for (uint32_t s = 4; s < at; s++) put(s);
+	t.colorEnv[n] = 0x88FFF;  // PREV.rgb = TEXC, clamped
+	t.alphaEnv[n] = 0x8FFF0;  // PREV.a = 0
+	t.order[n] = (o.order[2] & 0x3F) | 1u << 6 | 7u << 7;  // the Y plane's map and coordinate, no colour channel
+	t.ksel[n] = o.ksel[2];
+	t.stagePair[n] = o.stagePair[2];
+	n++;
+	for (uint32_t s = at; s < o.numStages; s++) put(s);
+	t.numStages = n;
+	t.pairFmt[o.stagePair[2]] = 6;  // a colour texture now (RGBA8 for the fallback's choices)
 }
 
 // The goop stamp (TPollutionCounterLayer::drawTexStamp, initGXforStamp): a texel of the stamp's
@@ -2796,6 +3218,11 @@ static unsigned tevDump(const TevSetup& t, const PicaState& st, bool ok, PicaTex
 	fprintf(out, "[tevdump] #%u frame %u: %u stages, %u indirect, %s (%u PICA stages, buf %x/%x %08x)\n",
 	        id, s_rFrames, t.numStages, numInd, ok ? "translated" : "FALLBACK", st.nstages,
 	        st.buf_rgb, st.buf_alpha, (unsigned)st.buf_color);
+	if (t.symErrOld >= 0)
+		fprintf(out, "[tevdump]   check: translation off by %d/1000%s\n", t.symErrOld,
+		        t.symUsed ? ", drawn compiled instead" : t.symErrOld > kTevSymAccept ? ", compiling did no better" : "");
+	if (t.symUsed && t.symErrNew >= 0) fprintf(out, "[tevdump]   check: compiled off by %d/1000\n", t.symErrNew);
+	if (t.symUsed && t.symErrOld < 0) fprintf(out, "[tevdump]   check: drawn compiled, as decided for the same stages with other constants\n");
 	for (uint32_t s = 0; s < t.numStages; s++)
 		fprintf(out, "[tevdump]   gx %u: ce %06x ae %06x order %03x ksel %03x\n", s, t.colorEnv[s], t.alphaEnv[s],
 		        t.order[s], t.ksel[s]);
@@ -2980,6 +3407,18 @@ struct TevCacheEntry {
 	uint32_t usedFrame;  // the render frame it was last found in (s_rFrames)
 };
 static std::unordered_map<uint64_t, TevCacheEntry> s_tevCache;
+
+// [perf]: the host side's caches on the heap. After two hours of play a console ran out of heap at
+// Noki Bay's Eely-Mouth (85 of 86 MB taken, 71 MB in use, the use some 18 MB up since boot): which
+// of them grows. (Read on the render thread while the GX thread changes some: figures, not exact.)
+static void perfHostMemory() {
+	fprintf(stderr,
+	        "[perf]   host memory: display-list cache %lu KB, compiled shapes %lu (%lu KB), TEV cache %u entries, "
+	        "texture cache %u entries, texture decode buffers %u KB, EFB copies %u\n",
+	        (unsigned long)(GXPC_DlCacheBytes() >> 10), (unsigned long)GXPC_J3DPkgStats[3], (unsigned long)(GXPC_J3DPkgBytes() >> 10),
+	        unsigned(s_tevCache.size()), unsigned(s_texCache.size()),
+	        unsigned((s_decodeBuf.capacity() + s_scaleBuf.capacity() + s_thpOut.capacity()) >> 10), unsigned(s_efbCopies.size()));
+}
 static const size_t kTevCacheMax = 1024;
 
 
@@ -3229,7 +3668,7 @@ static void logLighting(int ch, int cha, bool hasNrm, bool hasClr, const VtxFmtL
 
 static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevSetup& tev, bool debug,
                     PicaTex* const utex[PICA_MAX_TEX], const EfbCopy* const ucopy[PICA_MAX_TEX],
-                    const int ucoord[PICA_MAX_TEX], const PicaState& st) {
+                    const int ucoord[PICA_MAX_TEX], PicaState& st) {
 	if (s_tracing) return gpuFail(FB_TRACE, n);
 	if (rs.xfReg[0x05] != 0) return gpuFail(FB_NOCLIP, n);
 	if (n == 0 || n > 0xFFFF) return gpuFail(FB_SIZE, n);
@@ -3277,12 +3716,18 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 
 	// Texture units: source selection and the composed rows.
 	int slotAttr[3] = {-1, -1, -1};  // texture coordinate attribute (0-7) in source slots a, b, c
+	bool pdvNo = false;              // a unit 1 or 2 that is not divided per vertex
+	u.TQ1[3] = 1;                    // (divided by 1 when not projective)
 	for (int un = 0; un < PICA_MAX_TEX; un++) {
 		if (!utex[un]) continue;
 		const int coord = ucoord[un];
 		const uint32_t tg = rs.xfReg[XFR_TEXGEN + coord];
 		const uint32_t proj = (tg >> 1) & 1, form = (tg >> 2) & 1, type = (tg >> 4) & 7, row = (tg >> 7) & 31;
-		if (proj && type == 0) return gpuFail(FB_TEXGEN_PROJ, n);
+		// A projective texgen (with gx_proj.v.pica, pica_gx_projective): unit 0's q goes out as
+		// texcoord0w, divided per pixel; units 1 and 2's are divided per vertex, by one q row.
+		const bool projQ = proj && type == 0;
+		if (projQ && !pica_gx_projective()) return gpuFail(FB_TEXGEN_PROJ, n);
+
 		float* w0 = u.W[2 * un];
 		if (row == 0) {
 			w0[0] = 1;
@@ -3302,12 +3747,12 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 		}
 		// (Emboss and colour texgens with any other source: the CPU path passes its default (0, 0)
 		// through, as zero weights do here.)
-		float R[2][4];
+		float R[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 1}};  // s, t, q
 		if (type != 0) {
 			// Emboss and colour texgens: the CPU path passes the source's (s, t) through (texCoord), so
 			// does this, with no texture or post matrix.
 			const float id[2][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}};
-			memcpy(R, id, sizeof R);
+			memcpy(R, id, sizeof id);
 			goto efbRect;
 		}
 		{
@@ -3322,23 +3767,27 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 				if (r_verts[size_t(i) * r_stride + L.mtx + 1 + coord] != tm) return gpuFail(FB_TEXMTX_VARIES, n);
 		}
 		const float* m = reinterpret_cast<const float*>(&rs.xfMem[tm * 4]);
-		for (int r = 0; r < 2; r++) memcpy(R[r], m + 4 * r, 16);
+		for (int r = 0; r < (projQ ? 3 : 2); r++) memcpy(R[r], m + 4 * r, 16);
 		if (row >= 5 || form == 0)  // the source's third component is 1 (AB11; texture attributes)
-			for (int r = 0; r < 2; r++) R[r][3] += R[r][2], R[r][2] = 0.f;
-		// (t0, t1, t2 = 1) through the post matrix
+			for (int r = 0; r < 3; r++) R[r][3] += R[r][2], R[r][2] = 0.f;
+		// (t0, t1, t2) through the post matrix (t2 = 1 unless projective)
 		if (rs.xfReg[XFR_DUALTEX] & 1) {
 			const uint32_t post = rs.xfReg[XFR_POSTTEX + coord];
 			if ((post >> 8) & 1) return gpuFail(FB_POST_NORMALISE, n);  // normalised before the post matrix
 			const float* pm = reinterpret_cast<const float*>(&rs.xfMem[0x500 + (post & 63) * 4]);
-			if (pm[8] != 0.f || pm[9] != 0.f) return gpuFail(FB_POST_PROJ, n);  // varying third component: divided per vertex
-			float c = pm[10] + pm[11];
-			float Q[2][4];
-			for (int r = 0; r < 2; r++)
+			if (!projQ && (pm[8] != 0.f || pm[9] != 0.f)) return gpuFail(FB_POST_PROJ, n);  // varying third component: divided per vertex
+			float Q[3][4];
+			for (int r = 0; r < 3; r++)
 				for (int k = 0; k < 4; k++)
-					Q[r][k] = pm[4 * r] * R[0][k] + pm[4 * r + 1] * R[1][k] + (k == 3 ? pm[4 * r + 2] + pm[4 * r + 3] : 0.f);
-			if (c != 0.f && c != 1.f)
-				for (int r = 0; r < 2; r++)
-					for (int k = 0; k < 4; k++) Q[r][k] /= c;
+					Q[r][k] = pm[4 * r] * R[0][k] + pm[4 * r + 1] * R[1][k] + pm[4 * r + 2] * R[2][k] + (k == 3 ? pm[4 * r + 3] : 0.f);
+			if (!projQ) {  // a constant third component: divided here
+				const float c = Q[2][3];
+				if (c != 0.f && c != 1.f)
+					for (int r = 0; r < 2; r++)
+						for (int k = 0; k < 4; k++) Q[r][k] /= c;
+				const float one[4] = {0, 0, 0, 1};
+				memcpy(Q[2], one, sizeof one);
+			}
 			memcpy(R, Q, sizeof R);
 		}
 		}
@@ -3346,12 +3795,37 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 		if (const EfbCopy* cp = ucopy[un]) {  // through the copy's source rectangle into its texture's window
 			float as, bs, at, bt;
 			copyMap(cp, as, bs, at, bt);
-			for (int k = 0; k < 4; k++) R[0][k] *= as, R[1][k] *= at;
-			R[0][3] += bs;
-			R[1][3] += bt;
+			// (s / q) * a + b = (s a + q b) / q
+			for (int k = 0; k < 4; k++) {
+				R[0][k] = R[0][k] * as + R[2][k] * bs;
+				R[1][k] = R[1][k] * at + R[2][k] * bt;
+			}
 		}
 		memcpy(u.T[2 * un], R[0], 16);
 		memcpy(u.T[2 * un + 1], R[1], 16);
+		if (un == 0) memcpy(u.TQ, R[2], 16);
+		if (un > 0) {  // units 1 and 2: projective ones divided per vertex, with one q row (TQ1, pdv)
+			if (projQ) {
+				bool same = true;
+				if (u.pdv)
+					for (int k = 0; k < 4; k++) same &= fabsf(R[2][k] - u.TQ1[k]) <= 1e-5f * (1.0f + fabsf(u.TQ1[k]));
+				// all or none, one q row, and unit 0 projective (its flag turns the division on)
+				if (pdvNo || !same || !st.proj0) return gpuFail(FB_TEXGEN_PROJ, n);
+				memcpy(u.TQ1, R[2], 16);
+				u.pdv = 1;
+			} else {
+				if (u.pdv) return gpuFail(FB_TEXGEN_PROJ, n);
+				pdvNo = true;
+			}
+		}
+		if (un == 0 && st.proj0 != projQ) {
+			st.proj0 = projQ;
+			if (++s_stGen == 0) s_stGen = 1;
+		}
+	}
+	if (!utex[0] && st.proj0) {
+		st.proj0 = false;
+		if (++s_stGen == 0) s_stGen = 1;
 	}
 	for (int sl = 0; sl < 3; sl++)
 		if (slotAttr[sl] >= 0) lay.off_tex[sl] = int16_t(L.tex[slotAttr[sl]]);
@@ -3451,8 +3925,10 @@ static bool drawGpu(const VtxFmtLayout& L, uint32_t n, uint32_t nidx, const TevS
 	const float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1), p2 = xff(XFR_PROJ + 2), p3 = xff(XFR_PROJ + 3),
 	            p4 = xff(XFR_PROJ + 4), p5 = xff(XFR_PROJ + 5);
 	const bool ortho = rs.xfReg[XFR_PROJ + 6] & 1;
-	const float vsx = xff(XFR_VIEWPORT), vsy = xff(XFR_VIEWPORT + 1), vsz = xff(XFR_VIEWPORT + 2);
-	const float vcx = xff(XFR_VIEWPORT + 3) - 342.0f, vcy = xff(XFR_VIEWPORT + 4) - 342.0f, vcz = xff(XFR_VIEWPORT + 5);
+	const float rowScale = efbRowScale();
+	const float vsx = xff(XFR_VIEWPORT), vsy = xff(XFR_VIEWPORT + 1) / rowScale, vsz = xff(XFR_VIEWPORT + 2);
+	const float vcx = xff(XFR_VIEWPORT + 3) - 342.0f, vcy = (xff(XFR_VIEWPORT + 4) - 342.0f) / rowScale,
+	            vcz = xff(XFR_VIEWPORT + 5);
 	const float kInvZ = 1.0f / 16777215.0f;
 	float C[4][4];
 	if (!ortho) {
@@ -3635,6 +4111,18 @@ static void drawTriangles() {
 				}
 			}
 		}
+		// A movie with stages of its own after the conversion (isThpPrefix): the frame as RGB.
+		if (!debug && isThpPrefix(tev)) {
+			const int pu = tev.stagePair[0], pv = tev.stagePair[1], py = tev.stagePair[2];
+			if (ptex[pu] && ptex[pv] && ptex[py] && !pcopy[pu] && !pcopy[pv] && !pcopy[py])
+				if (PicaTex* rgb = thpRgbTexture(tev)) {
+					thpPrefixToTexture(tev);
+					ptex[py] = rgb;
+					pwhite[pu] = pwhite[pv] = true;  // no stage reads them now
+					tevLogOnce("movie converted on the CPU for the stages after it", 4, tev.numStages, tev.colorEnv[0],
+					           tev.alphaEnv[0]);
+				}
+		}
 		perfTev0 = perfTick();
 
 		memset(&st, 0, sizeof st);  // the PICA side compares states bytewise
@@ -3675,6 +4163,7 @@ static void drawTriangles() {
 			translateStamp(tev, st);
 		} else {
 			translated = translateTevFallback(tev, pwhite, st);
+			if (s_tevSymOn) tevSymImprove(tev, pwhite, st, translated);
 		}
 		if (!cached && !debug && !translated) {
 			resetTev(st, tev);
@@ -3781,6 +4270,46 @@ static void drawTriangles() {
 		s_tevPartTicks[3] += t3 - tevT1;
 	}
 	if (s_skipTev && dumpId >= s_skipTev && dumpId <= s_skipTevTo) return;  // (GX3DS_SetSkipTev: a debugging aid)
+	// A projective texgen on a unit other than 0 (Bowser's hot tub: the water's lookup of the screen
+	// copy, ~14K vertices): that unit and unit 0 swap, as the PICA divides per pixel on unit 0 only
+	// (otherwise the draw takes the CPU path). Once swapped, unit 0 is the projective one, so draws
+	// taking this setup again leave it as it is.
+	if (!debug && tev.nUnits > 1 && pica_gx_projective()) {
+		auto projective = [&](int un) {
+			if (!utex[un]) return false;
+			const uint32_t tg = rs.xfReg[XFR_TEXGEN + ucoord[un]];
+			return ((tg >> 1) & 1) && ((tg >> 4) & 7) == 0;
+		};
+		int pu = -1;
+		for (int un = 1; un < tev.nUnits && pu < 0; un++)
+			if (projective(un)) pu = un;
+		if (pu > 0 && !projective(0)) {
+			std::swap(utex[0], utex[pu]);
+			std::swap(ucopy[0], ucopy[pu]);
+			std::swap(ucoord[0], ucoord[pu]);
+			std::swap(tev.unitPair[0], tev.unitPair[pu]);
+			std::swap(st.tex[0], st.tex[pu]);
+			std::swap(st.wrap_s[0], st.wrap_s[pu]);
+			std::swap(st.wrap_t[0], st.wrap_t[pu]);
+			std::swap(st.linear[0], st.linear[pu]);
+			std::swap(st.lod_bias[0], st.lod_bias[pu]);
+			auto swapSrc = [&](uint16_t& srcs) {
+				uint16_t o = 0;
+				for (int k = 0; k < 3; k++) {
+					uint16_t v = (srcs >> (4 * k)) & 15;
+					if (v == SRC_TEX0) v = uint16_t(SRC_TEX0 + pu);
+					else if (v == SRC_TEX0 + pu) v = SRC_TEX0;
+					o |= uint16_t(v << (4 * k));
+				}
+				srcs = o;
+			};
+			for (int i = 0; i < st.nstages; i++) {
+				swapSrc(st.stage[i].src_rgb);
+				swapSrc(st.stage[i].src_alpha);
+			}
+			if (++s_stGen == 0) s_stGen = 1;
+		}
+	}
 	if (s_gpuTransform && drawGpu(L, n, nidx, tev, debug, utex, ucopy, ucoord, st)) return;
 	s_cpuBatches++;
 	s_fp.valid = false;  // (the CPU path changes the state for its own draw)
@@ -3820,8 +4349,10 @@ static void drawTriangles() {
 	const float p0 = xff(XFR_PROJ), p1 = xff(XFR_PROJ + 1), p2 = xff(XFR_PROJ + 2), p3 = xff(XFR_PROJ + 3),
 	            p4 = xff(XFR_PROJ + 4), p5 = xff(XFR_PROJ + 5);
 	const bool ortho = rs.xfReg[XFR_PROJ + 6] & 1;
-	const float vsx = xff(XFR_VIEWPORT), vsy = xff(XFR_VIEWPORT + 1), vsz = xff(XFR_VIEWPORT + 2);
-	const float vcx = xff(XFR_VIEWPORT + 3) - 342.0f, vcy = xff(XFR_VIEWPORT + 4) - 342.0f, vcz = xff(XFR_VIEWPORT + 5);
+	const float rowScale = efbRowScale();
+	const float vsx = xff(XFR_VIEWPORT), vsy = xff(XFR_VIEWPORT + 1) / rowScale, vsz = xff(XFR_VIEWPORT + 2);
+	const float vcx = xff(XFR_VIEWPORT + 3) - 342.0f, vcy = (xff(XFR_VIEWPORT + 4) - 342.0f) / rowScale,
+	            vcz = xff(XFR_VIEWPORT + 5);
 	const float kInvZ = 1.0f / 16777215.0f;
 	const bool noClip = rs.xfReg[0x05] != 0;
 
@@ -3961,6 +4492,7 @@ static void drawTriangles() {
 			        tl & 0x3FF, (tl >> 10) & 3, (unsigned long)traceTexAvg(map), unsigned(s_traceMinA),
 			        n ? out[0].tc[u][0] : 0.f, n ? out[0].tc[u][1] : 0.f,
 			        ucopy[u] ? " (EFB copy)" : utex[u] ? "" : " (none)");
+			if (!ucopy[u] && utex[u]) traceTexCheck(tf(), u, map, utex[u]);
 			// A 256x256 I8 texture (the goop layer's height map): saved once as a PGM image.
 			if (!ucopy[u] && rs.texImage[map] && ((img0 >> 20) & 15) == 1 && (img0 & 0x3FF) == 255 &&
 			    ((img0 >> 10) & 0x3FF) == 255) {
@@ -4730,11 +5262,162 @@ static void renderMain(void*) {
 	}
 }
 
+// Pixel metrics. The goop counters (TPollutionCounterLayer::drawPollutionLayer) draw each goop map
+// over its own size with an alpha test and read how many pixels passed; the game takes 4 off per
+// polygon it drew, so a read is the pixels passed plus 4 a triangle (as on the GameCube, and in
+// sms-pc-port's occlusion queries). The PICA has no counter: a draw of one quad textured with a
+// one-byte map (I4, I8) is counted on the GX thread from the map's memory, through a table of
+// which texel values pass (the TEV as GX computes it, then the alpha test). Its memory is the
+// readback of the map's last copy, two frames behind. Other draws count their triangles only.
+// With 0 the counters went to -8, each, which the event scripts take as a clean level at once
+// (Sirena Beach's scrubbing episode ended as its timer started) and the unsigned checks as never
+// clean (Noki Bay's goop-sealed rock).
+static void pixMetricCount() {
+	const uint32_t tris = uint32_t(s_idx.size() / 3);
+	s_pmTris += tris;
+	if (s_bArena || s_bclass != PRIM_TRIS || s_bcount != 4 || tris != 2) return;
+	const uint32_t n = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
+	if (n > 4 || ((g.bp[BP_GENMODE] >> 16) & 7) != 0) return;
+	TevSymIn in;
+	memset(&in, 0, sizeof in);
+	in.numStages = int(n);
+	int map = -1;
+	for (uint32_t s = 0; s < n; s++) {
+		in.ce[s] = g.bp[BP_TEV_COLOR_ENV + 2 * s] & 0xFFFFFF;
+		in.ae[s] = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1] & 0xFFFFFF;
+		in.order[s] = (g.bp[BP_TREF + (s >> 1)] >> ((s & 1) * 12)) & 0x3FF;
+		const uint32_t ks = g.bp[BP_TEV_KSEL + (s >> 1)];
+		in.ksel[s] = (s & 1) ? ((ks >> 14) & 0x3FF) : ((ks >> 4) & 0x3FF);
+		in.stagePair[s] = -1;
+		if ((in.order[s] >> 6) & 1) {
+			const int m = int(in.order[s] & 7);
+			if (map >= 0 && m != map) return;  // one map only
+			map = m;
+			in.stagePair[s] = 0;
+		}
+	}
+	if (map < 0) return;
+	const uint32_t img0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)];
+	const uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
+	const uint8_t* mem = g.texImage[map];
+	if (!mem || fmt > 1) return;
+	for (int i = 0; i < 4; i++) in.swap[i] = uint8_t((g.bp[BP_TEV_KSEL + 2 * i] & 15) | (g.bp[BP_TEV_KSEL + 2 * i + 1] & 15) << 4);
+	for (int r = 0; r < 4; r++) {
+		const uint32_t ra = g.bp[BP_TEV_REG + 2 * r], bg = g.bp[BP_TEV_REG + 2 * r + 1];
+		in.reg[r][0] = int16_t(sext11(ra & 0x7FF));
+		in.reg[r][1] = int16_t(sext11((bg >> 12) & 0x7FF));
+		in.reg[r][2] = int16_t(sext11(bg & 0x7FF));
+		in.reg[r][3] = int16_t(sext11((ra >> 12) & 0x7FF));
+		const uint32_t ka = g.kreg[2 * r], kb = g.kreg[2 * r + 1];
+		in.konst[r][0] = uint8_t(ka & 0xFF);
+		in.konst[r][1] = uint8_t((kb >> 12) & 0xFF);
+		in.konst[r][2] = uint8_t(kb & 0xFF);
+		in.konst[r][3] = uint8_t((ka >> 12) & 0xFF);
+	}
+	in.nPairs = 1;
+	for (int c = 0; c < 2; c++) {
+		const uint32_t mat = g.xfReg[XFR_MAT0 + c];
+		in.rasConst[c][0] = int16_t(mat >> 24);
+		in.rasConst[c][1] = int16_t((mat >> 16) & 0xFF);
+		in.rasConst[c][2] = int16_t((mat >> 8) & 0xFF);
+		in.rasConst[c][3] = int16_t(mat & 0xFF);
+	}
+	// The map's texel values (a histogram), then which of those pass the alpha test: worked out once
+	// per setup and value (the counters' setups stay the same from frame to frame; 256 TEV
+	// evaluations a map every frame doubled Noki Bay's GX thread).
+	// (a word at a time: goop maps are mostly clean, and a zero word is four clean texels)
+	static uint32_t hist[256];
+	memset(hist, 0, sizeof hist);
+	const uint32_t bytes = fmt == 1 ? w * h : w * h / 2;
+	uint32_t zeroWords = 0, i = 0;
+	if ((uintptr_t(mem) & 3) == 0) {
+		const uint32_t* wp = reinterpret_cast<const uint32_t*>(mem);
+		for (; i + 4 <= bytes; i += 4) {
+			const uint32_t x = wp[i >> 2];
+			if (!x) {
+				zeroWords++;
+				continue;
+			}
+			for (int k = 0; k < 4; k++) {
+				const uint8_t b = uint8_t(x >> (8 * k));
+				if (fmt == 1) hist[b]++;
+				else hist[b >> 4]++, hist[b & 15]++;
+			}
+		}
+	}
+	for (; i < bytes; i++) {
+		if (fmt == 1) hist[mem[i]]++;
+		else hist[mem[i] >> 4]++, hist[mem[i] & 15]++;
+	}
+	hist[0] += zeroWords * (fmt == 1 ? 4 : 8);
+	const uint32_t ac = g.bp[BP_ALPHACOMPARE];
+	uint64_t key = 1469598103934665603ull;
+	auto mix = [&](uint64_t x) { key = (key ^ x) * 1099511628211ull; };
+	mix(n | fmt << 8 | uint64_t(ac & 0xFFFFFF) << 16);
+	for (uint32_t st = 0; st < n; st++) {
+		mix(uint64_t(in.ce[st]) | uint64_t(in.ae[st]) << 24 | uint64_t(in.order[st] & 0x3FF) << 48);
+		mix(in.ksel[st]);
+	}
+	for (int r = 0; r < 4; r++) {
+		mix(uint64_t(uint16_t(in.reg[r][0])) | uint64_t(uint16_t(in.reg[r][1])) << 16 | uint64_t(uint16_t(in.reg[r][2])) << 32 |
+		    uint64_t(uint16_t(in.reg[r][3])) << 48);
+		mix(uint64_t(in.konst[r][0]) | uint64_t(in.konst[r][1]) << 8 | uint64_t(in.konst[r][2]) << 16 | uint64_t(in.konst[r][3]) << 24 |
+		    uint64_t(in.swap[r]) << 32);
+	}
+	struct PassTable {
+		uint64_t key;
+		uint32_t used;
+		uint8_t pass[256];  // 0: not worked out yet, 1: fails, 2: passes
+	};
+	static PassTable s_tables[32];
+	static uint32_t s_tableClock;
+	PassTable* t = nullptr;
+	for (PassTable& x : s_tables)
+		if (x.key == key && x.used) t = &x;
+	if (!t) {  // the least recently used one
+		t = &s_tables[0];
+		for (PassTable& x : s_tables)
+			if (x.used < t->used) t = &x;
+		t->key = key;
+		memset(t->pass, 0, sizeof t->pass);
+	}
+	t->used = ++s_tableClock;
+	const uint32_t ref0 = ac & 0xFF, ref1 = (ac >> 8) & 0xFF, c0 = (ac >> 16) & 7, c1 = (ac >> 19) & 7, op = (ac >> 22) & 3;
+	const int prim[4] = {in.rasConst[0][0], in.rasConst[0][1], in.rasConst[0][2], in.rasConst[0][3]};
+	uint32_t count = 0;
+	for (int v = 0; v < (fmt == 0 ? 16 : 256); v++) {
+		if (!hist[v]) continue;
+		if (!t->pass[v]) {
+			const int tv = fmt == 0 ? v * 17 : v;
+			const int tex[1][4] = {{tv, tv, tv, tv}};
+			const uint32_t a = uint32_t(tevSymGxAlpha(in, tex, prim));
+			const bool p0 = gxCompare(c0, a, ref0), p1 = gxCompare(c1, a, ref1);
+			const bool p = op == 0 ? (p0 && p1) : op == 1 ? (p0 || p1) : op == 2 ? (p0 != p1) : (p0 == p1);
+			t->pass[v] = p ? 2 : 1;
+		}
+		if (t->pass[v] == 2) count += hist[v];
+	}
+	s_pmCount += count;
+	if (s_verbose) {  // each map's count about every 5 s
+		static const uint8_t* s_seen[16];
+		static uint32_t s_when[16];
+		int i = 0;
+		while (i < 16 && s_seen[i] && s_seen[i] != mem) i++;
+		if (i < 16 && (!s_seen[i] || s_rFrames - s_when[i] >= 150)) {
+			s_seen[i] = mem;
+			s_when[i] = s_rFrames;
+			fprintf(stderr, "[gx] pixel count of %p (%ux%u %s): %lu passed\n", (const void*)mem, unsigned(w), unsigned(h),
+			        fmt ? "I8" : "I4", (unsigned long)count);
+		}
+	}
+}
+
 void flushBatch() {
 	if (!s_ready) return;
 	GX_ZONE(GZ_DRAW_REC);
 	PerfScopeExcl ps(PERF_BATCH);
 	if (batchHasVertices()) {
+		if (s_pmActive) pixMetricCount();
 		rcInit();
 		enqueueDraw();
 	}
@@ -5532,6 +6215,7 @@ static bool streamCopyList(const void* list, uint32_t n) {
 // Draw-sync tokens, GX thread -> game thread.
 static const uint32_t kTokens = 256;
 static uint16_t s_tok[kTokens];
+static uint32_t s_tokMetric[kTokens];  // the pixel count as each token passed (pixMetricRead)
 static std::atomic<uint32_t> s_tokHead{0}, s_tokTail{0};
 static uint32_t s_tokDropped;
 static void streamToken(uint16_t t) {
@@ -5541,6 +6225,8 @@ static void streamToken(uint16_t t) {
 		return;
 	}
 	s_tok[h % kTokens] = t;
+	s_tokMetric[h % kTokens] = s_pmCount + 4 * s_pmTris;
+	s_pmActive = false;  // a count runs from its clear to the token its read waits for
 	s_tokHead.store(h + 1, std::memory_order_release);
 	port_irq_kick();
 }
@@ -5550,11 +6236,14 @@ static void streamTokenPoll() {
 		const uint32_t t = s_tokTail.load(std::memory_order_relaxed);
 		if (t == s_tokHead.load(std::memory_order_acquire)) return;
 		const uint16_t token = s_tok[t % kTokens];
+		s_pmTokenValue = s_tokMetric[t % kTokens];
 		s_tokTail.store(t + 1, std::memory_order_release);
 		if (!drawSyncCallback) continue;
 		GXPC_DrawSyncCalls++;
 		const uint64_t t0 = svcGetSystemTick();
+		s_pmInToken = true;
 		drawSyncCallback(token);
+		s_pmInToken = false;
 		GXPC_DrawSyncTicks += svcGetSystemTick() - t0;
 	}
 }
@@ -5828,13 +6517,17 @@ void executeCopy(uint32_t ctrl) {
 		// A new stage (GX3DS_NewStage): the display-list cache and the resident vertex pages start
 		// over, here between two frames (kept, the stages left behind filled the heap).
 		bool fresh = false;
-		if (s_newStage.load(std::memory_order_relaxed)) {
+		// Out of heap (main.cpp's out-of-memory handler gave its reserve back): the same, and the reserve
+		// taken again.
+		const bool relief = SMS3DS_MemReserveSpent && SMS3DS_MemReserveSpent();
+		if (s_newStage.load(std::memory_order_relaxed) || relief) {
 			const uint32_t n = GXPC_DlEntryCount(), kb = uint32_t(GXPC_DlCacheBytes() >> 10);
 			if (GXPC_DlCacheClearNow()) {
 				s_newStage.store(false);
 				s_aresetDue = fresh = true;
-				fprintf(stderr, "[gx] new stage: the display-list cache (%lu lists, %lu KB) and the resident vertex pages (%lu KB) emptied\n",
-				        (unsigned long)n, (unsigned long)kb, (unsigned long)(s_abytes >> 10));
+				fprintf(stderr, "[gx] %s: the display-list cache (%lu lists, %lu KB) and the resident vertex pages (%lu KB) emptied\n",
+				        relief ? "out of heap" : "new stage", (unsigned long)n, (unsigned long)kb, (unsigned long)(s_abytes >> 10));
+				if (relief && SMS3DS_MemReserveRestore) SMS3DS_MemReserveRestore();
 			}
 		}
 		arenaFrameEnd(fresh);
@@ -5899,26 +6592,62 @@ static void renderCopy(const CopyRec* cr) {
 		leftOut = s_skipColourCopies && !exact;
 		uint16_t tw, th;
 		float win[4];
-		pica_copy_tex_layout(rx, ry, rw, rh, half, exact, &tw, &th, win);
+		const float rowScale = efbRowScale();
+		pica_copy_tex_layout(rx, ry, rw, rh, half, exact, rowScale, &tw, &th, win);
 		const int rgb565 = cfmt == 4;  // RGB565: no alpha to keep
 		EfbCopy* c = d ? findEfbCopy(d) : nullptr;
-		if (c && !pica_copy_tex_fits(c->tex, tw, th, rgb565)) {  // another size or format than its last copy
+		if (c && !pica_copy_tex_fits(c->tex, tw, th, rgb565) &&
+		    !(c->reduced && pica_copy_tex_fits(c->tex, tw / 2, th / 2, rgb565))) {  // another size or format than its last copy
 			pica_tex_free(c->tex);
 			s_efbCopies.erase(s_efbCopies.begin() + (c - s_efbCopies.data()));
 			c = nullptr;
 		}
 		if (d && !c) {
+			// The least recently sampled copy other than a map (exact) first, else any (-1: none).
+			auto victim = [&](bool mapsToo) {
+				int v = -1;
+				for (size_t i = 0; i < s_efbCopies.size(); i++) {
+					const uint32_t f = s_efbCopies[i].fmt;
+					const bool map = f == 1 || (f >= 7 && f <= 10);
+					if ((!map || mapsToo) && (v < 0 || s_efbCopies[i].usedFrame < s_efbCopies[size_t(v)].usedFrame)) v = int(i);
+				}
+				return v;
+			};
 			if (s_efbCopies.size() >= kMaxEfbCopies) {  // replace the least recently sampled
-				size_t oldest = 0;
-				for (size_t i = 1; i < s_efbCopies.size(); i++)
-					if (s_efbCopies[i].usedFrame < s_efbCopies[oldest].usedFrame) oldest = i;
-				pica_tex_free(s_efbCopies[oldest].tex);
-				s_efbCopies.erase(s_efbCopies.begin() + oldest);
+				int v = victim(false);
+				if (v < 0) v = victim(true);
+				pica_tex_free(s_efbCopies[size_t(v)].tex);
+				s_efbCopies.erase(s_efbCopies.begin() + v);
 			}
 			PicaTex* t = pica_copy_tex_create(tw, th, rgb565);
+			// No VRAM for a map's copy (a goop map, drawn back and copied every frame): the other
+			// copies give way, least recently sampled first (they are made again when copied next).
+			while (!t && exact) {
+				const int v = victim(false);
+				if (v < 0) break;
+				pica_tex_free(s_efbCopies[size_t(v)].tex);
+				s_efbCopies.erase(s_efbCopies.begin() + v);
+				t = pica_copy_tex_create(tw, th, rgb565);
+				if (t) logCopyOnce(d, "no VRAM for a map's copy: other copies gave way", tw, th);
+			}
+			// No VRAM for it at its size (the copy arena full, the scene's textures in VRAM): at half the
+			// size, which samples the same (the texture holds the copy's window, whatever its size), only
+			// coarser. Without one, draws read the destination's memory, which nothing wrote: on a
+			// console whatever the heap held (Sirena Beach's Phantamanta tints the screen through its
+			// 640x448 alpha copy, the fourth copy of the frame: manta-coloured noise everywhere). Not a
+			// map: its copy must hold its texels as they are (halved, a goop map read back and drawn
+			// again shrank, and its goop moved: Pianta Village, the Bowser fight).
+			bool reduced = false;
+			if (!t && !exact && tw >= 16 && th >= 16) {
+				t = pica_copy_tex_create(tw / 2, th / 2, rgb565);
+				reduced = t != nullptr;
+				if (reduced) logCopyOnce(d, "no VRAM at its size: a texture of half the size", tw, th);
+			}
 			if (t) {
-				s_efbCopies.push_back(EfbCopy{d, t, 0, 0, 0, 0, {0, 0, 1, 1}, s_rFrames, 0, 0});
+				s_efbCopies.push_back(EfbCopy{d, t, 0, 0, 0, 0, {0, 0, 1, 1}, s_rFrames, 0, 0, reduced});
 				c = &s_efbCopies.back();
+			} else if (!exact) {  // a map keeps its memory as the last readback left it
+				lostCopy(d, cfmt, half, rw, rh, tw, th);
 			}
 		}
 		if (c) {
@@ -5935,17 +6664,27 @@ static void renderCopy(const CopyRec* cr) {
 			// A frame a GPU test may have touched (profile runs): a map's copy is left out, so the
 			// map stays as before the test (the goop map is drawn from its last copy, then copied).
 			const bool keep = exact && pica_gpu_test_seen();
-			if (!keep && !leftOut) {
+			// A Z copy as Z24X8 (Bowser's hot tub: the water's height field is drawn as depth and
+			// copied, and the CPU reads it to shape the water and float what is on it): from the
+			// depth buffer, read back to memory.
+			const bool zcopy = pix == 3 && cfmt == 6 && !leftOut;
+			if (zcopy) {
+				pica_efb_depth_copy_to(c->tex, c->win, rowScale);
+				const int dw = half ? int(c->w) / 2 : int(c->w), dh = half ? int(c->h) / 2 : int(c->h);
+				pica_efb_readback(c->tex, const_cast<void*>(d), dw, dh, (dw + 3) / 4, 6, c->x, c->y, c->w, c->h);
+			} else if (!keep && !leftOut) {
 				PerfScope ps(PERF_COPY);
 				// One-channel formats read back with that channel in all four (R8 and I8 as I8),
 				// RA4 / RA8 with red as the intensity.
 				const int rep = cfmt == 0 || cfmt == 1 || cfmt == 8 ? 0 : cfmt == 7 ? 3 : cfmt == 9 ? 1 : cfmt == 10 ? 2
 				                : cfmt == 2 || cfmt == 3 ? 5 : -1;
-				pica_efb_copy_to_ch(c->tex, pix != 1 || cfmt == 4, rep, c->win);
+				pica_efb_copy_to_ch(c->tex, pix != 1 || cfmt == 4, rep, c->win, rowScale);
 			}
-			// One-byte formats (I8, A8, R8, G8, B8) go back to memory too: the CPU may read them
-			// (the goop map, TPollutionLayer::isPolluted).
-			if (!keep && (cfmt == 1 || (cfmt >= 7 && cfmt <= 10))) {
+			// One-byte formats (I8, R8, G8, B8) go back to memory too: the CPU may read them (the goop
+			// map, TPollutionLayer::isPolluted). Not A8: the game's two A8 copies (Sirena Beach's
+			// Phantamanta shadow, 640x448 every frame, and the bath water) only feed the GPU, and
+			// converting the manta's took the render thread ~5 ms a frame on a console.
+			if (!keep && !zcopy && (cfmt == 1 || (cfmt >= 8 && cfmt <= 10))) {
 				const bool intensity = ((ctrl >> 15) & 3) == 3;
 				const int dw = half ? int(c->w) / 2 : int(c->w), dh = half ? int(c->h) / 2 : int(c->h);
 				const int chan = cfmt == 7 ? 3 : cfmt == 9 ? 1 : cfmt == 10 ? 2 : cfmt == 1 && intensity ? 4 : 0;
@@ -5955,6 +6694,10 @@ static void renderCopy(const CopyRec* cr) {
 			}
 			logCopyKind(c, ctrl, pix);
 		}
+		if (s_tracing)
+			fprintf(tf(), "[trace]   copy to %p: %s (%ux%u texture, %u copies kept)\n", d,
+			        c ? (pica_tex_where(c->tex), "kept as a copy texture") : d ? "NO COPY TEXTURE (draws read the memory)" : "no destination",
+			        unsigned(tw), unsigned(th), unsigned(s_efbCopies.size()));
 	}
 	if (clear || disp) {
 		// BP 0x4F: A<<8|R, 0x50: G<<8|B, 0x51: 24-bit Z.
@@ -5972,8 +6715,9 @@ static void renderCopy(const CopyRec* cr) {
 			pica_clear(rgba, rs.bp[BP_CLEAR_Z] & 0xFFFFFF);
 		} else if (clear && !leftOut) {  // a texture copy clears its source rectangle only
 			const uint32_t tl = rs.bp[BP_COPY_SRC_TL], wh = rs.bp[BP_COPY_SRC_WH];
-			pica_clear_rect(float(tl & 0x3FF), float((tl >> 10) & 0x3FF), float((wh & 0x3FF) + 1),
-			                float(((wh >> 10) & 0x3FF) + 1), rgba, rs.bp[BP_CLEAR_Z] & 0xFFFFFF);
+			const float rows = efbRowScale();
+			pica_clear_rect(float(tl & 0x3FF), float((tl >> 10) & 0x3FF) / rows, float((wh & 0x3FF) + 1),
+			                float(((wh >> 10) & 0x3FF) + 1) / rows, rgba, rs.bp[BP_CLEAR_Z] & 0xFFFFFF);
 		}
 	}
 	if (disp) {
@@ -6007,8 +6751,17 @@ unsigned efbCopyLookup(const void*, int*, int*) { return 0; }
 // GREATER). Reported in view until the EFB can be peeked (no silhouette behind walls meanwhile).
 uint32_t peekColor(int, int) { return 0x10000000u; }
 uint32_t peekZ(int, int) { return 0; }
-void pixMetricClear() {}
-uint32_t pixMetricRead() { return 0; }
+// Pixel metrics (GXClearPixMetric, GXReadPixMetric): pixMetricCount below; the read is what that
+// counted (with each draw-sync token: pixMetricToken).
+void pixMetricClear() {
+	s_pmCount = s_pmTris = 0;
+	s_pmActive = true;
+}
+uint32_t pixMetricRead() {
+	if (s_pmInToken) return s_pmTokenValue;
+	s_pmActive = false;
+	return s_pmCount + 4 * s_pmTris;
+}
 bool rendererReady() { return s_ready; }
 float efbScale() { return 1.0f; }
 

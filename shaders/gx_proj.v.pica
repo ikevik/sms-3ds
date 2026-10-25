@@ -1,0 +1,324 @@
+; GX vertex shader with projective texgens on the GPU path (gx_pass.v.pica's variant, loaded with
+; settings.txt gpu_projective = on; pica_set_projective_shader): as gx_pass, plus pj in GPU mode.
+; Each output register is written once: on a New 3DS the GPU locked up when gx_pass wrote an output
+; in pieces, and this variant's first try, which wrote texcoord0w twice, hung it at the title screen
+; (Azahar ran both).
+;
+; cpu = true: the CPU has already applied the GameCube's position matrix, projection and
+;   viewport. v0 is a homogeneous position in EFB pixels with the GameCube depth in z, v1-v3 the
+;   texture coordinates of units 0-2, v4 a 0..255 colour. F is the EFB-pixels -> PICA projection.
+;   pj: unit 0's coordinate is projective, (s q, t q) in v1 with q in v3.x, which goes out as
+;   texcoord0w for a texture unit 0 in projection mode (the divide by q per pixel); else 1.
+;
+; cpu = false: GameCube vertices as the GX front half decoded them, transformed here.
+;   v0 position (x, y, z), v1 normal, v2 the colour channel's colour (0..255), v3-v5 up to three
+;   texture coordinate attributes (s, t), v6 the position matrix row index (GX PNMTX: 0, 3, ..27).
+;   P: position matrix rows 0-29 (XF memory words 0-119). N: normal matrix rows (matrix k's are
+;   N[3k..3k+2], XF words 256 + 3 * row).
+;   F: view space -> clip (GX projection, viewport and the PICA projection, composed on the CPU).
+;   Texture unit u: source = W[2u].x pos + W[2u].y normal + W[2u].z v3 + W[2u].w v4 + W[2u+1].x v5,
+;   coordinate = (T[2u] . source, T[2u+1] . source) (texgen, texture/post matrix, EFB copy rect);
+;   pj: unit 0's texgen is projective, its q = TQ . source goes out as texcoord0w (the divide per
+;   pixel, as in cpu mode; else 1); with it, units 1 and 2's coordinates are divided per vertex by
+;   TQ1 . their source (their q row when theirs are projective too, one row between them, else
+;   (0, 0, 0, 1)): fine meshes only (Bowser's hot tub's water: an environment map on unit 0 and the
+;   screen twice).
+;   Colour = v2 / 255 * CS + CM (the channel's material), and when lit (lighting on, with normals)
+;   times GX's lighting, clamp(AMB + each light's LC times its diffuse term), the light from LP (its
+;   view-space position) to the vertex and the view-space normal N[idx..idx+2] . normal normalised;
+;   the diffuse term max(N.L, LF.x) * LF.y + LF.z gives GX's clamp (LF 0 1 0), sign (-1e20 1 0) and
+;   none (any 0 1). The rgb and the alpha are lit apart: a channel lighting is off for has AMB 1, LC 0.
+;   l0, l1: lights 0 and 1 used (pica_draw.c leaves draws with more on the CPU path). a0, a1: the
+;   light is a spot light, its term times max(0, LA . (1, c, c^2)) / (LK . (1, d, d^2)), c = max(L . LD,
+;   0) with L the unit vector to the light, d the distance to it (else no attenuation). s0, s1: the
+;   light is a specular one, its term (LA . (1, c, c^2)) / (LK . (1, c, c^2)), c = max(N . LD, 0)
+;   where N . L > 0 (LD the half-angle direction), as Dolphin computes it.
+;   Per draw, work that would not change the result is skipped (most of the shader's cost): lit
+;   (the shade, else 1), tuN (texture unit N is used, else its coordinate is 0) and tdN (unit N's
+;   source is exactly attribute v(3+N), so the coordinate is (T[2N] . v, T[2N+1] . v)).
+
+.fvec F[4]
+.fvec P[30]
+.fvec N[30]
+.fvec T[6]
+.fvec TQ
+.fvec TQ1
+.fvec W[6]
+.fvec CS
+.fvec CM
+.fvec AMB
+.fvec LP[2]
+.fvec LC[2]
+.fvec LF[2]
+.fvec LA[2]
+.fvec LK[2]
+.fvec LD[2]
+.bool cpu
+.bool lit
+.bool l0
+.bool l1
+.bool a0
+.bool a1
+.bool s0
+.bool s1
+.bool tu0
+.bool tu1
+.bool tu2
+.bool td0
+.bool td1
+.bool td2
+.bool pj
+
+.constf k0(1.0, 0.0, 0.00392156862745098, 1e-20)
+
+.out outpos position
+.out outtc0 texcoord0
+.out outtc0w texcoord0w
+.out outtc1 texcoord1
+.out outtc2 texcoord2
+.out outclr color
+
+.proc main
+	ifu cpu
+		dp4 outpos.x, F[0], v0
+		dp4 outpos.y, F[1], v0
+		dp4 outpos.z, F[2], v0
+		dp4 outpos.w, F[3], v0
+		mov outtc0, v1
+		mov outtc1, v2
+		mov outtc2, v3
+		mul outclr, k0.zzzz, v4
+		ifu pj
+			mov outtc0w, v3.x
+		.else
+			mov outtc0w, k0.x
+		.end
+	.else
+		; position: view = P[idx..idx+2] . (pos, 1); clip = F . view
+		mova a0.x, v6.x
+		mov r0.xyz, v0
+		mov r0.w, k0.x
+		dp4 r1.x, P[a0.x], r0
+		dp4 r1.y, P[a0.x+1], r0
+		dp4 r1.z, P[a0.x+2], r0
+		mov r1.w, k0.x
+		dp4 outpos.x, F[0], r1
+		dp4 outpos.y, F[1], r1
+		dp4 outpos.z, F[2], r1
+		dp4 outpos.w, F[3], r1
+
+		; colour
+		mul r5, k0.zzzz, v2
+		mul r5, CS, r5
+		add r5, CM, r5
+
+		; GX lighting: the material times clamp(AMB + the lights)
+		ifu lit
+			dp3 r4.x, N[a0.x], v1
+			dp3 r4.y, N[a0.x+1], v1
+			dp3 r4.z, N[a0.x+2], v1
+			dp3 r4.w, r4, r4
+			add r4.w, k0.wwww, r4.w
+			rsq r4.w, r4.w
+			mul r4.xyz, r4.www, r4.xyz
+			mov r3, AMB
+			ifu l0
+				mov r2, -r1
+				add r2, LP[0], r2
+				dp3 r2.w, r2, r2
+				add r2.w, k0.wwww, r2.w
+				rsq r6.x, r2.w
+				mul r2.xyz, r6.xxx, r2.xyz
+				dp3 r7.x, r4, r2
+				max r7.x, LF[0].xxxx, r7.x
+				mul r7.x, LF[0].yyyy, r7.x
+				add r7.x, LF[0].zzzz, r7.x
+				ifu a0
+					; r8 = (1, d, d^2): the distance term LK . r8; r9 = (1, c, c^2): the angle term LA . r9
+					mov r8.x, k0.x
+					mul r8.y, r2.w, r6.x
+					mov r8.z, r2.w
+					dp3 r8.w, LK[0], r8
+					max r8.w, k0.wwww, r8.w
+					rcp r8.w, r8.w
+					mov r9.x, k0.x
+					dp3 r9.y, LD[0], r2
+					max r9.y, k0.yyyy, r9.y
+					mul r9.z, r9.y, r9.y
+					dp3 r9.w, LA[0], r9
+					max r9.w, k0.yyyy, r9.w
+					mul r9.w, r8.w, r9.w
+					mul r7.x, r9.w, r7.x
+				.end
+				ifu s0
+					; r9 = (1, c, c^2)
+					dp3 r8.x, r4, r2
+					slt r8.x, k0.yyyy, r8.x
+					dp3 r9.y, LD[0], r4
+					max r9.y, k0.yyyy, r9.y
+					mul r9.y, r8.x, r9.y
+					mul r9.z, r9.y, r9.y
+					mov r9.x, k0.x
+					dp3 r9.w, LA[0], r9
+					max r9.w, k0.yyyy, r9.w
+					dp3 r8.w, LK[0], r9
+					max r8.w, k0.wwww, r8.w
+					rcp r8.w, r8.w
+					mul r7.x, r9.w, r8.w
+				.end
+				mul r2, LC[0], r7.xxxx
+				add r3, r3, r2
+			.end
+			ifu l1
+				mov r2, -r1
+				add r2, LP[1], r2
+				dp3 r2.w, r2, r2
+				add r2.w, k0.wwww, r2.w
+				rsq r6.x, r2.w
+				mul r2.xyz, r6.xxx, r2.xyz
+				dp3 r7.x, r4, r2
+				max r7.x, LF[1].xxxx, r7.x
+				mul r7.x, LF[1].yyyy, r7.x
+				add r7.x, LF[1].zzzz, r7.x
+				ifu a1
+					; r8 = (1, d, d^2): the distance term LK . r8; r9 = (1, c, c^2): the angle term LA . r9
+					mov r8.x, k0.x
+					mul r8.y, r2.w, r6.x
+					mov r8.z, r2.w
+					dp3 r8.w, LK[1], r8
+					max r8.w, k0.wwww, r8.w
+					rcp r8.w, r8.w
+					mov r9.x, k0.x
+					dp3 r9.y, LD[1], r2
+					max r9.y, k0.yyyy, r9.y
+					mul r9.z, r9.y, r9.y
+					dp3 r9.w, LA[1], r9
+					max r9.w, k0.yyyy, r9.w
+					mul r9.w, r8.w, r9.w
+					mul r7.x, r9.w, r7.x
+				.end
+				ifu s1
+					; r9 = (1, c, c^2)
+					dp3 r8.x, r4, r2
+					slt r8.x, k0.yyyy, r8.x
+					dp3 r9.y, LD[1], r4
+					max r9.y, k0.yyyy, r9.y
+					mul r9.y, r8.x, r9.y
+					mul r9.z, r9.y, r9.y
+					mov r9.x, k0.x
+					dp3 r9.w, LA[1], r9
+					max r9.w, k0.yyyy, r9.w
+					dp3 r8.w, LK[1], r9
+					max r8.w, k0.wwww, r8.w
+					rcp r8.w, r8.w
+					mul r7.x, r9.w, r8.w
+				.end
+				mul r2, LC[1], r7.xxxx
+				add r3, r3, r2
+			.end
+			max r3, k0.yyyy, r3
+			min r3, k0.xxxx, r3
+			mul r5, r3, r5
+		.end
+		mov outclr, r5
+
+		; texture sources: r0 = (pos, 1), r6 = (normal, 1)
+		; On a New 3DS the GPU locked up (never finished the frame) when this section used mad and
+		; wrote outtcN.x and .y with separate dp4s; Azahar ran it. Plain mul/add, and each coordinate
+		; built in r9 and written whole, as the rest of the shader does.
+		mov r6.xyz, v1
+		mov r6.w, k0.x
+
+		mov r9, k0.yyyy
+		mov r11, k0.xxxx
+		ifu tu0
+			ifu td0
+				dp4 r9.x, T[0], v3
+				dp4 r9.y, T[1], v3
+				ifu pj
+					dp4 r11.x, TQ, v3
+				.end
+			.else
+				mul r7, W[0].xxxx, r0
+				mul r8, W[0].yyyy, r6
+				add r7, r7, r8
+				mul r8, W[0].zzzz, v3
+				add r7, r7, r8
+				mul r8, W[0].wwww, v4
+				add r7, r7, r8
+				mul r8, W[1].xxxx, v5
+				add r7, r7, r8
+				dp4 r9.x, T[0], r7
+				dp4 r9.y, T[1], r7
+				ifu pj
+					dp4 r11.x, TQ, r7
+				.end
+			.end
+		.end
+		mov outtc0, r9
+		mov outtc0w, r11.x
+
+		mov r9, k0.yyyy
+		ifu tu1
+			ifu td1
+				dp4 r9.x, T[2], v4
+				dp4 r9.y, T[3], v4
+				ifu pj
+					dp4 r10.x, TQ1, v4
+					rcp r10.x, r10.x
+					mul r9, r9, r10.xxxx
+				.end
+			.else
+				mul r7, W[2].xxxx, r0
+				mul r8, W[2].yyyy, r6
+				add r7, r7, r8
+				mul r8, W[2].zzzz, v3
+				add r7, r7, r8
+				mul r8, W[2].wwww, v4
+				add r7, r7, r8
+				mul r8, W[3].xxxx, v5
+				add r7, r7, r8
+				dp4 r9.x, T[2], r7
+				dp4 r9.y, T[3], r7
+				ifu pj
+					dp4 r10.x, TQ1, r7
+					rcp r10.x, r10.x
+					mul r9, r9, r10.xxxx
+				.end
+			.end
+		.end
+		mov outtc1, r9
+
+		mov r9, k0.yyyy
+		ifu tu2
+			ifu td2
+				dp4 r9.x, T[4], v5
+				dp4 r9.y, T[5], v5
+				ifu pj
+					dp4 r10.x, TQ1, v5
+					rcp r10.x, r10.x
+					mul r9, r9, r10.xxxx
+				.end
+			.else
+				mul r7, W[4].xxxx, r0
+				mul r8, W[4].yyyy, r6
+				add r7, r7, r8
+				mul r8, W[4].zzzz, v3
+				add r7, r7, r8
+				mul r8, W[4].wwww, v4
+				add r7, r7, r8
+				mul r8, W[5].xxxx, v5
+				add r7, r7, r8
+				dp4 r9.x, T[4], r7
+				dp4 r9.y, T[5], r7
+				ifu pj
+					dp4 r10.x, TQ1, r7
+					rcp r10.x, r10.x
+					mul r9, r9, r10.xxxx
+				.end
+			.end
+		.end
+		mov outtc2, r9
+	.end
+	end
+.end

@@ -60,6 +60,10 @@ endif
 ifeq ($(HEAPCHECK),1)
 CFLAGS   += -DSMS3DS_HEAPCHECK=1
 endif
+# ETC1=1: CMPR textures as ETC1 unless settings.txt says etc1_textures = off (a test build's default).
+ifeq ($(ETC1),1)
+CFLAGS   += -DSMS3DS_ETC1_DEFAULT=1
+endif
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
