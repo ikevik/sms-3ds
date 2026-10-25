@@ -46,7 +46,10 @@ APP_TITLE   := Super Mario Sunshine ($(DEMO) demo)
 endif
 APP_DESCRIPTION := Native 3DS port (WIP) - requires your own GMSE01 disc image
 APP_AUTHOR      := ikevik
-# ICON := gfx/icon.png   (uncomment once you have a 48x48 icon)
+# A local build's icon (48x48): meta/icon.png, when present (not in the repository). The release's
+# .3dsx keeps the default icon (scripts/cia/package.sh: ICON=); the CIA builder gives the player's
+# copy one made from their own disc.
+ICON := $(if $(wildcard meta/icon.png),meta/icon.png,)
 
 # New 3DS strongly recommended: see docs/PORTING.md
 ARCH     := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
@@ -145,12 +148,17 @@ ifeq ($(strip $(NO_SMDH)),)
 	export _3DSXFLAGS += --smdh=$(CURDIR)/$(TARGET).smdh
 endif
 
-.PHONY: all clean
+.PHONY: all clean cia
 all: $(BUILD)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 clean:
 	@echo clean ...
 	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf
+# make MODE=game cia ISO=<GMSE01.iso>: build/cia/$(TARGET).cia, its icon, banner and banner sound made
+# from that disc (scripts/cia/build_cia.py; makerom and bannertool from scripts/cia/build_tools.sh).
+cia: all
+	@python3 -I scripts/cia/build_cia.py $(if $(ISO),"$(ISO)") --elf $(TARGET).elf --3dsx $(TARGET).3dsx \
+		--tools build/tools/dist --out build/cia
 $(BUILD):
 	@mkdir -p $@
 else

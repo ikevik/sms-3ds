@@ -10,3 +10,16 @@ rom/*
 *.ciso
 build3ds/
 build3ds-*/
+
+# A local build's own icon and art (meta/icon.png, the Makefile's ICON): not in the repository, as
+# the release carries no Nintendo art (scripts/cia/build_cia.py makes the player's from their disc)
+meta/*.png
+meta/*.wav
+meta/*.bnr
+
+# The CIA builder run from the repository (scripts/cia/build_cia.py: output/ and its module cache)
+scripts/cia/output/
+scripts/cia/__pycache__/
+
+# macOS folder metadata
+.DS_Store

@@ -1,46 +1,176 @@
-# Super Mario Sunshine – Nintendo 3DS port (WIP)
+# Super Mario Sunshine – New Nintendo 3DS port (beta)
 
-A native 3DS port of Super Mario Sunshine (GMSE01, NTSC-U rev 0), modelled on how
-the existing handheld/PC ports of GameCube decompilations are structured. No game
-data is included: the port reads everything from **your own disc image** on the SD card.
+A native port of Super Mario Sunshine (GMSE01, NTSC-U) to the New Nintendo 3DS. The decompiled
+game code is compiled for the 3DS's ARM CPU, its GameCube graphics (GX) are translated to the
+3DS's PICA200 GPU, and its sound plays on the 3DS's DSP. No game data, art or music is included:
+the port reads everything from **your own disc image** on the SD card.
 
-## Status
+## Status: 0.1.0-beta
 
-Stage 0 – bring-up. Builds a `.3dsx` that:
-- boots, enables New 3DS 804 MHz mode,
-- finds and validates `sdmc:/sms/GMSE01.iso` and walks its file system,
-- reads the pad (Circle Pad, C-stick, ZL/ZR) into a GameCube-style status,
-- draws the test triangle through the citro3d path.
+What works:
 
-Not implemented yet: the decomp integration, the GX backend, audio, memory card. See `docs/PORTING.md`.
+- The game, from the opening to the final Bowser fight, on a New 3DS, New 3DS XL or New 2DS XL.
+- Music and sound on the DSP, with JAudio on its own core; the movies.
+- Saves, as memory card files on the SD card (`SD:/sms/card-a/`).
+- Launching from the Homebrew Launcher, or from the HOME Menu once the CIA is installed.
 
-## Build
+Speed: with the release's `settings.txt` (its `lite = plus` trades), Delfino Plaza plays at about
+27 frames a second while moving on a New 3DS; the game's own cap is 30.
 
-```sh
-# 1. devkitPro + 3ds-dev (macOS: use the devkitPro pkg installer, then)
-sudo dkp-pacman -S 3ds-dev
-export DEVKITPRO=/opt/devkitpro
-export DEVKITARM=$DEVKITPRO/devkitARM
+Known issues:
 
-# 2. build
-make -j
+- The final Bowser fight runs slowly: its hot-tub water is drawn by the CPU.
+- The warp portals (Delfino Plaza's statue, the hut and the lighthouse) are not drawn on a New 3DS,
+  although they show in the Azahar emulator.
+- Reported, not yet confirmed: in Bianco Hills' first episode, part of a hill shows when it should
+  be hidden.
+- The Old 3DS is not supported: it is too slow.
+- The bottom screen shows the port's status text (frame times and counts), not a game screen.
 
-# 3. run in Azahar/Citra, or copy sms3ds.3dsx to sdmc:/3ds/ and launch from the Homebrew Launcher
+## Installing
+
+You need:
+
+- A New 3DS, New 3DS XL or New 2DS XL with custom firmware (Luma3DS).
+- Your own Super Mario Sunshine disc image: USA (GMSE01), a plain 1.4 GB `.iso`.
+- For sound, the DSP firmware dump `SD:/3ds/dspfirm.cdc` (run DSP1 once if you never have).
+
+Each release has two zips:
+
+| File | What it is |
+|---|---|
+| `sms3ds-<version>.zip` | The game for the Homebrew Launcher (`3ds/sms3ds/sms3ds.3dsx`), the tested `sms/settings.txt`, the README and the licences. |
+| `SMS-3DS-CIA-Builder-<version>.zip` | Makes the `.cia` for the HOME Menu from your disc image (below). |
+
+Copy these to the SD card:
+
+```
+SD:/sms/GMSE01.iso            your disc image
+SD:/sms/settings.txt          from the zip (without it the game writes slower defaults)
+SD:/3ds/sms3ds/sms3ds.3dsx    for the Homebrew Launcher
 ```
 
-Put your disc image at `sdmc:/sms/GMSE01.iso` (uncompressed ISO/GCM).
+### The HOME Menu (.cia)
+
+No `.cia` is published: its icon (the Shine Sprite), its banner (the title logo) and the banner's
+sound (the first seconds of the title theme) are made from your own disc, so the release carries
+none of Nintendo's art or music. The builder takes about half a minute and needs Python 3.8 or
+newer (no packages).
+
+- Windows: unzip the builder and double-click `Build SMS CIA.bat`, then choose your disc image.
+- macOS: double-click `Build SMS CIA.command` and drag your disc image into its window. The first
+  time, macOS refuses it as from an unidentified developer: right-click it and choose Open.
+- Linux: `python3 build_cia.py /path/to/GMSE01.iso`, with `makerom` and `bannertool` on your
+  `PATH` (built from the sources in the credits below).
+
+It writes `output/sms3ds.cia` and `output/sd-card/` (the same SD files as above, the `.3dsx` with
+the same icon). Copy `sms3ds.cia` to `SD:/cias/`, then in FBI choose SD → cias → sms3ds.cia →
+Install CIA. Please don't share the built `.cia`: it carries art and music from your disc.
+
+## Controls
+
+| 3DS | Game |
+|---|---|
+| Circle Pad | Control stick |
+| C-Stick (New 3DS) | C-stick (camera) |
+| A, B, X, Y | A, B, X, Y |
+| L, R | L and R, pressed all the way |
+| ZL or ZR | Z |
+| D-pad, START | D-pad, START |
+| SELECT | R as a soft press (FLUDD sprays while Mario moves) or a hard one (Mario stops to aim) |
+| START + SELECT | Quit |
+
+## Settings
+
+`SD:/sms/settings.txt` is read at start, and each setting there has a comment saying what it does.
+The ones a player may want:
+
+- `lite`: `plus` (the release's) trades some detail for speed: Mario's and Yoshi's shadows only, a
+  quarter of the particles, a coarser sea, no mirror or Shine shadow. Leave it out for the full
+  detail, which is slower.
+- `audio_thread = core2`: JAudio on its own core (the release's).
+- `etc1_textures = on`: compressed textures as ETC1, so more of them fit in the GPU's memory
+  (faster in Bianco Hills and Delfino Plaza; a little colour loss, about a second more per stage
+  load).
+- `r_press`: `hard` or `soft`, the R press the game starts with (SELECT switches it).
+- `debug_input = on`: the port's debug and test controls (the touch screen, L + SELECT, buttons
+  held at launch). Off by default.
+
+## Building from source
+
+The build runs on macOS or Linux. It needs:
+
+- devkitPro with the `3ds-dev` group (devkitARM, libctru, citro3d, picasso, 3dsxtool):
+  https://devkitpro.org/wiki/Getting_Started, then `sudo dkp-pacman -S 3ds-dev`.
+- git, make, patch and Python 3.
+
+```sh
+git clone --recursive https://github.com/ikevik/sms-3ds.git
+cd sms-3ds
+export DEVKITPRO=/opt/devkitpro DEVKITARM=/opt/devkitpro/devkitARM
+
+scripts/apply_patches.sh            # build/decomp-patched: the decomp with sms-pc-port's and decomp-patches/ applied
+scripts/prepare_pcport.sh           # build/pcport-3ds: sms-pc-port with patches/sms-port/ applied
+scripts/build_game_lib.sh -j8       # build/libsms_game.a: the game, JSystem and the movie player
+scripts/build_platform_lib.sh -j8   # build/libsms_platform.a: sms-pc-port's SDK layer and the 3DS's
+scripts/undefined_symbols.sh        # what the game needs from the layers below it
+scripts/link_test.sh                # build/linktest/gx_stubs.o (its trial link then fails: expected)
+scripts/build_gx_lib.sh             # build/libsms_gx.a: GX's front half and the 3DS renderer
+make MODE=game -j8                  # sms3ds.3dsx
+```
+
+The submodules (`decomp/`, `ext/sms-pc-port/`) are never modified: the scripts patch copies of
+them under `build/`. What to run again after a change:
+
+- `source_game/`, `platform/3ds/pica/` or `shaders/`: `make MODE=game` only (they are the app's).
+- `platform/3ds/*.c*`: `scripts/build_platform_lib.sh`; `platform/3ds/gx/`: `scripts/build_gx_lib.sh`.
+- `decomp-patches/`: `scripts/apply_patches.sh`, then the game library.
+- `patches/sms-port/`: `scripts/prepare_pcport.sh`, then all three libraries.
+
+A local build's icon can be any 48x48 PNG at `meta/icon.png` (not in the repository). With the
+tools that `scripts/cia/build_tools.sh` builds (macOS, with mingw-w64 for the Windows ones),
+`make MODE=game cia ISO=/path/to/GMSE01.iso` writes `build/cia/sms3ds.cia`, and
+`scripts/cia/package.sh <version>` writes a release's two zips to `build/release/<version>/`.
 
 ## Layout
 
 ```
-source/            entry point (later: glue into the decomp's main)
-platform/3ds/      replacements for the GameCube SDK, same idea as sms-pc-port's platform/
-  gcm_disc.*         DVD layer: GCM/FST reader over the SD card
-  pad_3ds.*          PAD layer: 3DS input -> GC pad status
-  gx_citro3d.*       GX layer: GX -> citro3d / PICA200 (stub + bring-up)
+source_game/       the 3DS app: entry point, settings, the main loop
+platform/3ds/      3DS stand-ins for the GameCube SDK: pad, DSP audio, disc, movies, profiler
+  gx/                GX -> PICA200: the renderer (gx3ds_backend.cpp) and the TEV compiler
+  pica/              citro3d drawing, EFB copies, the GPU command ring
 shaders/           PICA200 vertex shaders (.v.pica)
-decomp/            (add) matching decomp as a git submodule
-decomp-patches/    (add) 3DS-only edits applied to copies of decomp sources
-docs/              PORTING.md: architecture, prior art, constraints, roadmap
-scripts/           setup.sh
+decomp/            the decompilation (chasem-dev/sms-english), a submodule
+ext/sms-pc-port/   the PC port (chasem-dev/sms-pc-port), a submodule
+decomp-patches/    3DS-only edits to the decomp
+patches/sms-port/  3DS-only edits to sms-pc-port
+scripts/           the build steps; scripts/cia/: the CIA builder and the release packaging
+docs/              PORTING.md (prior art, design), STAGE1.md, audio-3ds.md, native-j3d.md
+source/            the first bring-up app (make without MODE=game)
 ```
+
+## Credits
+
+The port is built from, or takes code from:
+
+| Project | What the port takes from it |
+|---|---|
+| [doldecomp/sms](https://github.com/doldecomp/sms) | The Super Mario Sunshine decompilation (CC0). sms-english forked from it; game code that looks wrong in sms-english is checked against it. |
+| [chasem-dev/sms-english](https://github.com/chasem-dev/sms-english) | The decompilation the game code is built from (`decomp/`, CC0), complete for the US version (GMSE01). |
+| [chasem-dev/sms-pc-port](https://github.com/chasem-dev/sms-pc-port) | The native PC port this one is built on (`ext/sms-pc-port/`, MIT): its stand-ins for the GameCube SDK, its GX front end and texture decoders, and its decomp patches. The 3DS changes to it are in `patches/sms-port/`. |
+| [chasem-dev/sms-switch](https://github.com/chasem-dev/sms-switch) | The POSIX shim headers in `platform/3ds/include/` (MIT), and the layout of a console port on top of sms-pc-port. |
+| [chasem-dev/sms-launcher](https://github.com/chasem-dev/sms-launcher) | The bring-your-own-disc model: the player's disc image is checked, and nothing from it ships. |
+| [devkitPro](https://devkitpro.org): devkitARM, [libctru](https://github.com/devkitPro/libctru), [citro3d](https://github.com/devkitPro/citro3d) | The toolchain, the 3DS system library and the GPU library. `platform/3ds/pica/c3d_uniforms.c` stands in for citro3d's uniforms object (zlib licence). |
+| [3DSGuy/Project_CTR](https://github.com/3DSGuy/Project_CTR) | makerom, which builds the .cia (`scripts/cia/`). |
+| [diasurgical/bannertool](https://github.com/diasurgical/bannertool) | bannertool (Steveice10's, in diasurgical's fork), which makes the HOME Menu icon and banner. |
+
+It also learned from:
+
+| Project | What it showed |
+|---|---|
+| [2gifts/melee-3ds](https://github.com/2gifts/melee-3ds) | A decompilation ported to the New 3DS. Its CIA builder, which makes the HOME Menu art from the player's own disc, is the model for `scripts/cia/`. |
+| [MiniBandit/MKW-3DS](https://github.com/MiniBandit/MKW-3DS) | Renderer ideas for citro3d (translate once rather than every frame; leave out GPU state that has not changed) and the same builder approach. |
+| [Dolphin](https://github.com/dolphin-emu/dolphin) | How the GameCube's GPU behaves: TEV arithmetic (the TEV compiler's checker), lighting and texture formats. |
+| [Azahar](https://github.com/azahar-emu/azahar) | The 3DS emulator every change is tested in first. |
+
+More prior art, and what was taken from each, is in `docs/PORTING.md`.

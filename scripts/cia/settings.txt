@@ -1,0 +1,126 @@
+# Super Mario Sunshine (3DS) settings: one "name = value" a line, read at start.
+# Lines starting with # are ignored. Delete this file to get the defaults back.
+
+# Gameplay frame rate: 30 (the game's own) or 60. At 60 the game's logic runs twice as
+# often, which the 3DS cannot keep up with.
+frame_rate = 30
+
+# The heat-wave shimmer in sunny places (a screen copy and a full-screen pass each frame):
+# on or off. Off on the 3DS for speed.
+heat_haze = off
+
+# Skip the game's movies: on or off.
+skip_movies = off
+
+# Game audio (docs/audio-3ds.md): on (music and sound effects, mixed by the 3DS's DSP), off (no
+# sound: a little faster), software (sms-pc-port's software mixer instead, to compare) or silent
+# (the game's sound driver runs and nothing plays, to measure). on and software need
+# sdmc:/3ds/dspfirm.cdc (made once by the DSP1 homebrew); without it the game runs without sound.
+audio = on
+# JAudio updates each voice every N subframes of 2.5 ms: 2 (the default: about half the work, the
+# same sound to the ear, since the 3DS's DSP takes a voice's state every 4.9 ms anyway) or 1 (the
+# game's own).
+audio_update_interval = 2
+# Where JAudio's sequencer and voice updates run: game (JAudio's own audio thread, taking turns
+# with the game thread on its core) or core2 (a thread on core 2, the game's sound code kept apart
+# from it by a lock, as the GameCube kept them apart by interrupts).
+# audio_thread = game
+# With audio not off: every N seconds turn to the next of on, software and silent, and log what
+# each costs ([audio] lines). 0: stay.
+# audio_cycle = 10
+
+# Delfino Plaza's Shine shadow: how many of its 5 shells to draw (0: all 5). Each costs
+# about 1 ms a frame; they only soften the shadow's edge over a pixel or two.
+shine_shadow_shells = 1
+
+# Small mipmapped textures drawn with their smaller levels, as the GameCube does (on), or
+# at full size everywhere (off). On is faster and shimmers less in the distance.
+mipmaps = on
+
+# The game's GX state resets written as precomputed blocks (on), with the same result as its
+# own calls (off), which cost several ms a frame. Off is for comparing the two.
+gx_state_blocks = on
+
+# Each GX state reset sent to the GX thread as one command with its final values (on), or as
+# its separate register writes (off). The same registers either way.
+gx_state_block_ops = on
+
+# That command compiled once per block, its values in the order the API keeps them (on), or
+# worked out entry by entry each time (off). The same registers either way.
+gx_state_block_compiled = on
+
+# The whole linear heap flushed from the CPU caches at each frame's end, as citro3d does (on),
+# or only the buffers flushed by their own ranges (off: an experiment; the GPU hung at the
+# first scene change with it off).
+heap_flush = on
+
+# The reset the lights call loads its 8 null textures once (on), or twice as the original (off):
+# the second set rewrites every register the first set wrote, with the same values.
+reset_textures_once = on
+
+# The state-only display lists the GX thread has cached (materials, vertex formats) replayed as
+# register words, skipping writes that change nothing (on), or command by command (off). The
+# same result either way; off is for comparing the two.
+gx_fast_state_lists = on
+
+# J3D models drawn natively (docs/native-j3d.md): their GX calls sent as one op per material and
+# shape, drawn from what the GX thread compiled (on), the calls as before (off), or both, the
+# ops checked against what the calls leave (check), or on with the render thread's registers
+# checked before each native draw (verify), in the draw buffers named. On saves Delfino Plaza's
+# frame about 2 ms, with the same pixels (verify mode: 0 differences).
+# native_j3d = on
+# native_j3d_buffers = MapOpa,StaticMapObj_SunOpa
+# Native shapes drawn from compiled blocks once they have drawn natively (on), or found and
+# checked in the display-list cache on every draw (off). The same draws either way.
+# native_j3d_packages = on
+
+# The sea's vertices worked out once per column and row (on), or vertex by vertex as the
+# original (off). The same vertices, bit for bit; on saves most of its exact sines.
+sea_precomputed = on
+
+# Materials the renderer's stage-by-stage translation gets wrong (NPCs' colours, the Shine
+# Gate's graffiti, the hot Chain Chomp) compiled through their algebra and checked against the
+# GameCube's arithmetic (on), or drawn as translated (off).
+tev_compiler = on
+
+# The news ticker's glyphs wholly outside its window left out (on), or every glyph of the
+# message drawn each frame as the original (off). The same pixels: the window's scissor
+# leaves nothing of a glyph outside it.
+ticker_clipped = on
+
+# The event watcher's lookups of objects by name answered from a cache (on), or each one a
+# full search of the scene's objects as the original (off). The same answers: the cache
+# drops them whenever the scene's objects change. verify: each answer checked against a full
+# search (slower).
+name_cache = on
+
+# The [perf] lines' breakdown of the renderer's time by phase (tex, tev, xform, submit, decode,
+# batch, append), timed (on) or not (off). It reads the clock thousands of times a frame: about
+# 2 ms a frame on a New 3DS and far more in Azahar. The frame and the threads' times are always
+# timed.
+# perf_timers = off
+
+# The port's debug and test controls (on): touching the screen (the top half shows the frame's
+# copies on the top screen; the bottom half traces a frame, switches between the GPU and CPU
+# vertex paths or starts a profile run), L + SELECT (cycles the colours) and buttons held at
+# launch (test modes, named in the log). Off: the port's only controls are SELECT (R's press)
+# and START + SELECT (quit).
+debug_input = off
+
+# The R button as a soft press (soft: FLUDD sprays while Mario moves) or a hard one (hard: Mario
+# stops to aim, as the GameCube's R pushed all the way). SELECT switches between them in play.
+r_press = hard
+
+# What touching the bottom right of the bottom screen low down runs (debug_input = on): the game
+# thread's steps (steps) or the game thread by object (objects). Higher up it starts the whole
+# profile run.
+profile_low_touch = steps
+
+# Console speed trades (lite = plus: Mario's and Yoshi's shadows only, a quarter of the particles,
+# the sea's grid every 2, no mirror or Shine shadow; Bianco Hills drawn to 20000).
+lite = plus
+# JAudio on its own thread on core 2.
+audio_thread = core2
+# CMPR textures as ETC1: less memory, more of them in VRAM (Bianco Hills ~7 ms a frame faster on a
+# New 3DS, Delfino Plaza ~3), a little colour loss, about a second more per stage load.
+etc1_textures = on
