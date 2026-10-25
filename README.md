@@ -72,9 +72,10 @@ Install CIA. Please don't share the built `.cia`: it carries art and music from 
 | C-Stick (New 3DS) | C-stick (camera) |
 | A, B, X, Y | A, B, X, Y |
 | L, R | L and R, pressed all the way |
-| ZL or ZR | Z |
+| ZL | Z |
+| ZR | R pressed part of the way: FLUDD sprays while Mario moves |
 | D-pad, START | D-pad, START |
-| SELECT | R as a soft press (FLUDD sprays while Mario moves) or a hard one (Mario stops to aim) |
+| SELECT | Switches R between the hard press (Mario stops to aim) and the soft one (as ZR) |
 | START + SELECT | Quit |
 
 ## Settings
@@ -89,7 +90,7 @@ The ones a player may want:
 - `etc1_textures = on`: compressed textures as ETC1, so more of them fit in the GPU's memory
   (faster in Bianco Hills and Delfino Plaza; a little colour loss, about a second more per stage
   load).
-- `r_press`: `hard` or `soft`, the R press the game starts with (SELECT switches it).
+- `r_press`: `hard` or `soft`, the press R starts as (SELECT switches it; ZR is always soft).
 - `debug_input = on`: the port's debug and test controls (the touch screen, L + SELECT, buttons
   held at launch). Off by default.
 

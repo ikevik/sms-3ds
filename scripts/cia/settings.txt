@@ -109,6 +109,7 @@ debug_input = off
 
 # The R button as a soft press (soft: FLUDD sprays while Mario moves) or a hard one (hard: Mario
 # stops to aim, as the GameCube's R pushed all the way). SELECT switches between them in play.
+# ZR is always the soft press.
 r_press = hard
 
 # What touching the bottom right of the bottom screen low down runs (debug_input = on): the game

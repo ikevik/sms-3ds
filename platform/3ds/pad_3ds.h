@@ -61,7 +61,7 @@ void sms3ds_wait_resumed(void);
 // Mapping:
 //   Circle Pad -> main stick        C-stick (New 3DS) -> C-stick
 //   A/B/X/Y    -> A/B/X/Y           L / R             -> L / R (full press; R soft: pad3ds_soft_r)
-//   ZL         -> Z                 ZR (New 3DS)      -> Z
+//   ZL         -> Z                 ZR (New 3DS)      -> R pressed part of the way (soft)
 //   D-pad      -> D-pad             Start             -> Start
 
 #ifdef __cplusplus

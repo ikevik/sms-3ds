@@ -25,17 +25,17 @@ static void read_now(Pad3DSStatus* out)
 	if (held & KEY_X)      out->button |= P3DS_BUTTON_X;
 	if (held & KEY_Y)      out->button |= P3DS_BUTTON_Y;
 	if (held & KEY_START)  out->button |= P3DS_BUTTON_START;
-	if (held & (KEY_ZL | KEY_ZR)) out->button |= P3DS_TRIGGER_Z;
+	if (held & KEY_ZL) out->button |= P3DS_TRIGGER_Z;
 	if (held & KEY_L) { out->button |= P3DS_TRIGGER_L; out->triggerL = 255; }
-	if (held & KEY_R) {
-		/* Soft: past the analog level at which the game's spray pressure is full (150 of 255:
-		 * TMario::getLRLevel, mAnalogLRToMaxVal), without the click. */
-		if (pad3ds_soft_r) {
-			out->triggerR = 180;
-		} else {
-			out->button |= P3DS_TRIGGER_R;
-			out->triggerR = 255;
-		}
+	/* R is a hard press (the analog value and the click: Mario stops to aim), or a soft one once
+	 * SELECT has switched it (pad3ds_soft_r); ZR is always the soft press, so FLUDD sprays while Mario
+	 * moves. Soft: past the analog level at which the game's spray pressure is full (150 of 255:
+	 * TMario::getLRLevel, mAnalogLRToMaxVal), without the click. */
+	if ((held & KEY_R) && !pad3ds_soft_r) {
+		out->button |= P3DS_TRIGGER_R;
+		out->triggerR = 255;
+	} else if (held & (KEY_R | KEY_ZR)) {
+		out->triggerR = 180;
 	}
 
 	circlePosition cp;

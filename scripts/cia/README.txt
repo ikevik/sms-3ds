@@ -39,10 +39,11 @@ and music from your disc.
 Playing
 -------
 - The buttons are the GameCube controller's: the Circle Pad is the stick, the C-Stick moves the
-  camera, L and R are the triggers, ZL or ZR is Z.
-- R is a hard press, as the GameCube's R pushed all the way: Mario stops to aim FLUDD. SELECT
-  makes it a soft press, so FLUDD sprays while Mario moves; SELECT again switches back. The
-  bottom screen shows which, and settings.txt's r_press sets the one the game starts with.
+  camera, L and R are the triggers, ZL is Z.
+- R is a hard press, as the GameCube's R pushed all the way: Mario stops to aim FLUDD. ZR is a
+  soft press: FLUDD sprays while Mario moves. SELECT makes R a soft press too, and SELECT again
+  switches it back; the bottom screen shows which, and settings.txt's r_press sets the one R
+  starts with.
 - START + SELECT quits.
 - Saves go to SD:/sms/card-a/, and the log of the last run to SD:/sms/log.txt.
 - settings.txt is read at start; each setting there has a comment saying what it does.

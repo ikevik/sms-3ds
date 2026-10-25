@@ -85,8 +85,8 @@ static int s_profAuto, s_profAutoQuit, s_quitAfter, s_timelineAt;
 // ~90K vertices a frame 20000 leaves out ~31K (mostly behind the hills nearby), 15000 ~43K, 25000 ~21K;
 // 10000 and less showed in wide views.
 static const int kPlusBiancoFar = 20000;
-// autorun.txt buttons = <seconds>:<keys>[:<hold seconds>],... (keys A B X Y L R START SELECT UP
-// DOWN LEFT RIGHT, the Circle Pad pushed all the way SUP SDOWN SLEFT SRIGHT, the C-stick CUP CDOWN
+// autorun.txt buttons = <seconds>:<keys>[:<hold seconds>],... (keys A B X Y L R ZL ZR START SELECT
+// UP DOWN LEFT RIGHT, the Circle Pad pushed all the way SUP SDOWN SLEFT SRIGHT, the C-stick CUP CDOWN
 // CLEFT CRIGHT, joined by '+'): those held for 0.25 s (or the hold given) from that many seconds
 // after launch (pad_3ds.c, pad3ds_script). shots = <seconds>,...: the frame drawn then saved as sdmc:/sms/shot-<tenths of a
 // second>.ppm (pica_draw.c).
@@ -113,7 +113,8 @@ static u32 script_keys(const char* s)
 		const char* name;
 		u32 key;
 	} kKeys[] = {{"A", KEY_A},         {"B", KEY_B},          {"X", KEY_X},         {"Y", KEY_Y},
-	             {"L", KEY_L},         {"R", KEY_R},          {"START", KEY_START}, {"SELECT", KEY_SELECT},
+	             {"L", KEY_L},         {"R", KEY_R},          {"ZL", KEY_ZL},       {"ZR", KEY_ZR},
+	             {"START", KEY_START}, {"SELECT", KEY_SELECT},
 	             {"UP", KEY_DUP},      {"DOWN", KEY_DDOWN},   {"LEFT", KEY_DLEFT},  {"RIGHT", KEY_DRIGHT},
 	             {"SUP", KEY_CPAD_UP}, {"SDOWN", KEY_CPAD_DOWN}, {"SLEFT", KEY_CPAD_LEFT}, {"SRIGHT", KEY_CPAD_RIGHT},
 	             {"CUP", KEY_CSTICK_UP}, {"CDOWN", KEY_CSTICK_DOWN}, {"CLEFT", KEY_CSTICK_LEFT}, {"CRIGHT", KEY_CSTICK_RIGHT}};
@@ -499,6 +500,7 @@ static const char kDefaultSettings[] =
     "\n"
     "# The R button as a soft press (soft: FLUDD sprays while Mario moves) or a hard one (hard: Mario\n"
     "# stops to aim, as the GameCube's R pushed all the way). SELECT switches between them in play.\n"
+    "# ZR is always the soft press.\n"
     "r_press = hard\n"
     "\n"
     "# What touching the bottom right of the bottom screen low down runs (debug_input = on): the game\n"
