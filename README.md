@@ -14,9 +14,9 @@ What works:
 - Saves, as memory card files on the SD card (`SD:/sms/card-a/`).
 - Launching from the Homebrew Launcher, or from the HOME Menu once the CIA is installed.
 
-Speed on a New 3DS, with the release's `settings.txt` (its `lite = plus` trades): the game's own
-30 frames a second in lighter areas, such as parts of Delfino Plaza, and down to about 20 in the
-heaviest ones. Making the heavy areas faster is the work before the next release.
+Speed, measured on a New 3DS with the release's `settings.txt` (its `lite = plus` trades): Delfino
+Plaza mostly at the game's own cap of 30 frames a second, Ricco Harbor about 29, Bianco Hills about
+25, and the slowest moments around 24. The final Bowser fight is slower (below).
 
 Known issues:
 
