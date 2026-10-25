@@ -38,7 +38,8 @@ for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
 # No -include port_compat.h here: as in sms-pc-port's CMakeLists, only game code gets it. Its
 # math macros (sqrtf -> sms_msl_sqrtf, ...) would turn platform/misc/msl_math.c's own
 # implementations into calls to themselves (sms_msl_sqrtf compiled to a branch-to-self).
-COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -DSMS_AUDIO_DSP_HLE=1 -include $P3DS/sms_compat_3ds.h -D__3DS__ -DSMS_PLATFORM_3DS=1"
+# Source paths as relative to the repository (__FILE__ in asserts): no build machine's paths in the binary.
+COMMON="$ARCHFLAGS $OPT -g0 -ffile-prefix-map=$ROOT/= -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -DSMS_AUDIO_DSP_HLE=1 -include $P3DS/sms_compat_3ds.h -D__3DS__ -DSMS_PLATFORM_3DS=1"
 # GameCube ABI for sms-pc-port's units (4-byte enums, signed plain char), matching the game
 # and GX libraries. The @3ds units below include libctru headers, whose structs use the
 # toolchain's variable-size enums, so they keep the defaults; they share no enum-typed

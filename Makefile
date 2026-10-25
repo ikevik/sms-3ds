@@ -54,6 +54,8 @@ ICON := $(if $(wildcard meta/icon.png),meta/icon.png,)
 # New 3DS strongly recommended: see docs/PORTING.md
 ARCH     := -march=armv6k -mtune=mpcore -mfloat-abi=hard -mtp=soft
 CFLAGS   := -g -Wall -O2 -mword-relocations -ffunction-sections $(ARCH)
+# Source paths as relative to the repository (__FILE__, debug info): no build machine's paths in the binary.
+CFLAGS   += -ffile-prefix-map=$(TOPDIR)/=
 CFLAGS   += $(INCLUDE) -D__3DS__ -DSMS_PLATFORM_3DS=1
 ifneq ($(strip $(DEMO_STAGE)),)
 CFLAGS   += -DSMS_DEMO_STAGE=$(DEMO_STAGE) -DSMS_DEMO_SCENARIO=$(DEMO_SCENARIO)

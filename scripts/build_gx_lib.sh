@@ -30,7 +30,8 @@ for d in "$DECOMP"/libs/*/include; do INCS="$INCS -I$d"; done
 # files (e.g. GXVtxAttrFmtList in J3D models) and char comparisons. Units that talk to
 # libctru keep the toolchain defaults (see build_platform_lib.sh).
 GC_ABI="-fno-short-enums -fsigned-char"
-COMMON="$ARCHFLAGS $OPT -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -ffp-contract=off -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI"
+# Source paths as relative to the repository (__FILE__ in asserts): no build machine's paths in the binary.
+COMMON="$ARCHFLAGS $OPT -g0 -ffile-prefix-map=$ROOT/= -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -ffp-contract=off -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI"
 # SAMPLE=1: see build_game_lib.sh. Only the units the game thread runs: the GX and render
 # threads' code stays as it is.
 INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h"

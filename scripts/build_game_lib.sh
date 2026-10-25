@@ -79,7 +79,8 @@ GC_ABI="-fno-short-enums -fsigned-char"
 # SAMPLE=1: each function's entry and exit call prof_3ds.cpp's hooks (inline ones from headers
 # are left out), for the profile run's sampler. A measurement build: the hooks cost time.
 INSTR=""; [ -n "${SAMPLE:-}" ] && INSTR="-finstrument-functions -finstrument-functions-exclude-file-list=.h"
-COMMON="$ARCHFLAGS $OPT $INSTR -g0 -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT_INC/src/port_compat.h"
+# Source paths as relative to the repository (__FILE__ in asserts): no build machine's paths in the binary.
+COMMON="$ARCHFLAGS $OPT $INSTR -g0 -ffile-prefix-map=$ROOT/= -w -ffunction-sections -fdata-sections -fno-strict-aliasing -fwrapv -fno-stack-protector -ffp-contract=off -DGEKKO -DTARGET_PC -DVERSION_GMSE01 -DBUILD_VERSION=2 -DNDEBUG=1 -D__3DS__ -DSMS_PLATFORM_3DS=1 $GC_ABI -include $PCPORT_INC/src/port_compat.h"
 CXXF="$COMMON -std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics"
 CF="$COMMON -std=gnu99 -fcommon"
 CP932=""
