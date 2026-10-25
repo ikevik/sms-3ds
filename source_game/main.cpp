@@ -1028,10 +1028,15 @@ extern "C" void __appExit(void)
 		fputc('\n', stderr);
 		dump_os_threads("at the fatal error");
 	}
+	// aptExit before the SD card is closed, so that the log says whether it returned (after a close
+	// from the HOME Menu the process did not end, somewhere past graphics).
+	fprintf(stderr, "[3ds] quit: aptExit\n");
+	flush_log();
+	aptExit();
+	fprintf(stderr, "[3ds] quit: aptExit returned; the SD card and the service manager next\n");
 	flush_log();
 	archiveUnmountAll();
 	fsExit();
-	aptExit();
 	srvExit();
 }
 

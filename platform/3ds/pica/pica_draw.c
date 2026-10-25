@@ -109,6 +109,12 @@ void pica_request_stop(void)
 	__dmb();
 	s_stopping = 1;
 }
+/* The HOME Menu (an APT suspend): the thread that draws stops between frames (below). */
+static volatile int s_suspendReq;
+static void suspend_pause(void);
+static void pica_apt_hook(APT_HookType hook, void* param);
+static aptHookCookie s_aptCookie;
+static u32 s_initThread; /* the thread that made the context (the main thread): it never pauses */
 /* In the GPU waits' loops: once the app is quitting, the thread waiting (the render thread) parks
  * rather than poll on, the GPU's completions gone with gfxExit (pad_3ds.h, sms3ds_park). */
 static void park_if_stopping(void)
@@ -205,6 +211,8 @@ int pica_init(void)
 	if (s_ready) return 1;
 	if (s_failed) return 0;
 	if (!C3D_Init(CMDBUF_BYTES)) goto fail;
+	svcGetThreadId(&s_initThread, CUR_THREAD_HANDLE);
+	aptHook(&s_aptCookie, pica_apt_hook, NULL);
 	s_top = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, -1); /* no depth: the present pass needs none */
 	if (!s_top) goto fail;
 	C3D_RenderTargetSetOutput(s_top, GFX_TOP, GFX_LEFT, DISPLAY_TRANSFER_FLAGS);
@@ -1243,6 +1251,7 @@ static int frame_begin_ex(u8 flags)
 	 * its emulated VI retrace; blocking here as well left the retrace already due whenever the
 	 * game waited for it, so the main thread never slept and lower-priority threads (stage
 	 * setup, priority 17) were starved. citro3d still waits for the previous frame's GPU work. */
+	if (s_suspendReq) suspend_pause();
 	if (s_dead_due) { /* once per started frame, even when a non-blocking begin fails */
 		release_dead();
 		s_dead_due = 0;
@@ -3413,3 +3422,62 @@ int pica_kernel_threads(void)
 	svcCloseHandle(rl);
 	return (int)cur;
 }
+
+/* ---- the HOME Menu ------------------------------------------------------------------------------
+ * While the HOME Menu is up it has the GPU, and the application's GPU work waits for its return.
+ * The render thread drew on all the same, supplying each missing completion after 500 ms, and an
+ * app closed from the HOME Menu then never ended (the next app's screen stayed black: its last
+ * calls into the GPU service had no GPU to finish them). So on suspend (the APT hook, on the main
+ * thread, before citro3d's and GSP's) the thread that draws stops at its next frame start, once
+ * the GPU has finished what it was given, and waits in the kernel until the app is back. Closed
+ * instead, it stays there, and the quit parks it. Back from the HOME Menu, every setting is sent
+ * again: the HOME Menu used the GPU in between. */
+static LightEvent s_resumed;
+static volatile int s_paused;
+static void pica_apt_hook(APT_HookType hook, void* param)
+{
+	(void)param;
+	if (hook == APTHOOK_ONSUSPEND || hook == APTHOOK_ONSLEEP) {
+		static int s_evtReady;
+		if (!s_evtReady) LightEvent_Init(&s_resumed, RESET_STICKY), s_evtReady = 1;
+		LightEvent_Clear(&s_resumed);
+		s_paused = 0;
+		__dmb();
+		s_suspendReq = 1;
+		/* up to 300 ms for it to stop (a frame start comes within one frame) */
+		for (int i = 0; i < 60 && !s_paused; i++) svcSleepThread(5000000LL);
+		fprintf(stderr, "[pica] suspended: the drawing %s\n", s_paused ? "stopped between frames" : "did not stop within 300 ms");
+	} else if (hook == APTHOOK_ONRESTORE || hook == APTHOOK_ONWAKEUP) {
+		if (!s_suspendReq) return;
+		s_suspendReq = 0;
+		__dmb();
+		LightEvent_Signal(&s_resumed);
+	}
+	/* APTHOOK_ONEXIT: left as it is (the quit follows) */
+}
+static void suspend_pause(void)
+{
+	u32 id = 0;
+	svcGetThreadId(&id, CUR_THREAD_HANDLE);
+	if (id == s_initThread) return; /* the main thread runs the hook: it cannot wait for itself */
+	/* what the GPU was given first, while it is still the app's (at most 200 ms) */
+	for (int i = 0; i < 1000; i++) {
+		if (s_ovl ? !s_ovRunning || gxCmdQueueWait(s_ovRunning, 0) : !s_queue || gxCmdQueueWait(s_queue, 0)) break;
+		svcSleepThread(200000);
+	}
+	s_paused = 1;
+	while (s_suspendReq) {
+		LightEvent_WaitTimeout(&s_resumed, 100000000LL);
+		park_if_stopping(); /* closed from the HOME Menu */
+	}
+	s_paused = 0;
+	/* the HOME Menu's settings in the GPU now: ours all sent again */
+	s_last_valid = 0;
+	s_gxLayoutValid = 0;
+	s_bufValid = 0;
+	s_mode = MODE_NONE;
+	s_texGen++;
+	memset(s_boundValid, 0, sizeof s_boundValid);
+	fprintf(stderr, "[pica] resumed: drawing again, every setting sent again\n");
+}
+
