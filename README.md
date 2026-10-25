@@ -146,6 +146,18 @@ docs/              PORTING.md (prior art, design), STAGE1.md, audio-3ds.md, nati
 source/            the first bring-up app (make without MODE=game)
 ```
 
+## AI disclosure
+
+Nearly all of this repository was written by an AI: Claude, Anthropic's model, working through
+Claude Code. That covers its code, scripts, patches and documentation: the 3DS platform layer, the
+GX-to-PICA renderer and its TEV compiler, the 3DS patches to sms-pc-port and the decompilation, the
+CIA builder, and this README. The project's author (ikevik) directed the work, decided what to
+build and what to trade away, and tested every build, in the Azahar emulator and on a New 3DS.
+Every commit except one merge carries a `Co-Authored-By: Claude` line.
+
+The game's own code is the decompilation and the PC port in the credits below: this repository
+builds a 3DS port on top of them. Expect mistakes; please report problems in the issue tracker.
+
 ## Credits
 
 The port is built from, or takes code from:

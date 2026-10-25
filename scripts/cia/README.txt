@@ -47,6 +47,14 @@ Playing
 - Saves go to SD:/sms/card-a/, and the log of the last run to SD:/sms/log.txt.
 - settings.txt is read at start; each setting there has a comment saying what it does.
 
+AI disclosure
+-------------
+Nearly all of this port (its code, scripts, patches and documentation) was written by an AI:
+Claude, Anthropic's model, working through Claude Code. ikevik directed the work and tested every
+build, in the Azahar emulator and on a New 3DS. The game's own code is the decompilation and PC
+port credited below. Expect mistakes; please report problems at
+https://github.com/ikevik/sms-3ds/issues.
+
 Credits
 -------
 Built from, or with code from:
