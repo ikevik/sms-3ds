@@ -49,6 +49,14 @@ extern volatile int sms3ds_parked_threads;  // how many have parked (the log's a
 // render thread, polling for a GPU completion on core 2, faulted on its own stack).
 void sms3ds_park(void);
 extern volatile int pad3ds_parked;  // set by the game thread once it stops for the quit
+// The HOME Menu: set while the app is suspended (pica_draw.c's APT hook), so that the threads that
+// wake up on their own wait in the kernel until it is back (sms3ds_wait_resumed): the game thread
+// at PADRead, the VI retrace timer, the status screen. With only the drawing stopped the HOME Menu
+// lagged, the game still running behind it.
+extern volatile int sms3ds_suspended;
+void sms3ds_set_suspended(int on);
+// Waits while the app is suspended (in steps of 100 ms), and returns once it is back or quitting.
+void sms3ds_wait_resumed(void);
 
 // Mapping:
 //   Circle Pad -> main stick        C-stick (New 3DS) -> C-stick

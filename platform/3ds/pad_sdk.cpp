@@ -32,6 +32,8 @@ extern "C" void PADControlAllMotors(const u32*) {}
 
 extern "C" u32 PADRead(PADStatus* status)
 {
+	// Suspended (the HOME Menu): the game waits here until it is back.
+	sms3ds_wait_resumed();
 	// Quitting: the game thread stops here, before the services it uses are shut down.
 	if (pad3ds_quit) {
 		pad3ds_parked = 1;

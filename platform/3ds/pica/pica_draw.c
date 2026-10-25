@@ -3431,7 +3431,8 @@ int pica_kernel_threads(void)
  * thread, before citro3d's and GSP's) the thread that draws stops at its next frame start, once
  * the GPU has finished what it was given, and waits in the kernel until the app is back. Closed
  * instead, it stays there, and the quit parks it. Back from the HOME Menu, every setting is sent
- * again: the HOME Menu used the GPU in between. */
+ * again: the HOME Menu used the GPU in between. The rest of the app waits too (sms3ds_suspended,
+ * pad_3ds.h): with only the drawing stopped, the game ran on behind the HOME Menu and it lagged. */
 static LightEvent s_resumed;
 static volatile int s_paused;
 static void pica_apt_hook(APT_HookType hook, void* param)
@@ -3444,6 +3445,7 @@ static void pica_apt_hook(APT_HookType hook, void* param)
 		s_paused = 0;
 		__dmb();
 		s_suspendReq = 1;
+		sms3ds_set_suspended(1); /* the game, the retrace timer and the status screen wait too */
 		/* up to 300 ms for it to stop (a frame start comes within one frame) */
 		for (int i = 0; i < 60 && !s_paused; i++) svcSleepThread(5000000LL);
 		fprintf(stderr, "[pica] suspended: the drawing %s\n", s_paused ? "stopped between frames" : "did not stop within 300 ms");
@@ -3452,6 +3454,7 @@ static void pica_apt_hook(APT_HookType hook, void* param)
 		s_suspendReq = 0;
 		__dmb();
 		LightEvent_Signal(&s_resumed);
+		sms3ds_set_suspended(0);
 	}
 	/* APTHOOK_ONEXIT: left as it is (the quit follows) */
 }

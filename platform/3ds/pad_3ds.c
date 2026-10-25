@@ -71,6 +71,27 @@ volatile int pad3ds_quit;
 volatile int pad3ds_soft_r;
 volatile int sms3ds_ending;
 volatile int sms3ds_parked_threads;
+volatile int sms3ds_suspended;
+static LightEvent s_resumed;
+static int s_resumedReady;
+
+void sms3ds_set_suspended(int on)
+{
+	if (!s_resumedReady) LightEvent_Init(&s_resumed, RESET_STICKY), s_resumedReady = 1;
+	if (on) {
+		LightEvent_Clear(&s_resumed);
+		sms3ds_suspended = 1;
+	} else {
+		sms3ds_suspended = 0;
+		LightEvent_Signal(&s_resumed);
+	}
+}
+
+void sms3ds_wait_resumed(void)
+{
+	while (sms3ds_suspended && !pad3ds_quit && !sms3ds_ending && s_resumedReady)
+		LightEvent_WaitTimeout(&s_resumed, 100000000LL);
+}
 
 void sms3ds_park(void)
 {

@@ -987,6 +987,7 @@ static void status_thread(void*) {
 		// Twice a second, in 50 ms steps, so a quit does not wait half a second for this thread.
 		for (int i = 0; i < 10 && s_statusRun; i++) svcSleepThread(50000000LL);
 		if (!s_statusRun) break;
+		if (sms3ds_suspended) continue;  // the HOME Menu is up: no drawing, no SD writes (core 1 is the system's)
 		uint32_t s[7];
 		GX3DS_GetStats(s);
 		if (s_statusDraw) draw_status(s);
