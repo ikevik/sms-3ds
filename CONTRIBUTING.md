@@ -5,15 +5,16 @@ Thanks for helping with the port. This page is how to get a change from your for
 ## Before you start
 
 Open an issue (or comment on one) saying what you want to take on, so that two people don't build
-the same thing. Good places to start, all things the port doesn't do yet:
+the same thing. Good places to start:
 
-- the game's HUD on the bottom screen, with touch to skip movies and answer questions (today the
-  bottom screen shows the port's status text);
+- the bottom screen, which needs development: for example touch to skip cutscenes rather than
+  pressing A, and bringing over what chasem-dev's sms-pc-port does with its radar and the progress
+  tracking in its pause menu (today the bottom screen shows the port's status text);
 - CISO disc images, next to the plain `.iso`;
 - the GameCube's 4:3 picture as an option (the top screen is stretched now);
-- the audio's echo (the game's FX sends);
-- the final Bowser fight's speed (its hot-tub water is drawn by the CPU);
-- the occasional boot stall in Azahar (only ever seen there, never on a console).
+- the final Bowser fight, which may need further testing;
+- the occasional boot stall in Azahar (only ever seen there, never on a console), for further
+  investigation by beta testers.
 
 ## Building
 
