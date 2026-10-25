@@ -14,16 +14,13 @@ What works:
 - Saves, as memory card files on the SD card (`SD:/sms/card-a/`).
 - Launching from the Homebrew Launcher, or from the HOME Menu once the CIA is installed.
 
-Speed: with the release's `settings.txt` (its `lite = plus` trades), Delfino Plaza plays at about
-27 frames a second while moving on a New 3DS; the game's own cap is 30.
+Speed on a New 3DS, with the release's `settings.txt` (its `lite = plus` trades): the game's own
+30 frames a second in lighter areas, such as parts of Delfino Plaza, and down to about 20 in the
+heaviest ones. Making the heavy areas faster is the work before the next release.
 
 Known issues:
 
 - The final Bowser fight runs slowly: its hot-tub water is drawn by the CPU.
-- The warp portals (Delfino Plaza's statue, the hut and the lighthouse) are not drawn on a New 3DS,
-  although they show in the Azahar emulator.
-- Reported, not yet confirmed: in Bianco Hills' first episode, part of a hill shows when it should
-  be hidden.
 - The Old 3DS is not supported: it is too slow.
 - The bottom screen shows the port's status text (frame times and counts), not a game screen.
 
