@@ -144,6 +144,14 @@ static LightLock s_linLock = 1; /* 1: unlocked */
 #define COPY_UNITS (COPY_ARENA_BYTES / COPY_UNIT)
 static uint8_t* s_copyArena;
 static uint8_t s_copyUnitUsed[COPY_UNITS];
+static uint32_t s_copyArenaUnits = COPY_UNITS; /* (pica_set_copy_arena_kb: smaller, for tests) */
+static uint32_t s_vramHogKB; /* (pica_set_vram_hog_kb: VRAM taken away at the start, for tests) */
+void pica_set_vram_hog_kb(uint32_t kb) { s_vramHogKB = kb; }
+void pica_set_copy_arena_kb(uint32_t kb)
+{
+	const uint32_t u = (kb << 10) / COPY_UNIT;
+	s_copyArenaUnits = u < 1 ? 1 : u > COPY_UNITS ? COPY_UNITS : u;
+}
 static uint32_t s_copyUnits, s_copyUnitsPeak;
 
 /* The GX shader's uniform registers (gx_pass.v.pica or gx_proj.v.pica, whichever is bound). */
@@ -238,9 +246,18 @@ int pica_init(void)
 	                      GPU_TEXTURE_WRAP_S(GPU_CLAMP_TO_EDGE) | GPU_TEXTURE_WRAP_T(GPU_CLAMP_TO_EDGE);
 	C3D_TexSetFilter(&s_efbTex, GPU_LINEAR, GPU_LINEAR);
 	C3D_TexSetWrap(&s_efbTex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
-	s_copyArena = (uint8_t*)vramAlloc(COPY_ARENA_BYTES);
+	s_copyArena = (uint8_t*)vramAlloc(s_copyArenaUnits * COPY_UNIT);
 	if (!s_copyArena)
-		fprintf(stderr, "[pica] no %u KB of VRAM for the EFB-copy textures: each takes its own\n", COPY_ARENA_BYTES >> 10);
+		fprintf(stderr, "[pica] no %lu KB of VRAM for the EFB-copy textures: each takes its own\n",
+		        (unsigned long)(s_copyArenaUnits * (COPY_UNIT >> 10)));
+	if (s_vramHogKB) { /* in 256 KB pieces: VRAM is two banks of 3 MB */
+		uint32_t kb = 0;
+		while (kb + 256 <= s_vramHogKB && vramAlloc(256u << 10)) kb += 256;
+		fprintf(stderr, "[pica] %lu KB of VRAM taken away (vram_hog_kb, testing)\n", (unsigned long)kb);
+	}
+	if (s_copyArena && s_copyArenaUnits != COPY_UNITS)
+		fprintf(stderr, "[pica] the EFB-copy textures' arena: %lu KB (copy_arena_kb, testing)\n",
+		        (unsigned long)(s_copyArenaUnits * (COPY_UNIT >> 10)));
 
 	/* EFB pixels (y down). Depth: z = -(GameCube depth), so the default depth map (-z/w) stores
 	 * the GameCube's own depth and its compare modes carry over. */
@@ -308,6 +325,11 @@ static void vram_drop(PicaTex* t);
 static void copy_tex_mem_free(PicaTex* t);
 static int s_copyTexCount; /* EFB-copy textures in VRAM (copy_reserve, below) */
 static int s_dead_due = 1; /* a frame has started since release_dead last ran */
+/* VRAM copies of textures dropped while a frame the GPU may still be drawing could read them
+ * (vram_make_room_later): freed by release_dead two frame starts on, as the textures freed then. */
+#define VRAM_LATER 64
+static void* s_vlater[2][VRAM_LATER];
+static int s_nvlater[2];
 
 static void release_dead(void)
 {
@@ -338,6 +360,10 @@ static void release_dead(void)
 	memcpy(s_dead[1], s_dead[0], sizeof(PicaTex*) * (size_t)s_ndead[0]);
 	s_ndead[1] = s_ndead[0];
 	s_ndead[0] = 0;
+	for (int i = 0; i < s_nvlater[1]; i++) vramFree(s_vlater[1][i]);
+	memcpy(s_vlater[1], s_vlater[0], sizeof(void*) * (size_t)s_nvlater[0]);
+	s_nvlater[1] = s_nvlater[0];
+	s_nvlater[0] = 0;
 }
 
 /* VRAM copies of textures. The GPU reads VRAM faster than FCRAM, where its reads also compete
@@ -354,14 +380,18 @@ static void release_dead(void)
  * them small goop maps), one more while a replaced one waits out its two frames, each at most a
  * whole-EFB texture. */
 #define COPY_TEX_BYTES (EFB_TEX_W * EFB_TEX_H * 4u)
+static uint32_t s_frameNo;
+/* An EFB copy that found no VRAM (pica_copy_tex_create): its size kept free of textures too for
+ * the next 20 s (600 frames), so that they do not take back what was made for it. */
+static uint32_t s_copyShort, s_copyShortFrame;
 static uint32_t copy_reserve(void)
 {
 	const int left = 9 - s_copyTexCount;
-	return (!s_copyArena && left > 0 ? (uint32_t)left * COPY_TEX_BYTES : 0) + (64u << 10);
+	if (s_copyShort && s_frameNo - s_copyShortFrame > 600) s_copyShort = 0;
+	return (!s_copyArena && left > 0 ? (uint32_t)left * COPY_TEX_BYTES : 0) + (64u << 10) + s_copyShort;
 }
 #define VRAM_IDLE 30 /* frames a texture goes unbound before its VRAM copy may go */
 #define VRAM_MAX 1024
-static uint32_t s_frameNo;
 static PicaTex* s_vlist[VRAM_MAX]; /* textures with a VRAM copy */
 static int s_nvlist;
 static uint32_t s_vramEvicted, s_vramAnimated;
@@ -460,6 +490,50 @@ static void vram_drop(PicaTex* t)
 /* For the EFB-copy textures: room for `bytes` more in VRAM, made by evicting the VRAM copies of
  * textures no frame the GPU may still be drawing has bound (3 frames). */
 static void vram_make_room(uint32_t bytes) { vram_evict(bytes + 4096, 3); }
+
+static uint32_t s_vlaterFrame, s_vramGivenToCopies;
+/* For an EFB copy with no room even then (every texture in VRAM drawn lately): textures give way,
+ * whatever their age (they draw from FCRAM meanwhile, and wait VRAM_IDLE frames before trying for
+ * VRAM again), the least recently drawn first, until `bytes` and a quarter more (VRAM's gaps) will be
+ * free two frames on. A copy can go nowhere else, a texture can: the copy is coarser or lost only
+ * until then. Once per 3 frames, so a copy failing each frame meanwhile does not take more, and
+ * when no copy has been made since the last time (VRAM's gaps too small), at twice the last wait,
+ * up to 10 s: a Bianco Hills test with 3 MB of VRAM taken away gave up 4 MB of textures in 40 s. */
+static uint32_t s_vlaterGap = 3;
+static int s_copyMadeSince;
+static void vram_make_room_later(uint32_t bytes)
+{
+	if (s_vlaterFrame && s_frameNo - s_vlaterFrame < s_vlaterGap) return;
+	if (s_vlaterFrame) s_vlaterGap = s_copyMadeSince ? 3 : s_vlaterGap * 2 > 300 ? 300 : s_vlaterGap * 2;
+	s_vlaterFrame = s_frameNo;
+	s_copyMadeSince = 0;
+	uint32_t freed = 0;
+	while (freed < bytes + bytes / 4 && s_nvlater[0] < VRAM_LATER) {
+		int best = -1;
+		uint32_t bestAge = 0;
+		for (int i = 0; i < s_nvlist; i++) {
+			const uint32_t age = s_frameNo - s_vlist[i]->vramUse;
+			if (best < 0 || age > bestAge) {
+				best = i;
+				bestAge = age;
+			}
+		}
+		if (best < 0) break;
+		PicaTex* t = s_vlist[best];
+		s_vlist[best] = s_vlist[--s_nvlist];
+		if (t->vpending) vram_unpend(t);
+		tex_count(t, -1);
+		s_vlater[0][s_nvlater[0]++] = t->vram;
+		t->vram = NULL;
+		t->vready = 0;
+		t->vtryFrame = s_frameNo;
+		tex_count(t, 1);
+		freed += t->bytes;
+		s_vramEvicted++;
+	}
+	s_vramGivenToCopies += freed;
+}
+uint32_t pica_vram_given_to_copies(void) { return s_vramGivenToCopies; }
 static void vram_unpend(PicaTex* t)
 {
 	for (int i = 0; i < s_nvpend; i++)
@@ -626,7 +700,12 @@ static void etc_encode(void* dst, uint32_t w, uint32_t h, const uint8_t* rgba, i
 {
 	const uint64_t t0 = svcGetSystemTick();
 	const uint64_t err = etc1_encode_tex(dst, w, h, rgba, fmt == PICA_TF_ETC1A4);
-	s_etcTicks += svcGetSystemTick() - t0;
+	pica_etc1_note(w, h, fmt == PICA_TF_ETC1A4, err, svcGetSystemTick() - t0);
+}
+void pica_etc1_note(uint32_t w, uint32_t h, int alpha, uint64_t err, uint64_t ticks)
+{
+	const int fmt = alpha ? PICA_TF_ETC1A4 : PICA_TF_ETC1;
+	s_etcTicks += ticks;
 	s_etcEncodes++;
 	s_etcErr += err;
 	s_etcTexels += (uint64_t)w * h;
@@ -744,6 +823,30 @@ void pica_tex_upload(PicaTex* t, const uint8_t* rgba)
 	else
 		tex_swizzle_small(t->tex.data, t->tex.width, t->tex.height, rgba, t->fmt);
 	tex_flush(t);
+}
+
+void pica_tex_upload_raw(PicaTex* t, const void* data)
+{
+	if (!t) return;
+	memcpy(t->tex.data, data, t->tex.size);
+	tex_flush(t);
+}
+
+/* The GX back end's worker (its ETC1 encodes): on core 2 at the lowest priority, in the time the
+ * render thread and the audio leave there. */
+static LightEvent s_workEvent;
+int pica_worker_start(void (*fn)(void*))
+{
+	LightEvent_Init(&s_workEvent, RESET_ONESHOT);
+	return threadCreate(fn, NULL, 32u << 10, 0x3F, 2, true) != NULL;
+}
+void pica_worker_signal(void) { LightEvent_Signal(&s_workEvent); }
+void pica_worker_wait(void)
+{
+	if (sms3ds_ending) sms3ds_park();
+	sms3ds_wait_resumed();
+	LightEvent_WaitTimeout(&s_workEvent, 100000000LL);
+	if (sms3ds_ending) sms3ds_park();
 }
 
 PicaTex* pica_tex_create_mip(uint32_t w, uint32_t h, int levels, float lodBias, int fmt)
@@ -2026,10 +2129,10 @@ static void* copy_arena_alloc(uint32_t bytes, PicaTex* t)
 {
 	uint32_t n = 1;
 	while (n * COPY_UNIT < bytes) n <<= 1;
-	if (!s_copyArena || n > COPY_UNITS) return NULL;
+	if (!s_copyArena || n > s_copyArenaUnits) return NULL;
 	/* First fit at any unit (textures need far less than 4 KB alignment): placed only at multiples of
 	 * their own size, a 512 KB copy found no room in an arena with 512 KB free (Sirena Beach). */
-	for (uint32_t at = 0; at + n <= COPY_UNITS;) {
+	for (uint32_t at = 0; at + n <= s_copyArenaUnits;) {
 		uint32_t k = 0;
 		while (k < n && !s_copyUnitUsed[at + k]) k++;
 		if (k < n) {
@@ -2111,8 +2214,20 @@ int pica_copy_tex_fits(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565)
 {
 	return t && t->tex.width == tw && t->tex.height == th && (t->tex.fmt == GPU_RGB565) == (rgb565 != 0);
 }
+int pica_copy_tex_at_least(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565)
+{
+	return t && t->tex.width >= tw && t->tex.height >= th && (t->tex.fmt == GPU_RGB565) == (rgb565 != 0);
+}
 
-PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
+void pica_tex_fcram_only(PicaTex* t)
+{
+	if (t) t->noVram = 1;
+}
+
+static PicaTex* copy_tex_create(uint32_t tw, uint32_t th, int rgb565, int makeRoom);
+PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565) { return copy_tex_create(tw, th, rgb565, 1); }
+PicaTex* pica_copy_tex_try(uint32_t tw, uint32_t th, int rgb565) { return copy_tex_create(tw, th, rgb565, 0); }
+static PicaTex* copy_tex_create(uint32_t tw, uint32_t th, int rgb565, int makeRoom)
 {
 	if (!pica_init()) return NULL;
 	PicaTex* t = (PicaTex*)calloc(1, sizeof *t);
@@ -2131,7 +2246,13 @@ PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
 		 * so that fallback lost the copy every time, and draws sampling it read the destination's
 		 * memory, which the GPU never wrote: on a console whatever the heap held there (Sirena Beach's
 		 * Phantamanta tinted the screen by its alpha copy: noise in the manta's colour). The caller
-		 * tries a smaller texture. Logged once per size. */
+		 * tries a smaller texture. Textures make room for it two frames on, and keep it clear.
+		 * Logged once per size. */
+		if (makeRoom) {
+			if (bytes > s_copyShort) s_copyShort = bytes;
+			s_copyShortFrame = s_frameNo;
+			vram_make_room_later(bytes);
+		}
 		static uint32_t s_said[8];
 		const uint32_t key = tw << 16 | th << 1 | (rgb565 ? 1u : 0u);
 		int k = 0;
@@ -2140,7 +2261,7 @@ PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
 			s_said[k] = key;
 			fprintf(stderr, "[pica] no VRAM for a %lux%lu EFB-copy texture (%lu KB free, arena %lu of %lu KB used)\n",
 			        (unsigned long)tw, (unsigned long)th, (unsigned long)(vramSpaceFree() >> 10),
-			        (unsigned long)(s_copyUnits * (COPY_UNIT >> 10)), (unsigned long)(COPY_ARENA_BYTES >> 10));
+			        (unsigned long)(s_copyUnits * (COPY_UNIT >> 10)), (unsigned long)(s_copyArenaUnits * (COPY_UNIT >> 10)));
 		}
 		free(t);
 		return NULL;
@@ -2161,6 +2282,7 @@ PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565)
 	}
 	t->bytes = bytes;
 	s_copyTexCount++;
+	s_copyMadeSince = 1;
 	return t;
 }
 
@@ -2168,7 +2290,7 @@ void pica_copy_arena(uint32_t* usedKB, uint32_t* peakKB, uint32_t* totalKB)
 {
 	*usedKB = s_copyUnits * (COPY_UNIT >> 10);
 	*peakKB = s_copyUnitsPeak * (COPY_UNIT >> 10);
-	*totalKB = s_copyArena ? COPY_ARENA_BYTES >> 10 : 0;
+	*totalKB = s_copyArena ? s_copyArenaUnits * (COPY_UNIT >> 10) : 0;
 }
 
 /* Draws the rectangle (x, y, w, h) of the EFB texture (EFB pixels) over the whole of the bound

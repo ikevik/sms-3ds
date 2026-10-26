@@ -93,6 +93,18 @@ enum { PICA_TF_RGBA8, PICA_TF_RGB565, PICA_TF_RGBA5551, PICA_TF_RGBA4, PICA_TF_L
 /* ETC1 textures (PICA_TF_ETC1, ETC1A4: encoded from RGBA8 on upload): how many there are, their
  * KB, the encodes so far, the milliseconds they took and their colour error as PSNR (dB). */
 void pica_etc1_stats(uint32_t* count, uint32_t* kb, uint32_t* encodes, float* ms, float* db);
+/* An encode made elsewhere (the GX back end's worker), for those figures and the log's worst ones. */
+void pica_etc1_note(uint32_t w, uint32_t h, int alpha, uint64_t err, uint64_t ticks);
+/* Texels already in t's layout (its tex.size bytes: an ETC1 encode) copied in. */
+void pica_tex_upload_raw(PicaTex* t, const void* data);
+/* t drawn from FCRAM, never given a VRAM copy (a texture about to be replaced: its ETC1 version). */
+void pica_tex_fcram_only(PicaTex* t);
+/* A worker thread for the GX back end (its ETC1 encodes), on core 2 at the lowest priority: 0 when
+ * none could start. pica_worker_wait: its wait for work (signalled, or 100 ms), parking it once the
+ * app quits and holding it while the app is suspended. */
+int pica_worker_start(void (*fn)(void*));
+void pica_worker_signal(void);
+void pica_worker_wait(void);
 PicaTex* pica_tex_create_fmt(uint32_t w, uint32_t h, int fmt);
 int pica_tex_format(const PicaTex* t);
 void pica_tex_free(PicaTex* t);
@@ -129,7 +141,11 @@ uint32_t pica_tex_phys(const PicaTex* t, int vram);
 void pica_copy_tex_layout(float x, float y, float w, float h, int half, int exact, float yscale, uint16_t* tw,
                           uint16_t* th, float win[4]);
 PicaTex* pica_copy_tex_create(uint32_t tw, uint32_t th, int rgb565);
+/* The same where there is room already: no textures made to give way (a coarser copy's retries). */
+PicaTex* pica_copy_tex_try(uint32_t tw, uint32_t th, int rgb565);
 int pica_copy_tex_fits(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565);
+/* Whether t is of that format and at least tw x th (a copy's texture kept at another size). */
+int pica_copy_tex_at_least(const PicaTex* t, uint32_t tw, uint32_t th, int rgb565);
 /* Draws the window win (x, y, w, h; EFB pixels, rows as GX's: divided by yscale in the EFB) of the
  * EFB into dst. alpha_one: the EFB format has no alpha. chan: -1 as is; 0-3 that channel (r, g, b,
  * a) in all four (one-channel copy formats, as GX reads them back); 5 red in rgb, alpha kept (RA4,
@@ -149,6 +165,12 @@ void pica_efb_readback(PicaTex* t, void* dest, int dw, int dh, int tilesPerRow, 
                        float h);
 /* The EFB-copy textures' VRAM arena: in use now, most in use so far, and its size (0: none). */
 void pica_copy_arena(uint32_t* usedKB, uint32_t* peakKB, uint32_t* totalKB);
+/* Testing (autorun.txt copy_arena_kb): a smaller arena, set before the renderer starts. */
+void pica_set_copy_arena_kb(uint32_t kb);
+/* Testing (autorun.txt vram_hog_kb): that much VRAM taken away at the start. */
+void pica_set_vram_hog_kb(uint32_t kb);
+/* The bytes of texture VRAM copies dropped so far to make room for EFB copies. */
+uint32_t pica_vram_given_to_copies(void);
 uint32_t pica_readbacks(void);
 uint32_t pica_copies(void);
 /* Debug viewer: cycles what the top screen shows between the EFB (0) and each EFB copy of the

@@ -52,6 +52,10 @@ static bool s_mipsOn = true;
 extern "C" void GX3DS_SetMips(int on) { s_mipsOn = on != 0; }
 static bool s_etc1On;  // settings.txt etc1_textures (textureForMap)
 extern "C" void GX3DS_SetEtc1(int on) { s_etc1On = on != 0; }
+// The ETC1 worker's queues (etcWorker: s_etcIn, then s_etcOut) and whether it runs: 1, or -1 when
+// none could start (the encodes then run in place, as before).
+static std::atomic<uint32_t> s_etcInHead{0}, s_etcInTail{0}, s_etcOutHead{0}, s_etcOutTail{0};
+static int s_etcWorker;
 static bool s_tevSymOn = true;  // settings.txt tev_compiler (tevSymImprove)
 extern "C" void GX3DS_SetTevCompiler(int on) { s_tevSymOn = on != 0; }
 static uint64_t s_arenaDrawVerts, s_arenaUploadBytes; // resident vertices drawn, stored (display-list arena)
@@ -224,6 +228,7 @@ extern const int GX3DS_ZoneCount = gx::GZ_COUNT;
 int GX3DS_ZoneSampling;  // prof_3ds.cpp: the sampler runs
 }  // prof_3ds.cpp: decomp patch 3ds-0031's check (checked, differing)
 extern "C" uint64_t svcGetSystemTick(void);
+extern "C" uint64_t etc1_encode_tex(void* dst, uint32_t w, uint32_t h, const uint8_t* rgba, int alpha);  // pica/etc1_enc.c
 // The "other" breakdown: GX command parsing and display-list calls (gx_fifo.cpp, patch 0006; it
 // includes our draw work done inside them), the emulated OS's idle time (no game thread runnable:
 // waiting for the retrace), and beside them the main thread's bottom-screen status redraw, which
@@ -695,16 +700,20 @@ static void perfFrameEnd() {
 			pica_tex_stats(&vKB, &vN, &lKB, &lN, &vFree);
 			pica_copy_arena(&aUsed, &aPeak, &aSize);
 			fprintf(stderr, "[perf]   textures: %u with a VRAM copy (%u KB), %u in FCRAM only (%u KB) | VRAM free %u KB | "
-			        "%lu copies into VRAM, %lu evicted, %lu animated kept in FCRAM so far | EFB copies %u KB of %u (peak %u)\n",
+			        "%lu copies into VRAM, %lu evicted, %lu animated kept in FCRAM so far | EFB copies %u KB of %u (peak %u), "
+			        "%lu KB of texture VRAM given to them so far\n",
 			        unsigned(vN), unsigned(vKB), unsigned(lN), unsigned(lKB), unsigned(vFree), (unsigned long)pica_vram_copies(),
 			        (unsigned long)pica_vram_evicted(), (unsigned long)pica_vram_animated(), unsigned(aUsed), unsigned(aSize),
-			        unsigned(aPeak));
+			        unsigned(aPeak), (unsigned long)(pica_vram_given_to_copies() >> 10));
 			uint32_t eN, eKB, eEnc;
 			float eMs, eDb;
 			pica_etc1_stats(&eN, &eKB, &eEnc, &eMs, &eDb);
 			if (eN || eEnc)
-				fprintf(stderr, "[perf]   ETC1 textures: %u (%u KB) | %lu encoded so far, in %.0f ms, %.1f dB against the decoded texels\n",
-				        unsigned(eN), unsigned(eKB), (unsigned long)eEnc, double(eMs), double(eDb));
+				fprintf(stderr, "[perf]   ETC1 textures: %u (%u KB) | %lu encoded so far, in %.0f ms (%s), %.1f dB against the decoded "
+				        "texels | %lu waiting for it\n",
+				        unsigned(eN), unsigned(eKB), (unsigned long)eEnc, double(eMs),
+				        s_etcWorker > 0 ? "on the worker, core 2, its waits included" : "in the render thread", double(eDb),
+				        (unsigned long)(s_etcInHead.load() - s_etcInTail.load()));
 			texInventory(frames);
 		}
 		renderThreadPerf(frames);
@@ -997,11 +1006,114 @@ struct TexEntry {
 	int levels = 1;                              // mip levels uploaded
 	uint32_t draws = 0, draws0 = 0;              // draws that sampled it, so far and at the last report
 	uint32_t uploadFrame = 0;                    // when it was last uploaded
+	uint32_t serial = 0;                         // which upload it holds (s_texSerial), for etcApply
 };
 static std::unordered_map<TexKey, TexEntry, TexKeyHash> s_texCache;
 static uint32_t s_texBytes;
 static std::vector<uint8_t> s_decodeBuf, s_scaleBuf;
-static uint32_t s_texUploads, s_copyTexDraws;
+static uint32_t s_texUploads, s_copyTexDraws, s_texSerial;
+
+// settings.txt etc1_textures: the ETC1 encodes, ~20 ms a texture on a New 3DS, ran here in the
+// render thread as each stage's textures were first drawn, 30 to 70 of them (1-1.7 s): every stage
+// started with seconds of 60-100 ms frames (issue #1). They run on a worker thread instead (core 2
+// at the lowest priority, the render thread's idle time), from the game's texels; the texture is
+// drawn in its plain format meanwhile and swapped for its ETC1 version at a later draw (etcApply).
+struct EtcJob {
+	TexKey key;
+	uint32_t pw, ph, serial;
+	uint64_t dataHash;  // the upload's: its result counts only while the entry holds that upload
+	bool alpha;         // ETC1A4
+	uint8_t* out;       // the encode (the worker's malloc), null: none
+	uint64_t err, ticks;
+};
+static const uint32_t kEtcJobs = 128;
+static EtcJob s_etcIn[kEtcJobs], s_etcOut[kEtcJobs];  // render thread -> worker -> render thread
+
+static void etcWorker(void*) {
+	for (;;) {
+		const uint32_t t = s_etcInTail.load(std::memory_order_relaxed);
+		if (t == s_etcInHead.load(std::memory_order_acquire)) {
+			pica_worker_wait();
+			continue;
+		}
+		EtcJob j = s_etcIn[t % kEtcJobs];
+		s_etcInTail.store(t + 1, std::memory_order_release);
+		j.out = nullptr;
+		// The texels as the upload hashed them, before the decode and after the encode: a new stage
+		// may have put something else there meanwhile.
+		const uint8_t* ptr = j.key.ptr;
+		const uint32_t w = j.key.w, h = j.key.h, bytes = texLevelBytes(14, w, h);
+		uint8_t* rgba = hashBytes(ptr, bytes) == j.dataHash ? (uint8_t*)malloc(size_t(w) * h * 4) : nullptr;
+		uint8_t* scaled = nullptr;
+		if (rgba) {
+			decodeTexture(ptr, 14, w, h, nullptr, 0, rgba);
+			const uint8_t* src = rgba;
+			if (j.pw != w || j.ph != h) {  // nearest resample to the power-of-two size, as textureForMap
+				scaled = (uint8_t*)malloc(size_t(j.pw) * j.ph * 4);
+				src = scaled;
+				for (uint32_t y = 0; scaled && y < j.ph; y++) {
+					const uint8_t* row = rgba + size_t(y * h / j.ph) * w * 4;
+					for (uint32_t x = 0; x < j.pw; x++) memcpy(scaled + (size_t(y) * j.pw + x) * 4, row + (x * w / j.pw) * 4, 4);
+				}
+			}
+			if (src) j.out = (uint8_t*)malloc(size_t(j.pw) * j.ph / (j.alpha ? 1 : 2));
+			if (j.out) {
+				const uint64_t t0 = svcGetSystemTick();
+				j.err = etc1_encode_tex(j.out, j.pw, j.ph, src, j.alpha);
+				j.ticks = svcGetSystemTick() - t0;
+				if (hashBytes(ptr, bytes) != j.dataHash) {
+					free(j.out);
+					j.out = nullptr;
+				}
+			}
+		}
+		free(scaled);
+		free(rgba);
+		const uint32_t o = s_etcOutHead.load(std::memory_order_relaxed);
+		if (o - s_etcOutTail.load(std::memory_order_acquire) < kEtcJobs) {
+			s_etcOut[o % kEtcJobs] = j;
+			s_etcOutHead.store(o + 1, std::memory_order_release);
+		} else {
+			free(j.out);
+		}
+	}
+}
+
+// Whether a texture's encode can go to the worker (started the first time it is asked).
+static bool etcRoom() {
+	if (!s_etcWorker) s_etcWorker = pica_worker_start(etcWorker) ? 1 : -1;
+	return s_etcWorker > 0 && s_etcInHead.load(std::memory_order_relaxed) - s_etcInTail.load(std::memory_order_acquire) < kEtcJobs;
+}
+
+static void etcQueue(const TexKey& key, uint32_t pw, uint32_t ph, uint64_t dataHash, uint32_t serial, bool alpha) {
+	const uint32_t i = s_etcInHead.load(std::memory_order_relaxed);
+	s_etcIn[i % kEtcJobs] = EtcJob{key, pw, ph, serial, dataHash, alpha, nullptr, 0, 0};
+	s_etcInHead.store(i + 1, std::memory_order_release);
+	pica_worker_signal();
+}
+
+// The worker's encodes into the texture cache (before a draw looks its textures up): each entry
+// still holding the upload it was made from gets its ETC1 texture, the plain one freed.
+static void etcApply() {
+	const uint32_t head = s_etcOutHead.load(std::memory_order_acquire);
+	for (uint32_t i = s_etcOutTail.load(std::memory_order_relaxed); i != head; i++) {
+		EtcJob& j = s_etcOut[i % kEtcJobs];
+		auto it = s_texCache.find(j.key);
+		if (j.out && it != s_texCache.end() && it->second.serial == j.serial && it->second.dataHash == j.dataHash) {
+			TexEntry& e = it->second;
+			if (PicaTex* t = pica_tex_create_fmt(j.pw, j.ph, j.alpha ? PICA_TF_ETC1A4 : PICA_TF_ETC1)) {
+				pica_tex_upload_raw(t, j.out);
+				pica_etc1_note(j.pw, j.ph, j.alpha, j.err, j.ticks);
+				s_texBytes -= pica_tex_bytes(e.tex);
+				pica_tex_free(e.tex);
+				e.tex = t;
+				s_texBytes += pica_tex_bytes(t);
+			}
+		}
+		free(j.out);
+		s_etcOutTail.store(i + 1, std::memory_order_release);
+	}
+}
 static std::unordered_map<PicaTex*, uint32_t> s_texAvg;  // average RGBA of each uploaded texture
 
 // EFB copies: each destination address the game copies the EFB to gets a texture holding a
@@ -1017,6 +1129,7 @@ struct EfbCopy {
 	uint32_t clock;  // writeClock() at the latest copy: CPU writes to dest after it make the snapshot stale
 	uint32_t fmt;    // copy texture format (1, 7-10: one byte a texel, a map such as the goop's)
 	bool reduced;    // at half its size: no VRAM was left for its own (see the copy below)
+	uint32_t triedFrame;  // when a coarser texture than its own last tried for its own size
 };
 static std::vector<EfbCopy> s_efbCopies;
 // Bianco Hills copies to 7 destinations a frame (5 goop maps, a 256x256 RGB5A3 copy, the screen
@@ -1335,6 +1448,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	const uint8_t* src = nullptr;
 	int tf = PICA_TF_RGBA8;
 	size_t levelOff[16] = {0};
+	bool etcLater = false, etcAlpha = false;  // its ETC1 encode on the worker (etcQueue, after the upload)
 	if (!la8) {
 		size_t total = 0;
 		for (int l = 0; l < levels; l++) {
@@ -1351,9 +1465,13 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		tf = smallTexFormat(src, total / 4, fmt, key.tlutFmt);
 		// settings.txt etc1_textures = on: CMPR textures (already 4 bits a texel, lossy) as ETC1, a
 		// quarter of RGB565's memory, or ETC1A4 with alpha, half of RGBA5551's: more of them fit in
-		// VRAM, at a second lossy step. Not for data rewritten lately (each upload is an encode).
-		if (s_etc1On && fmt == 14 && (!e.tex || s_rFrames - e.uploadFrame > 300))
-			tf = tf == PICA_TF_RGB565 || tf == PICA_TF_L8 ? PICA_TF_ETC1 : PICA_TF_ETC1A4;
+		// VRAM, at a second lossy step. Not for data rewritten lately (each upload is an encode). On
+		// the worker when it has room, the plain format until its encode is in; in place without one.
+		if (s_etc1On && fmt == 14 && (!e.tex || s_rFrames - e.uploadFrame > 300)) {
+			etcAlpha = !(tf == PICA_TF_RGB565 || tf == PICA_TF_L8);
+			if (dh && levels == 1 && etcRoom()) etcLater = true;
+			else if (s_etcWorker < 0) tf = etcAlpha ? PICA_TF_ETC1A4 : PICA_TF_ETC1;
+		}
 	} else {
 		tf = PICA_TF_LA8;
 	}
@@ -1378,6 +1496,7 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 		e.dataHash = dh;
 		e.tlutHash = th;
 		e.uploadFrame = s_rFrames;
+		e.serial = ++s_texSerial;
 		s_texUploads++;
 		evictTextures();
 		return e.tex;
@@ -1408,7 +1527,12 @@ static PicaTex* textureForMap(int map, const EfbCopy** copy) {
 	e.dataHash = dh;
 	e.tlutHash = th;
 	e.uploadFrame = s_rFrames;
+	e.serial = ++s_texSerial;
 	s_texUploads++;
+	if (etcLater) {  // drawn from FCRAM until then: a VRAM copy given back seconds later left gaps in VRAM
+		pica_tex_fcram_only(e.tex);
+		etcQueue(key, pw, ph, dh, e.serial, etcAlpha);
+	}
 	evictTextures();
 	return e.tex;
 }
@@ -4028,6 +4152,7 @@ static void flattenSpans() {
 }
 
 static void drawTriangles() {
+	if (s_etcOutHead.load(std::memory_order_relaxed) != s_etcOutTail.load(std::memory_order_relaxed)) etcApply();
 	if (((rs.bp[BP_GENMODE] >> 14) & 3) == 3) return;  // every face culled
 	if (s_afterTexCopy) s_drawsAfterCopy++;
 	else s_drawsBeforeCopy++;
@@ -6596,11 +6721,24 @@ static void renderCopy(const CopyRec* cr) {
 		pica_copy_tex_layout(rx, ry, rw, rh, half, exact, rowScale, &tw, &th, win);
 		const int rgb565 = cfmt == 4;  // RGB565: no alpha to keep
 		EfbCopy* c = d ? findEfbCopy(d) : nullptr;
-		if (c && !pica_copy_tex_fits(c->tex, tw, th, rgb565) &&
-		    !(c->reduced && pica_copy_tex_fits(c->tex, tw / 2, th / 2, rgb565))) {  // another size or format than its last copy
-			pica_tex_free(c->tex);
-			s_efbCopies.erase(s_efbCopies.begin() + (c - s_efbCopies.data()));
-			c = nullptr;
+		// Another size or format than its last copy: a new texture. Not for a copy that is not a map
+		// while its texture has the format and at least half the size: that holds the copy's window
+		// as well (finer or coarser), and making the texture again each time the size changed, with
+		// VRAM short, lost the copy on some frames and not others (issue #1: the water's and FLUDD's
+		// screen copy flickered). A coarser one tries for its own size every 2 s.
+		if (c && !pica_copy_tex_fits(c->tex, tw, th, rgb565)) {
+			if (exact || !pica_copy_tex_at_least(c->tex, tw / 2, th / 2, rgb565)) {
+				pica_tex_free(c->tex);
+				s_efbCopies.erase(s_efbCopies.begin() + (c - s_efbCopies.data()));
+				c = nullptr;
+			} else if (!pica_copy_tex_at_least(c->tex, tw, th, rgb565) && s_rFrames - c->triedFrame >= 60) {
+				c->triedFrame = s_rFrames;
+				if (PicaTex* t = pica_copy_tex_try(tw, th, rgb565)) {
+					pica_tex_free(c->tex);
+					c->tex = t;
+					c->reduced = false;
+				}
+			}
 		}
 		if (d && !c) {
 			// The least recently sampled copy other than a map (exact) first, else any (-1: none).
@@ -6644,7 +6782,7 @@ static void renderCopy(const CopyRec* cr) {
 				if (reduced) logCopyOnce(d, "no VRAM at its size: a texture of half the size", tw, th);
 			}
 			if (t) {
-				s_efbCopies.push_back(EfbCopy{d, t, 0, 0, 0, 0, {0, 0, 1, 1}, s_rFrames, 0, 0, reduced});
+				s_efbCopies.push_back(EfbCopy{d, t, 0, 0, 0, 0, {0, 0, 1, 1}, s_rFrames, 0, 0, reduced, s_rFrames});
 				c = &s_efbCopies.back();
 			} else if (!exact) {  // a map keeps its memory as the last readback left it
 				lostCopy(d, cfmt, half, rw, rh, tw, th);

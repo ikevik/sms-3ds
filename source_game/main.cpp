@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/iosupport.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -43,6 +44,8 @@ void pica_set_state_skip(int on);
 void pica_set_readback_dumps(int on);
 void pica_set_overlap(int on);
 void pica_set_big_ring(int on);
+void pica_set_copy_arena_kb(uint32_t kb);
+void pica_set_vram_hog_kb(uint32_t kb);
 extern "C" void SMS3DS_ProfRequest(void);
 extern "C" void SMS3DS_ProfRequestGame(void);  // part 4 alone: the game thread's steps
 extern "C" int SMS3DS_ProfState(void);
@@ -421,12 +424,121 @@ static void check_stall(uint32_t frames, uint32_t batches)
 	printf("\x1b[29;0Hstalled: %.30s", pica_where());
 }
 
+// The log's SD writes, on a thread of their own. stderr goes to the "log:" device, a 256 KB ring in
+// memory, and log_writer moves the ring to sdmc:/sms/log.txt and commits it once a second. Written
+// by the threads that logged, through stderr's lock, a slow SD card held every thread that logged
+// meanwhile, the game thread too, for seconds (issue #1: 5.8 s once in Delfino Plaza, 1.4-3 s in
+// 13 more windows of 5 s). Full, the ring drops what does not fit (counted in the log).
+static FILE* s_logFile;  // the SD file: log_drain's alone
+static char s_logRing[256 << 10];
+static uint32_t s_logHead, s_logTail, s_logDropped;  // ring positions, counting from the start
+static LightLock s_logRingLock, s_logFileLock;
+static LightEvent s_logWake;
+static bool s_logRingOn, s_logWriterOn;
+static volatile bool s_logInPlace;  // quitting: flush_log writes on the caller's thread, and waits
+
+static ssize_t log_write(struct _reent*, void*, const char* p, size_t n)
+{
+	LightLock_Lock(&s_logRingLock);
+	const uint32_t room = sizeof s_logRing - (s_logHead - s_logTail);
+	const uint32_t k = n < room ? (uint32_t)n : room;
+	for (uint32_t done = 0; done < k;) {
+		const uint32_t at = (s_logHead + done) % sizeof s_logRing;
+		const uint32_t run = k - done < sizeof s_logRing - at ? k - done : sizeof s_logRing - at;
+		memcpy(s_logRing + at, p + done, run);
+		done += run;
+	}
+	s_logHead += k;
+	s_logDropped += (uint32_t)n - k;
+	const bool half = s_logHead - s_logTail > sizeof s_logRing / 2;
+	LightLock_Unlock(&s_logRingLock);
+	if (half && s_logWriterOn) LightEvent_Signal(&s_logWake);
+	return (ssize_t)n;
+}
+
+// The ring into the file, in order (the file's lock held throughout), then committed.
+static void log_drain(void)
+{
+	static char chunk[16 << 10];
+	static uint32_t saidDropped;
+	LightLock_Lock(&s_logFileLock);
+	for (;;) {
+		LightLock_Lock(&s_logRingLock);
+		uint32_t n = s_logHead - s_logTail;
+		if (n > sizeof chunk) n = sizeof chunk;
+		for (uint32_t done = 0; done < n;) {
+			const uint32_t at = (s_logTail + done) % sizeof s_logRing;
+			const uint32_t run = n - done < sizeof s_logRing - at ? n - done : sizeof s_logRing - at;
+			memcpy(chunk + done, s_logRing + at, run);
+			done += run;
+		}
+		s_logTail += n;
+		const uint32_t dropped = s_logDropped;
+		LightLock_Unlock(&s_logRingLock);
+		if (s_logFile && n) fwrite(chunk, 1, n, s_logFile);
+		if (s_logFile && dropped != saidDropped) {
+			fprintf(s_logFile, "[log] %lu bytes of the log lost so far: the SD card fell behind\n", (unsigned long)dropped);
+			saidDropped = dropped;
+		}
+		if (!n) break;
+	}
+	if (s_logFile) {
+		fflush(s_logFile);
+		fsync(fileno(s_logFile));
+	}
+	LightLock_Unlock(&s_logFileLock);
+}
+
+static void log_writer(void*)
+{
+	for (;;) {
+		LightEvent_WaitTimeout(&s_logWake, 1000000000LL);
+		if (sms3ds_ending) sms3ds_park();
+		if (!s_logInPlace) log_drain();
+	}
+}
+
+// stderr into the ring, the SD file opened and its writer started; without the device, stderr goes
+// straight to the file as before.
+static void log_start(void)
+{
+	static devoptab_t dev;
+	dev.name = "log";
+	dev.structSize = sizeof(int);
+	dev.open_r = [](struct _reent*, void*, const char*, int, int) { return 0; };
+	dev.close_r = [](struct _reent*, void*) { return 0; };
+	dev.write_r = log_write;
+	LightLock_Init(&s_logRingLock);
+	LightLock_Init(&s_logFileLock);
+	LightEvent_Init(&s_logWake, RESET_ONESHOT);
+	s_logFile = fopen(LOG_PATH, "w");
+	static char fileBuf[32 << 10];
+	if (s_logFile) setvbuf(s_logFile, fileBuf, _IOFBF, sizeof fileBuf);
+	s_logRingOn = s_logFile && AddDevice(&dev) >= 0 && freopen("log:", "w", stderr);
+	if (!s_logRingOn) {
+		if (s_logFile) fclose(s_logFile);
+		s_logFile = nullptr;
+		freopen(LOG_PATH, "w", stderr);
+		return;
+	}
+	// On the main thread's core at its priority: the writer mostly waits on the SD card, and the
+	// game thread (lowest priority there) gets the core back as soon as it does.
+	s_logWriterOn = threadCreate(log_writer, NULL, 16u << 10, 0x30, -2, true) != NULL;
+}
+
 // Commits the log to the SD card. Written data only becomes part of the file when it is flushed
-// or closed, so a console turned off without this leaves gaps and stale bytes in log.txt.
+// or closed, so a console turned off without this leaves gaps and stale bytes in log.txt. Hands the
+// writing to log_writer; written here, waiting for the card, while quitting or without a writer.
 static void flush_log(void)
 {
 	fflush(stderr);
-	fsync(fileno(stderr));
+	if (!s_logRingOn) {
+		fsync(fileno(stderr));
+	} else if (s_logWriterOn && !s_logInPlace && !sms3ds_ending) {
+		LightEvent_Signal(&s_logWake);
+	} else {
+		log_drain();
+	}
 }
 
 // sdmc:/sms/settings.txt as first written: the settings that do something on the 3DS, at its
@@ -1193,10 +1305,10 @@ int main()
 	// The previous run's log is kept as log-prev.txt (FAT's rename does not replace a file).
 	remove(SMS_DIR "/log-prev.txt");
 	rename(LOG_PATH, SMS_DIR "/log-prev.txt");
-	freopen(LOG_PATH, "w", stderr);
-	// A 64 KB buffer, written out once a second by the main loop (flush_log). Unbuffered, every
-	// line was its own SD write: slow on a New 3DS, and garbled when threads wrote at once. A
-	// crash loses at most the last second (Luma's crash dump has the rest).
+	log_start();
+	// A 64 KB buffer, handed on once a second by the main loop (flush_log). Unbuffered, every line
+	// was its own write: slow, and garbled when threads wrote at once. A crash loses at most the
+	// last second (Luma's crash dump has the rest).
 	static char logBuf[64 << 10];
 	setvbuf(stderr, logBuf, _IOFBF, sizeof logBuf);
 
@@ -1375,6 +1487,13 @@ int main()
 		for (int i = 0; i < 10000; i++) (void)svcGetSystemTick();
 		const u64 t1 = svcGetSystemTick();
 		fprintf(stderr, "[perf] one svcGetSystemTick: %.0f ns\n", double(t1 - t0) / 10000.0 / 0.268111856);
+	}
+	// autorun.txt copy_arena_kb: a smaller arena for the EFB-copy textures; vram_hog_kb: that much VRAM
+	// taken away. The copies then run short of VRAM (testing their fallbacks). Before the renderer starts.
+	{
+		char v[12];
+		if (setting_value(SMS_DIR "/autorun.txt", "copy_arena_kb", v, sizeof v)) pica_set_copy_arena_kb((uint32_t)atoi(v));
+		if (setting_value(SMS_DIR "/autorun.txt", "vram_hog_kb", v, sizeof v)) pica_set_vram_hog_kb((uint32_t)atoi(v));
 	}
 	printf("GPU self-test... ");
 	const bool gpuOk = pica_selftest() != 0;
@@ -1584,6 +1703,7 @@ int main()
 	// unbounded one kept the process from ending, and the next app the HOME Menu started had a black
 	// screen until the console was turned off. Each step is logged as it ends, to tell which one.
 	const bool homeClose = aptShouldClose();
+	s_logInPlace = true;  // the quit's lines written as they come (the writer parks with the rest)
 	fprintf(stderr, "[3ds] exiting (%s)\n", homeClose ? "closed from the HOME Menu" : "START+SELECT or autorun");
 	flush_log();
 	if (s_statusThread) {
