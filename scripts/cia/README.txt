@@ -43,7 +43,8 @@ Playing
 - R is a hard press, as the GameCube's R pushed all the way: Mario stops to aim FLUDD. ZR is a
   soft press: FLUDD sprays while Mario moves. SELECT makes R a soft press too, and SELECT again
   switches it back; the bottom screen shows which, and settings.txt's r_press sets the one R
-  starts with.
+  starts with. With zr_press = opposite, ZR is whichever press R isn't.
+- If Mario drifts without you touching the Circle Pad, raise settings.txt's stick_deadzone.
 - START + SELECT quits.
 - Saves go to SD:/sms/card-a/, and the log of the last run to SD:/sms/log.txt.
 - settings.txt is read at start; each setting there has a comment saying what it does.

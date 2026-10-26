@@ -109,8 +109,15 @@ debug_input = off
 
 # The R button as a soft press (soft: FLUDD sprays while Mario moves) or a hard one (hard: Mario
 # stops to aim, as the GameCube's R pushed all the way). SELECT switches between them in play.
-# ZR is always the soft press.
 r_press = hard
+
+# ZR: always the soft press (soft), or whichever press R is not (opposite: hard once SELECT has
+# made R soft).
+zr_press = soft
+
+# The Circle Pad's and the C-stick's dead zone, out of about 156 to the edge: within it a stick
+# reads centred, for pads that don't rest exactly in the middle. Raise it if Mario drifts; 0: none.
+stick_deadzone = 15
 
 # What touching the bottom right of the bottom screen low down runs (debug_input = on): the game
 # thread's steps (steps) or the game thread by object (objects). Higher up it starts the whole

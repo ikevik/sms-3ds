@@ -500,8 +500,15 @@ static const char kDefaultSettings[] =
     "\n"
     "# The R button as a soft press (soft: FLUDD sprays while Mario moves) or a hard one (hard: Mario\n"
     "# stops to aim, as the GameCube's R pushed all the way). SELECT switches between them in play.\n"
-    "# ZR is always the soft press.\n"
     "r_press = hard\n"
+    "\n"
+    "# ZR: always the soft press (soft), or whichever press R is not (opposite: hard once SELECT has\n"
+    "# made R soft).\n"
+    "zr_press = soft\n"
+    "\n"
+    "# The Circle Pad's and the C-stick's dead zone, out of about 156 to the edge: within it a stick\n"
+    "# reads centred, for pads that don't rest exactly in the middle. Raise it if Mario drifts; 0: none.\n"
+    "stick_deadzone = 15\n"
     "\n"
     "# What touching the bottom right of the bottom screen low down runs (debug_input = on): the game\n"
     "# thread's steps (steps) or the game thread by object (objects). Higher up it starts the whole\n"
@@ -976,7 +983,8 @@ static void draw_status(const uint32_t* s) {
 	GX3DS_GetPathStats(ps2);
 	printf("transform: %s  gpu %lu cpu %lu   \n", GX3DS_GetGpuTransform() ? "GPU" : "CPU", (unsigned long)ps2[0],
 	       (unsigned long)ps2[1]);
-	printf("\x1b[28;0HR: %s press (SELECT switches)", pad3ds_soft_r ? "soft" : "hard");
+	printf("\x1b[28;0HR %s, ZR %s (SELECT switches)  ", pad3ds_soft_r ? "soft" : "hard",
+	       pad3ds_zr_opposite && pad3ds_soft_r ? "hard" : "soft");
 	// No gfxSwapBuffers: citro3d swaps the top screen, and the console's bottom screen is
 	// single-buffered, so writing back the CPU cache is enough.
 	gfxFlushBuffers();
@@ -1151,6 +1159,17 @@ int main()
 		pad3ds_soft_r = setting_value(SMS_DIR "/settings.txt", "r_press", v, sizeof v) && strcmp(v, "soft") == 0;
 	}
 	fprintf(stderr, "[3ds] R: %s press (r_press; SELECT switches)\n", pad3ds_soft_r ? "soft" : "hard");
+	{
+		char v[12];
+		pad3ds_zr_opposite =
+		    setting_value(SMS_DIR "/settings.txt", "zr_press", v, sizeof v) && strcmp(v, "opposite") == 0;
+		if (setting_value(SMS_DIR "/settings.txt", "stick_deadzone", v, sizeof v)) {
+			const int dz = atoi(v);
+			pad3ds_stick_deadzone = dz < 0 ? 0 : dz > 100 ? 100 : dz;
+		}
+	}
+	fprintf(stderr, "[3ds] ZR: %s (zr_press); stick dead zone %d of 156 (stick_deadzone)\n",
+	        pad3ds_zr_opposite ? "the opposite of R" : "the soft press", pad3ds_stick_deadzone);
 	printf("log: %s\nSELECT: R soft/hard, START+SELECT: exit\n", LOG_PATH);
 	if (s_debugInput) printf("L+SELECT = colours\ntouch: top=view  bottom: L=trace M=GPU R=profile\n");
 

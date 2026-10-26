@@ -37,6 +37,12 @@ extern volatile uint32_t pad3ds_script;
 // one (0: the analog value and the click at the bottom, so he stops to aim, as the GameCube's R
 // pushed all the way). The main thread switches it on SELECT (main.cpp).
 extern volatile int pad3ds_soft_r;
+// ZR as the other press from R (settings.txt zr_press = opposite: hard while R is soft), else always
+// the soft one (main.cpp reads it at start).
+extern volatile int pad3ds_zr_opposite;
+// The sticks' dead zone, in their raw units of about 156 to the edge (settings.txt stick_deadzone;
+// 15 unless it says otherwise): within it a stick reads centred.
+extern volatile int pad3ds_stick_deadzone;
 // Set by the main thread when quitting: the game thread stops at its next PADRead.
 extern volatile int pad3ds_quit;
 // Set by the main thread once the game thread has stopped, as the services are about to shut down:
@@ -61,7 +67,7 @@ void sms3ds_wait_resumed(void);
 // Mapping:
 //   Circle Pad -> main stick        C-stick (New 3DS) -> C-stick
 //   A/B/X/Y    -> A/B/X/Y           L / R             -> L / R (full press; R soft: pad3ds_soft_r)
-//   ZL         -> Z                 ZR (New 3DS)      -> R pressed part of the way (soft)
+//   ZL         -> Z                 ZR (New 3DS)      -> R part of the way (soft; zr_press)
 //   D-pad      -> D-pad             Start             -> Start
 
 #ifdef __cplusplus

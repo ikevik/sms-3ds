@@ -1,14 +1,24 @@
 #include "pad_3ds.h"
 #include <3ds.h>
+#include <math.h>
 #include <string.h>
 
-static int8_t scale_axis(int16_t v)
+/* A stick on the GameCube's scale (the Circle Pad and the C-stick report about -156..156, the
+ * GameCube's stick about -72..72), with a dead zone: a pad that doesn't rest exactly at the centre
+ * read as a slight push, and Mario drifted (issue #1). Within pad3ds_stick_deadzone of the centre
+ * it reads centred; past it the rest of the travel is spread over the whole range, so all the way
+ * still reads all the way. Measured as a radius, so that diagonals keep their direction. */
+volatile int pad3ds_stick_deadzone = 15;
+static void scale_stick(int dx, int dy, int8_t* ox, int8_t* oy)
 {
-	// Circle Pad reports about -156..156; GameCube stick range is about -72..72.
-	int s = (v * 72) / 156;
-	if (s > 72) s = 72;
-	if (s < -72) s = -72;
-	return (int8_t)s;
+	const float full = 156.0f, dz = (float)pad3ds_stick_deadzone;
+	const float r = sqrtf((float)(dx * dx + dy * dy));
+	*ox = *oy = 0;
+	if (r <= dz || r <= 0.0f) return;
+	const float k = (r >= full ? 1.0f : (r - dz) / (full - dz)) * 72.0f / r;
+	int x = (int)lroundf((float)dx * k), y = (int)lroundf((float)dy * k);
+	*ox = (int8_t)(x > 72 ? 72 : x < -72 ? -72 : x);
+	*oy = (int8_t)(y > 72 ? 72 : y < -72 ? -72 : y);
 }
 
 static void read_now(Pad3DSStatus* out)
@@ -28,26 +38,28 @@ static void read_now(Pad3DSStatus* out)
 	if (held & KEY_ZL) out->button |= P3DS_TRIGGER_Z;
 	if (held & KEY_L) { out->button |= P3DS_TRIGGER_L; out->triggerL = 255; }
 	/* R is a hard press (the analog value and the click: Mario stops to aim), or a soft one once
-	 * SELECT has switched it (pad3ds_soft_r); ZR is always the soft press, so FLUDD sprays while Mario
-	 * moves. Soft: past the analog level at which the game's spray pressure is full (150 of 255:
-	 * TMario::getLRLevel, mAnalogLRToMaxVal), without the click. */
-	if ((held & KEY_R) && !pad3ds_soft_r) {
+	 * SELECT has switched it (pad3ds_soft_r). ZR is the soft press, so FLUDD sprays while Mario
+	 * moves; with settings.txt zr_press = opposite (pad3ds_zr_opposite) it is whichever press R is
+	 * not, so hard while R is soft. Soft: past the analog level at which the game's spray pressure is
+	 * full (150 of 255: TMario::getLRLevel, mAnalogLRToMaxVal), without the click. */
+	const int zrHard = pad3ds_zr_opposite && pad3ds_soft_r;
+	const int rHard = ((held & KEY_R) && !pad3ds_soft_r) || ((held & KEY_ZR) && zrHard);
+	const int rSoft = ((held & KEY_R) && pad3ds_soft_r) || ((held & KEY_ZR) && !zrHard);
+	if (rHard) {
 		out->button |= P3DS_TRIGGER_R;
 		out->triggerR = 255;
-	} else if (held & (KEY_R | KEY_ZR)) {
+	} else if (rSoft) {
 		out->triggerR = 180;
 	}
 
 	circlePosition cp;
 	hidCircleRead(&cp);
-	out->stickX = scale_axis(cp.dx);
-	out->stickY = scale_axis(cp.dy);
+	scale_stick(cp.dx, cp.dy, &out->stickX, &out->stickY);
 
 	circlePosition cs;
 	irrstScanInput();
 	irrstCstickRead(&cs);   // New 3DS C-stick (needs irrstInit)
-	out->substickX = scale_axis(cs.dx);
-	out->substickY = scale_axis(cs.dy);
+	scale_stick(cs.dx, cs.dy, &out->substickX, &out->substickY);
 
 	/* autorun.txt buttons: the Circle Pad and C-stick pushed all the way (main.cpp) */
 	u32 sc = pad3ds_script;
@@ -69,6 +81,7 @@ volatile uint32_t pad3ds_script;
 static LightLock s_lock = 1; /* 1: unlocked */
 volatile int pad3ds_quit;
 volatile int pad3ds_soft_r;
+volatile int pad3ds_zr_opposite;
 volatile int sms3ds_ending;
 volatile int sms3ds_parked_threads;
 volatile int sms3ds_suspended;

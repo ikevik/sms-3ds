@@ -73,7 +73,7 @@ Install CIA. Please don't share the built `.cia`: it carries art and music from 
 | A, B, X, Y | A, B, X, Y |
 | L, R | L and R, pressed all the way |
 | ZL | Z |
-| ZR | R pressed part of the way: FLUDD sprays while Mario moves |
+| ZR | R pressed part of the way: FLUDD sprays while Mario moves (or R's opposite: `zr_press`) |
 | D-pad, START | D-pad, START |
 | SELECT | Switches R between the hard press (Mario stops to aim) and the soft one (as ZR) |
 | START + SELECT | Quit |
@@ -90,7 +90,10 @@ The ones a player may want:
 - `etc1_textures = on`: compressed textures as ETC1, so more of them fit in the GPU's memory
   (faster in Bianco Hills and Delfino Plaza; a little colour loss, about a second more per stage
   load).
-- `r_press`: `hard` or `soft`, the press R starts as (SELECT switches it; ZR is always soft).
+- `r_press`: `hard` or `soft`, the press R starts as (SELECT switches it).
+- `zr_press`: `soft` (ZR is always the soft press) or `opposite` (ZR is whichever press R isn't).
+- `stick_deadzone`: how far a stick must move before it counts (15 of about 156); raise it if
+  Mario drifts.
 - `debug_input = on`: the port's debug and test controls (the touch screen, L + SELECT, buttons
   held at launch). Off by default.
 
