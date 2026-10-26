@@ -56,7 +56,7 @@ typedef struct {
 	uint8_t alpha_test2, alpha_func2, alpha_ref2; /* second pass for a test passing two alpha ranges */
 	PicaTex* tex[PICA_MAX_TEX];                /* texture units; null: unused */
 	uint8_t wrap_s[PICA_MAX_TEX], wrap_t[PICA_MAX_TEX]; /* GPU_TEXTURE_WRAP_PARAM */
-	uint8_t linear[PICA_MAX_TEX];              /* bilinear filtering */
+	uint8_t linear[PICA_MAX_TEX];              /* bilinear filtering: bit 0 magnified, bit 1 minified (GX's two) */
 	int16_t lod_bias[PICA_MAX_TEX];            /* mip LOD bias, 1/256 units (mipmapped textures) */
 	uint8_t depth_bias;                        /* depth moved slightly toward the camera (decals) */
 	uint8_t proj0;                             /* CPU vertices: unit 0's coordinate is projective, (s q, t q) in

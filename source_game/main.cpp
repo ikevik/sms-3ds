@@ -105,6 +105,12 @@ static float s_newStageAt[16];  // autorun.txt new_stage_at = <seconds>,...: the
 static int s_nNewStage, s_newStageNext;
 static float s_memTestAt = -1.0f;  // autorun.txt mem_test = <seconds>: the heap run out then (the reserve's path, testing)
 static float s_cpuPathAt = -1.0f;  // autorun.txt cpu_path_at = <seconds>: the CPU vertex path from then on (comparing the paths)
+static float s_j3dOffAt = -1.0f;  // autorun.txt native_j3d_off_at = <seconds>: native J3D off from then on (comparing the paths)
+extern "C" void GX3DS_SetTraceRect(float x0, float y0, float x1, float y1);  // gx3ds_backend.cpp
+static float s_coloursAt[2] = {-1.0f, -1.0f};  // autorun.txt colours_at = <seconds>:<mode>,<seconds>:<mode> (as L+SELECT: 1 flat, 2 opaque, 3 no alpha test)
+static int s_coloursMode[2];
+static float s_cullOffAt = -1.0f;  // autorun.txt cull_off_at = <seconds>: off-screen display lists drawn from then on
+extern "C" void GXPC_SetNativeJ3DMode(int mode);  // gx_api.cpp: native J3D's mode, its buffers kept
 static float s_traceAt = -1.0f;  // autorun.txt trace_at = <seconds>: that frame's GX commands traced (sdmc:/sms/trace-N.txt)
 static float s_goopDumpAt = -1.0f;  // autorun.txt goop_dump_at = <seconds>: each map's next readback written (sdmc:/sms/goop-<address>.pgm)
 extern "C" void pica_request_goop_dumps(void);  // pica_draw.c
@@ -1021,6 +1027,14 @@ static void* game_thread(void*)
 			if (setting_value(kAutoPath, "trace_at", list, sizeof list)) s_traceAt = float(atof(list));
 			if (setting_value(kAutoPath, "goop_dump_at", list, sizeof list)) s_goopDumpAt = float(atof(list));
 			if (setting_value(kAutoPath, "cpu_path_at", list, sizeof list)) s_cpuPathAt = float(atof(list));
+			if (setting_value(kAutoPath, "native_j3d_off_at", list, sizeof list)) s_j3dOffAt = float(atof(list));
+			if (setting_value(kAutoPath, "cull_off_at", list, sizeof list)) s_cullOffAt = float(atof(list));
+			if (setting_value(kAutoPath, "colours_at", list, sizeof list))
+				sscanf(list, "%f:%d,%f:%d", &s_coloursAt[0], &s_coloursMode[0], &s_coloursAt[1], &s_coloursMode[1]);
+			if (setting_value(kAutoPath, "trace_rect", list, sizeof list)) {
+				float r[4];
+				if (sscanf(list, "%f,%f,%f,%f", &r[0], &r[1], &r[2], &r[3]) == 4) GX3DS_SetTraceRect(r[0], r[1], r[2], r[3]);
+			}
 			if (setting_value(kAutoPath, "mem_test", list, sizeof list)) s_memTestAt = float(atof(list));
 			if (setting_value(kAutoPath, "new_stage_at", list, sizeof list))
 				for (char* p = strtok(list, ","); p && s_nNewStage < 16; p = strtok(nullptr, ","))
@@ -1131,7 +1145,8 @@ static void draw_status(const uint32_t* s) {
 			printf("\x1b[14;0H%38s", "");
 	}
 	printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
-	       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
+	       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque"
+	       : GX3DS_GetDebugColors() == 3 ? "no alpha test" : "material");
 	uint32_t cs[3];
 	GX3DS_GetCopyStats(cs);
 	printf("draws: %3lu before copy, %3lu after\ntexture copies/frame: %lu  \n", (unsigned long)cs[0],
@@ -1550,7 +1565,7 @@ int main()
 		// needs START+SELECT.
 		hidScanInput();
 		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_goopDumpAt >= 0.0f || s_cpuPathAt >= 0.0f || s_nNewStage ||
-		    s_tpNext < s_nTp) {  // autorun.txt timed keys
+		    s_tpNext < s_nTp || s_j3dOffAt >= 0.0f || s_cullOffAt >= 0.0f || s_coloursAt[0] >= 0.0f || s_coloursAt[1] >= 0.0f) {  // autorun.txt timed keys
 			const float t = float(osGetTime() - s_launchMs) / 1000.0f;
 			// A teleport once it is time and a stage is in play (the stage's director playing).
 			if (s_tpNext < s_nTp && t >= s_tp[s_tpNext].at && s_tpPending < 0 && g_phase == 2) {
@@ -1562,6 +1577,22 @@ int main()
 				GX3DS_SetGpuTransform(0);
 				s_cpuPathAt = -1.0f;
 			}
+			if (s_j3dOffAt >= 0.0f && t >= s_j3dOffAt) {
+				GXPC_SetNativeJ3DMode(0);
+				s_j3dOffAt = -1.0f;
+				fprintf(stderr, "[3ds] autorun: native J3D off (native_j3d_off_at)\n");
+			}
+			if (s_cullOffAt >= 0.0f && t >= s_cullOffAt) {
+				GXPC_CullOff = 1;
+				s_cullOffAt = -1.0f;
+				fprintf(stderr, "[3ds] autorun: off-screen culling off (cull_off_at)\n");
+			}
+			for (int c = 0; c < 2; c++)
+				if (s_coloursAt[c] >= 0.0f && t >= s_coloursAt[c]) {
+					GX3DS_SetDebugColors(s_coloursMode[c]);
+					s_coloursAt[c] = -1.0f;
+					fprintf(stderr, "[3ds] autorun: colours mode %d (colours_at)\n", s_coloursMode[c]);
+				}
 			if (s_memTestAt >= 0.0f && t >= s_memTestAt) {
 				s_memTestAt = -1.0f;
 				// Megabytes taken until operator new finds no room (out_of_memory gives the reserve back
@@ -1647,7 +1678,7 @@ int main()
 		if ((released & KEY_SELECT) && selectAlone) {
 			selectAlone = false;
 			if (s_debugInput && (held & KEY_L)) {
-				GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 3);
+				GX3DS_SetDebugColors((GX3DS_GetDebugColors() + 1) % 4);
 			} else {
 				pad3ds_soft_r = !pad3ds_soft_r;
 				fprintf(stderr, "[pad] R: %s press (SELECT)\n", pad3ds_soft_r ? "soft" : "hard");

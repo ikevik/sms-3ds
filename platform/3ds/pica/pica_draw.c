@@ -1946,7 +1946,7 @@ static void apply_state(const PicaState* st, uint32_t same)
 		PicaTex* pt = st->tex[u];
 		C3D_Tex* tex = &pt->tex;
 		C3D_TexSetWrap(tex, (GPU_TEXTURE_WRAP_PARAM)st->wrap_s[u], (GPU_TEXTURE_WRAP_PARAM)st->wrap_t[u]);
-		C3D_TexSetFilter(tex, st->linear[u] ? GPU_LINEAR : GPU_NEAREST, st->linear[u] ? GPU_LINEAR : GPU_NEAREST);
+		C3D_TexSetFilter(tex, st->linear[u] & 1 ? GPU_LINEAR : GPU_NEAREST, st->linear[u] & 2 ? GPU_LINEAR : GPU_NEAREST);
 		C3D_TexSetLodBias(tex, st->lod_bias[u] / 256.0f);
 		pt->lastUse = s_frameNo;
 		if (!pt->vram && !pt->rt && s_vramTex && s_ovl && s_in_frame) vram_try(pt);
@@ -3483,10 +3483,10 @@ static void describe_state(const PicaState* st)
 	for (int u = 0; u < PICA_MAX_TEX; u++) {
 		const PicaTex* t = st->tex[u];
 		if (!t) continue;
-		fprintf(stderr, "[gpucheck]   texture %d: %ux%u fmt %d data %p (phys %08lx) %s, wrap %u/%u, %s\n", u,
+		fprintf(stderr, "[gpucheck]   texture %d: %ux%u fmt %d data %p (phys %08lx) %s, wrap %u/%u, %s/%s\n", u,
 		        t->tex.width, t->tex.height, (int)t->tex.fmt, t->tex.data,
 		        (unsigned long)osConvertVirtToPhys(t->tex.data), t->rt ? "EFB copy" : "uploaded", st->wrap_s[u],
-		        st->wrap_t[u], st->linear[u] ? "linear" : "nearest");
+		        st->wrap_t[u], st->linear[u] & 1 ? "linear" : "nearest", st->linear[u] & 2 ? "linear" : "nearest");
 	}
 	for (int i = 0; i < st->nstages && i < PICA_MAX_STAGES; i++) {
 		const PicaTevStage* g = &st->stage[i];

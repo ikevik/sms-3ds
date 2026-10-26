@@ -937,9 +937,10 @@ static inline uint8_t clamp255(float v) { return v <= 0.f ? 0 : v >= 255.f ? 255
 // blending are left alone so fades stay transparent.
 static volatile bool s_debugColors;
 // Opaque mode (GX3DS_SetDebugColors 2): blending and the alpha test off, to tell what a draw's
-// colour is from how it is blended.
-static volatile bool s_opaque;
-static int debugColorMode() { return s_debugColors ? 1 : s_opaque ? 2 : 0; }
+// colour is from how it is blended (s_opaque 1); 3: the alpha test alone off (s_opaque 2).
+static volatile int s_opaque;
+static int debugColorMode() { return s_debugColors ? 1 : s_opaque ? s_opaque + 1 : 0; }
+
 // One-frame trace (GX3DS_TraceNextFrame, L on the 3DS side): every draw, copy and clear of the
 // next frame, in order, to the log.
 static volatile bool s_traceArm;
@@ -949,6 +950,15 @@ static bool s_tracing;
 static FILE* s_traceFile;
 static unsigned s_traceNo;
 static std::vector<unsigned> s_traceDumped;  // TEV dumps written to the current trace file
+// autorun.txt trace_rect = x0,y0,x1,y1 (EFB pixels): a traced frame's triangles that reach into that
+// rectangle, vertex by vertex (where on screen, and the model-space position and matrix it came from).
+static float s_traceRect[4];
+static bool s_traceRectOn;
+static uint32_t s_traceTexDumps;  // textures of those draws written (sdmc:/sms/trace-tex-<draw>.pam), this trace
+extern "C" void GX3DS_SetTraceRect(float x0, float y0, float x1, float y1) {
+	s_traceRect[0] = x0, s_traceRect[1] = y0, s_traceRect[2] = x1, s_traceRect[3] = y1;
+	s_traceRectOn = true;
+}
 static inline FILE* tf() { return s_traceFile ? s_traceFile : stderr; }
 // GX3DS_SetVerboseLog: the once-per-kind [tevdump], [tev] and [copy] lines. Off by default: on a
 // New 3DS each new TEV setup's dump cost several ms of SD writes on the game thread.
@@ -983,7 +993,11 @@ static void debugColor(uint32_t pm, const uint8_t* v0, uint32_t stride, uint32_t
 void decodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h, const uint8_t* tlut, uint32_t tlutFmt,
                    uint8_t* out);
 
-static const uint32_t kMaxTexSide = 256;
+// As the GameCube, up to the PICA's own 1024 a side. Kept to 256, every larger texture lost three
+// rows or columns in four: the roofs' 128x1024 atlas lost its regions' transparent margins, and the
+// alpha test cut a see-through line along every roof ridge and edge where geometry met one (issue #1:
+// the rooftop seams). The movies' frames, converted every frame, stay at kMaxThpSide.
+static const uint32_t kMaxTexSide = 1024, kMaxThpSide = 256;
 static const uint32_t kTexBudget = 8u << 20;
 
 struct TexKey {
@@ -1207,9 +1221,9 @@ static void lostCopy(const void* d, uint32_t cfmt, bool half, float rw, float rh
 	        th, (unsigned long)bytes);
 }
 
-static inline uint32_t pow2Side(uint32_t v) {
+static inline uint32_t pow2Side(uint32_t v, uint32_t most = kMaxTexSide) {
 	uint32_t p = 8;
-	while (p < v && p < kMaxTexSide) p <<= 1;
+	while (p < v && p < most) p <<= 1;
 	return p;
 }
 
@@ -1589,7 +1603,7 @@ static void traceTexCheck(FILE* out, int u, int map, PicaTex* t) {
 	        (unsigned long)pica_tex_phys(t, where == 1), where == 1 ? " (VRAM)" : "", data,
 	        diff ? "DIFFERS" : bytes ? "matches the data" : "not checked");
 	if (diff) fprintf(out, ": %lu of %lu bytes, first at +%lx", (unsigned long)diff, (unsigned long)bytes, (unsigned long)first);
-	fprintf(out, " (PICA format %d)\n", pica_tex_format(t));
+	fprintf(out, " (PICA format %d, %lu bytes)\n", pica_tex_format(t), (unsigned long)pica_tex_bytes(t));
 }
 
 // For the draw trace: the average colour (and smallest alpha) of map's texture as the game's data
@@ -3114,7 +3128,7 @@ static PicaTex* thpRgbTexture(const TevSetup& t) {
 	if (e && e->frame == s_rFrames) return e->tex;
 	uint64_t hash = hashBytes(konst, sizeof konst) ^ (uint64_t(ra) << 32 | bg);
 	for (int i = 0; i < 3; i++) hash = hash * 0x100000001B3ull ^ hashBytes(src[i], texLevelBytes(1, w[i], h[i]));
-	const uint32_t pw = pow2Side(w[2]), ph = pow2Side(h[2]);
+	const uint32_t pw = pow2Side(w[2], kMaxThpSide), ph = pow2Side(h[2], kMaxThpSide);
 	if (e && e->hash == hash && e->pw == pw && e->ph == ph) {
 		e->frame = s_rFrames;
 		return e->tex;
@@ -4176,7 +4190,8 @@ static void drawTriangles() {
 	// are worked out in place (s_fp), so taking them copies nothing; the CPU path, which changes the
 	// state for its own draw, leaves them invalid.
 	struct FastState {
-		bool valid, debug, opaque;
+		bool valid, debug;
+		int opaque;
 		uint32_t gen, fmt, frame;
 		TevSetup tev;
 		PicaTex* ptex[kMaxPairs];
@@ -4339,7 +4354,11 @@ static void drawTriangles() {
 			st.tex[u] = utex[u];
 			st.wrap_s[u] = kWrap[mode0 & 3];
 			st.wrap_t[u] = kWrap[(mode0 >> 2) & 3];
-			st.linear[u] = (mode0 >> 4) & 1;
+			// GX's two filters: bit 4 when magnified, bits 5-7 when minified (near, linear, near or linear
+			// within a mip level). The magnified one stood for both, so textures the game samples nearest when
+			// minified (Delfino Plaza's roof atlas: near within a level) were blended there.
+			const uint32_t minf = (mode0 >> 5) & 7;
+			st.linear[u] = uint8_t(((mode0 >> 4) & 1) | (minf == 1 || minf == 3 || minf == 5 ? 2 : 0));
 			st.lod_bias[u] = int16_t(int8_t((mode0 >> 9) & 0xFF) * 8);  // s2.5 -> 1/256
 			// A perspective draw reading a one-byte map copy is the goop layer on the ground.
 			if (ucopy[u] && (ucopy[u]->fmt == 1 || (ucopy[u]->fmt >= 7 && ucopy[u]->fmt <= 10)) &&
@@ -4366,7 +4385,7 @@ static void drawTriangles() {
 			if (!cached || !s_tevCache[tevKey].dumpId) s_tevCache[tevKey].dumpId = dumpId;
 		}
 		if (s_opaque) {
-			st.blend = 0;
+			if (s_opaque == 1) st.blend = 0;
 			st.alpha_test = st.alpha_test2 = 0;
 			st.alpha_func = 1;  // GPU_ALWAYS
 		}
@@ -4653,6 +4672,57 @@ static void drawTriangles() {
 		        w0, w1, nan, n ? out[0].x : 0.f, n ? out[0].y : 0.f, n ? out[0].z : 0.f, n ? out[0].w : 0.f, p0f[0], p0f[1], p0f[2],
 		        hasMtx ? r_verts[L.mtx] : defPm, m0[0], m0[1], m0[2], m0[3], m0[4], m0[5], m0[6], m0[7], m0[8], m0[9], m0[10],
 		        m0[11], p0, p1, p2, p3, p4, p5, ortho ? "ortho" : "persp", vsx, vsy, vsz, vcx, vcy, vcz, r_fmt);
+		uint32_t said = 0;
+		for (uint32_t t = 0; s_traceRectOn && t + 2 < nidx && said < 200; t += 3) {
+			// Its extent on screen, clipped against w > 0 as the GPU clips it (its points in front, and
+			// where its edges cross the camera plane).
+			float tx0 = 1e9f, tx1 = -1e9f, ty0 = 1e9f, ty1 = -1e9f;
+			auto extend = [&](float x, float y, float w) {
+				x /= w, y /= w;
+				tx0 = x < tx0 ? x : tx0, tx1 = x > tx1 ? x : tx1, ty0 = y < ty0 ? y : ty0, ty1 = y > ty1 ? y : ty1;
+			};
+			for (int k = 0; k < 3; k++) {
+				const PicaVtx& o = out[oidx[t + k]];
+				const PicaVtx& p = out[oidx[t + (k + 1) % 3]];
+				if (o.w > 1e-3f) extend(o.x, o.y, o.w);
+				if ((o.w > 1e-3f) != (p.w > 1e-3f)) {
+					const float f = (o.w - 1e-3f) / (o.w - p.w);
+					extend(o.x + f * (p.x - o.x), o.y + f * (p.y - o.y), 1e-3f);
+				}
+			}
+			if (tx1 < s_traceRect[0] || tx0 > s_traceRect[2] || ty1 < s_traceRect[1] || ty0 > s_traceRect[3]) continue;
+			said++;
+			fprintf(tf(), "[trace]   tri %u:", t / 3);
+			for (int k = 0; k < 3; k++) {
+				const uint32_t i = oidx[t + k];
+				const PicaVtx& o = out[i];
+				const uint8_t* v = r_verts + size_t(i) * r_stride;
+				float pos[3];
+				memcpy(pos, v, 12);
+				fprintf(tf(), " [%u screen %.3f %.3f %.6f w %.3f | pos %.4f %.4f %.4f pm %u | tc0 %.6f %.6f]", unsigned(i), o.x / o.w,
+				        o.y / o.w, o.z / o.w, o.w, pos[0], pos[1], pos[2], unsigned(hasMtx ? v[L.mtx] : defPm), o.tc[0][0], o.tc[0][1]);
+			}
+			fprintf(tf(), "\n");
+		}
+		// Unit 0's texture as the game's data decodes, for the draws with triangles there (a few).
+		if (said && utex[0] && !ucopy[0] && s_traceTexDumps < 16) {
+			const int map = tev.pairMap[tev.unitPair[0]];
+			const uint32_t img0 = rs.bp[bpTexReg(BP_TX_IMAGE0, map)];
+			const uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
+			if (rs.texImage[map] && fmt != 8 && fmt != 9 && fmt != 10) {
+				std::vector<uint8_t> rgba(size_t(w) * h * 4);
+				decodeTexture(rs.texImage[map], fmt, w, h, nullptr, 0, rgba.data());
+				char path[64];
+				snprintf(path, sizeof path, "sdmc:/sms/trace-tex-%u.pam", s_traceDraw - 1);
+				if (FILE* f = fopen(path, "wb")) {
+					fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", unsigned(w), unsigned(h));
+					fwrite(rgba.data(), 1, rgba.size(), f);
+					fclose(f);
+					s_traceTexDumps++;
+					fprintf(tf(), "[trace]   unit 0's texture (%ux%u fmt %u) written to %s\n", unsigned(w), unsigned(h), unsigned(fmt), path);
+				}
+			}
+		}
 	}
 	perfAdd(PERF_XFORM, perfTick() - perfXform0);
 	{
@@ -6691,6 +6761,7 @@ static void renderCopy(const CopyRec* cr) {
 			s_tracing = true;
 			s_traceDraw = 0;
 			s_traceDumped.clear();
+			s_traceTexDumps = 0;
 			char path[48];
 			snprintf(path, sizeof path, "sdmc:/sms/trace-%u.txt", ++s_traceNo);
 			s_traceFile = fopen(path, "w");
@@ -7039,9 +7110,9 @@ void GX3DS_GetPerf(float out[11]) {
 
 void GX3DS_SetDebugColors(int mode) {
 	gx::s_debugColors = mode == 1;
-	gx::s_opaque = mode == 2;
+	gx::s_opaque = mode == 2 ? 1 : mode == 3 ? 2 : 0;
 }
-int GX3DS_GetDebugColors(void) { return gx::s_debugColors ? 1 : gx::s_opaque ? 2 : 0; }
+int GX3DS_GetDebugColors(void) { return gx::s_debugColors ? 1 : gx::s_opaque ? gx::s_opaque + 1 : 0; }
 
 // Last frame: triangle draws before its first EFB-to-texture copy, after it, and the copies.
 // Texture uploads so far, cache bytes, draws skipped for sampling an EFB copy.
