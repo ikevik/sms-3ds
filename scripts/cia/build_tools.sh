@@ -18,6 +18,10 @@ ln -sf "$(command -v x86_64-w64-mingw32-ar)" "$MINGW_AR/ar"
 for t in win x86_64 arm64; do
 	rm -rf "$T/makerom-$t"
 	cp -R "$T/Project_CTR/makerom" "$T/makerom-$t"
+	# user_settings.c includes makerom's version.h, whose VER_MINOR (19, makerom's own version) hides
+	# the title version's index (1): -minor wrote past titleVersion[] and the minor number was lost
+	# (0.1.1 became 0.0.1).
+	sed -i '' 's/titleVersion\[VER_MINOR\]/titleVersion[1]/g' "$T/makerom-$t/src/user_settings.c"
 	(cd "$T/makerom-$t" && make clean >/dev/null 2>&1 && make clean_deps >/dev/null 2>&1) || true
 done
 (cd "$T/makerom-win" && PATH="$MINGW_AR:$PATH" make PROJECT_PLATFORM=WIN32 deps && PATH="$MINGW_AR:$PATH" make PROJECT_PLATFORM=WIN32 -j8)
