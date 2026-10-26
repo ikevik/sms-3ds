@@ -39,6 +39,7 @@ extern "C" u32 PADRead(PADStatus* status)
 		pad3ds_parked = 1;
 		sms3ds_park();
 	}
+	if (void (*hook)(void) = pad3ds_frame_hook) hook();
 	Pad3DSStatus in;
 	pad3ds_read(&in);
 

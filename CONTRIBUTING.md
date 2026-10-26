@@ -37,6 +37,7 @@ which script to run again after a change to which folder. Two rules:
 | `quit_after = 30` | Quit after that many seconds of play |
 | `buttons = 28:ZR+SUP:4` | Hold buttons at a time, for a while (A B X Y L R ZL ZR START SELECT, D-pad UP DOWN LEFT RIGHT, Circle Pad SUP SDOWN SLEFT SRIGHT, C-stick CUP CDOWN CLEFT CRIGHT) |
 | `shots = 29,31.5` | Save the frame at those times (`sdmc:/sms/shot-<tenths>.ppm`) |
+| `teleport = 27:1200,900,-3400,90;40:0,500,0` | Put Mario at x,y,z (and facing that many degrees) at the first moment of play from that many seconds on, in order, with no spaces. The bottom screen shows where Mario is and which way he faces, and so do the log's `[mar]` lines |
 | `debug_input = on` | The debug controls (also in `settings.txt`) |
 
 The others are described where `source_game/main.cpp` reads them. Every run writes

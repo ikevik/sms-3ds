@@ -105,6 +105,17 @@ static float s_cpuPathAt = -1.0f;  // autorun.txt cpu_path_at = <seconds>: the C
 static float s_traceAt = -1.0f;  // autorun.txt trace_at = <seconds>: that frame's GX commands traced (sdmc:/sms/trace-N.txt)
 static float s_goopDumpAt = -1.0f;  // autorun.txt goop_dump_at = <seconds>: each map's next readback written (sdmc:/sms/goop-<address>.pgm)
 extern "C" void pica_request_goop_dumps(void);  // pica_draw.c
+// autorun.txt teleport = <seconds>:<x>,<y>,<z>[,<degrees>];...: Mario put at that point (and turned to
+// face that way, in degrees as the bottom screen shows them) in the first frame of play from that many
+// seconds after launch on, in order (no spaces, as every value). The bottom screen and the log's [mar]
+// lines say where he is.
+struct Teleport {
+	float at, x, y, z, deg;
+	bool facing;
+};
+static Teleport s_tp[8];
+static int s_nTp, s_tpNext;
+static volatile int s_tpPending = -1;  // for the game thread's next PADRead (teleport_now); -1: none
 static u64 s_launchMs;
 extern "C" void pica_request_shot(int id);  // pica_draw.c
 static u32 script_keys(const char* s)
@@ -271,6 +282,39 @@ static SceneState read_scene()
 	return s;
 }
 
+// The game's (MarioAccess.cpp): TMario::mPosition and TMario::mFaceAngle.y (0x10000 a turn), set as
+// Mario is made and stale between stages: read only while a stage's director is up.
+extern float* gpMarioPos;
+extern s16* gpMarioAngleY;
+static bool mario_where(float* p, int* deg)
+{
+	if (!gpMarioPos || !probe_readable((uintptr_t)gpMarioPos, 12) || !gpMarioAngleY ||
+	    !probe_readable((uintptr_t)gpMarioAngleY, 2))
+		return false;
+	memcpy(p, gpMarioPos, 12);
+	*deg = int((u16)*gpMarioAngleY * 360u >> 16);
+	return true;
+}
+
+// On the game thread at its PADRead (pad3ds_frame_hook), before the frame's game code moves Mario:
+// the teleport the main thread posted.
+static void teleport_now()
+{
+	const int i = s_tpPending;
+	if (i < 0) return;
+	s_tpPending = -1;
+	const Teleport& t = s_tp[i];
+	float p[3];
+	int deg;
+	if (!mario_where(p, &deg)) return;
+	gpMarioPos[0] = t.x;
+	gpMarioPos[1] = t.y;
+	gpMarioPos[2] = t.z;
+	if (t.facing) *gpMarioAngleY = (s16)(u16)(int)(t.deg * (65536.0f / 360.0f) + (t.deg < 0 ? -0.5f : 0.5f));
+	fprintf(stderr, "[3ds] autorun: Mario put at %.0f, %.0f, %.0f (from %.0f, %.0f, %.0f), facing %d\n", t.x, t.y,
+	        t.z, p[0], p[1], p[2], t.facing ? int(t.deg) : deg);
+}
+
 // Logs once a second, and at once whenever the state, area, movie or director changes.
 // frames and batches are GX3DS_GetStats totals; draws/frame is over the time since the last line.
 // autorun.txt flags_on = <flag>,...: those game flags kept set (testing: Delfino Plaza's gates
@@ -321,9 +365,14 @@ static void log_scene(uint32_t frames, uint32_t batches)
 	uint32_t df = frames - last_frames, db = batches - last_batches;
 	last_frames = frames;
 	last_batches = batches;
-	if (s.mar_state >= 0)
-		fprintf(stderr, "[mar] state=%d cardload=%08lx cl=%d,%d,%d draws/frame=%lu\n", s.mar_state,
-		        (unsigned long)s.cardload, s.cl10, s.cl14, s.cl18, (unsigned long)(df ? db / df : 0));
+	if (s.mar_state >= 0) {
+		float p[3];
+		int deg;
+		char at[48] = "";
+		if (mario_where(p, &deg)) snprintf(at, sizeof at, " mario=%.0f,%.0f,%.0f,%d", p[0], p[1], p[2], deg);
+		fprintf(stderr, "[mar] state=%d cardload=%08lx cl=%d,%d,%d draws/frame=%lu%s\n", s.mar_state,
+		        (unsigned long)s.cardload, s.cl10, s.cl14, s.cl18, (unsigned long)(df ? db / df : 0), at);
+	}
 	if (s.thp_state || s.thp_internal || s.thp_play) {
 		int32_t video, audio;
 		read_thp_frames(&video, &audio);
@@ -867,6 +916,16 @@ static void* game_thread(void*)
 			if (setting_value(kAutoPath, "flags_on", list, sizeof list))
 				for (char* p = strtok(list, ","); p && s_nFlagsOn < 16; p = strtok(nullptr, ","))
 					s_flagsOn[s_nFlagsOn++] = (u32)strtoul(p, nullptr, 0);
+			if (setting_value(kAutoPath, "teleport", list, sizeof list)) {
+				for (char* p = strtok(list, ";"); p && s_nTp < 8; p = strtok(nullptr, ";")) {
+					Teleport& tp = s_tp[s_nTp];
+					const int n = sscanf(p, " %f : %f , %f , %f , %f", &tp.at, &tp.x, &tp.y, &tp.z, &tp.deg);
+					tp.facing = n == 5;
+					if (n >= 4) s_nTp++;
+				}
+				if (s_nTp) pad3ds_frame_hook = teleport_now;
+				fprintf(stderr, "[3ds] autorun.txt: %d teleports\n", s_nTp);
+			}
 			if (s_nPress || s_nShot)
 				fprintf(stderr, "[3ds] autorun.txt: %d scripted button presses, %d screenshots\n", s_nPress, s_nShot);
 		}
@@ -951,6 +1010,13 @@ static void draw_status(const uint32_t* s) {
 		printf("\nscene: %-9s area %2u-%-2u next %2u-%-2u\nmovie %u  director %08lx\n",
 		       app_state_name(sc.state), sc.curr_stage, sc.curr_scen, sc.next_stage, sc.next_scen,
 		       sc.movie, (unsigned long)sc.director_vtbl);
+		// Where Mario is, for autorun.txt's teleport.
+		float p[3];
+		int deg;
+		if (sc.mar_state >= 0 && mario_where(p, &deg))
+			printf("\x1b[14;0HMario %6.0f %6.0f %6.0f facing %3d ", p[0], p[1], p[2], deg);
+		else
+			printf("\x1b[14;0H%38s", "");
 	}
 	printf("\x1b[16;0Hdropped draws %lu\ncolours: %-14s\n", (unsigned long)pica_dropped(),
 	       GX3DS_GetDebugColors() == 1 ? "debug (per draw)" : GX3DS_GetDebugColors() == 2 ? "opaque" : "material");
@@ -1364,8 +1430,14 @@ int main()
 		// presses before hidKeysDown() saw them). START alone is the game's Start button, so quitting
 		// needs START+SELECT.
 		hidScanInput();
-		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_goopDumpAt >= 0.0f || s_cpuPathAt >= 0.0f || s_nNewStage) {  // autorun.txt timed keys
+		if (s_nPress || s_nShot || s_traceAt >= 0.0f || s_goopDumpAt >= 0.0f || s_cpuPathAt >= 0.0f || s_nNewStage ||
+		    s_tpNext < s_nTp) {  // autorun.txt timed keys
 			const float t = float(osGetTime() - s_launchMs) / 1000.0f;
+			// A teleport once it is time and a stage is in play (the stage's director playing).
+			if (s_tpNext < s_nTp && t >= s_tp[s_tpNext].at && s_tpPending < 0 && g_phase == 2) {
+				const SceneState sc = read_scene();
+				if (sc.state == 5 && sc.mar_state == 4) s_tpPending = s_tpNext++;
+			}
 			while (s_newStageNext < s_nNewStage && t >= s_newStageAt[s_newStageNext]) s_newStageNext++, GX3DS_NewStage();
 			if (s_cpuPathAt >= 0.0f && t >= s_cpuPathAt) {
 				GX3DS_SetGpuTransform(0);

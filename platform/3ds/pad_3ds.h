@@ -45,6 +45,9 @@ extern volatile int pad3ds_zr_opposite;
 extern volatile int pad3ds_stick_deadzone;
 // Set by the main thread when quitting: the game thread stops at its next PADRead.
 extern volatile int pad3ds_quit;
+// Called by the game thread at each PADRead, at the start of its frame and before the frame's
+// game code: for changes to the game's objects (main.cpp's autorun.txt teleport). NULL: none.
+extern void (*volatile pad3ds_frame_hook)(void);
 // Set by the main thread once the game thread has stopped, as the services are about to shut down:
 // from then on the threads that wake up on their own park (sms3ds_park).
 extern volatile int sms3ds_ending;

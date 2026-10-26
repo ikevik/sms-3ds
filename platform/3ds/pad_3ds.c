@@ -80,6 +80,7 @@ static Pad3DSStatus s_latest;
 volatile uint32_t pad3ds_script;
 static LightLock s_lock = 1; /* 1: unlocked */
 volatile int pad3ds_quit;
+void (*volatile pad3ds_frame_hook)(void);
 volatile int pad3ds_soft_r;
 volatile int pad3ds_zr_opposite;
 volatile int sms3ds_ending;
