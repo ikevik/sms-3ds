@@ -71,7 +71,8 @@ extern int GXPC_CullOff;  // patch 0014: skip off-screen display-list draws
 extern "C" int SMS3DS_DemoStage, SMS3DS_DemoScenario;
 int SMS3DS_DemoStage = SMS_DEMO_STAGE, SMS3DS_DemoScenario = SMS_DEMO_SCENARIO;
 // Unattended runs, driven from a computer (as in Azahar): sdmc:/sms/autorun.txt may give
-// boot_stage (<stage>-<scenario>: booted into and returned to, as a demo build's), skip_movies
+// boot_stage (<stage>-<scenario>: booted into and returned to, as a demo build's; past the title and
+// the file select, so no save is loaded: a new game's flags, Delfino Plaza's gates closed), skip_movies
 // (on: the movies skipped, as settings.txt's skip_movies), profile_auto (seconds of free play
 // before the low touch's run starts by itself; 0 off), profile_auto_quit (on: quit once that run
 // is done) and quit_after (seconds of free play before quitting; 0 off). Free play: the stage's
