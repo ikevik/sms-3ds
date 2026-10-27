@@ -5,7 +5,7 @@ game code is compiled for the 3DS's ARM CPU, its GameCube graphics (GX) are tran
 3DS's PICA200 GPU, and its sound plays on the 3DS's DSP. No game data, art or music is included:
 the port reads everything from **your own disc image** on the SD card.
 
-## Status: 0.1.1-beta
+## Status: 0.1.2-beta
 
 What works:
 
