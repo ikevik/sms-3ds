@@ -407,7 +407,8 @@ static void check_stall(uint32_t frames, uint32_t batches)
 	// then, and a step back read as a stall of billions of seconds (17 Oct log, frame 4588).
 	u64 now = svcGetSystemTick() / (SYSCLOCK_ARM11 / 1000);
 	if (frames != last_frames) {
-		if (reports) fprintf(stderr, "[stall] frames moving again at %lu\n", (unsigned long)frames);
+		if (reports)
+			fprintf(stderr, "[stall] frames moving again at %lu, after %.1f s\n", (unsigned long)frames, double(now - since) / 1000.0);
 		last_frames = frames;
 		since = now;
 		reports = 0;
@@ -443,6 +444,10 @@ static LightLock s_logRingLock, s_logFileLock;
 static LightEvent s_logWake;
 static bool s_logRingOn, s_logWriterOn;
 static volatile bool s_logInPlace;  // quitting: flush_log writes on the caller's thread, and waits
+// autorun.txt log_card_delay_ms: each of the writer's commits takes that much longer, as on a slow SD
+// card (testing; issue #2's card held v0.1.1's loggers 5-7 s at a time, every 8-17 s).
+static uint32_t s_logCardDelayMs;
+static uint32_t s_logSlowWrites, s_logSlowestMs;  // commits over a second, and the longest
 
 static ssize_t log_write(struct _reent*, void*, const char* p, size_t n)
 {
@@ -469,6 +474,8 @@ static void log_drain(void)
 	static char chunk[16 << 10];
 	static uint32_t saidDropped;
 	LightLock_Lock(&s_logFileLock);
+	const u64 t0 = svcGetSystemTick();
+	uint32_t bytes = 0;
 	for (;;) {
 		LightLock_Lock(&s_logRingLock);
 		uint32_t n = s_logHead - s_logTail;
@@ -483,6 +490,7 @@ static void log_drain(void)
 		const uint32_t dropped = s_logDropped;
 		LightLock_Unlock(&s_logRingLock);
 		if (s_logFile && n) fwrite(chunk, 1, n, s_logFile);
+		bytes += n;
 		if (s_logFile && dropped != saidDropped) {
 			fprintf(s_logFile, "[log] %lu bytes of the log lost so far: the SD card fell behind\n", (unsigned long)dropped);
 			saidDropped = dropped;
@@ -492,6 +500,15 @@ static void log_drain(void)
 	if (s_logFile) {
 		fflush(s_logFile);
 		fsync(fileno(s_logFile));
+		if (s_logCardDelayMs && !s_logInPlace) svcSleepThread(s_logCardDelayMs * 1000000LL);
+		// A slow card said in the log, after the lines it held: this thread alone waited for it.
+		const uint32_t ms = uint32_t((svcGetSystemTick() - t0) / (SYSCLOCK_ARM11 / 1000));
+		if (ms >= 1000) {
+			s_logSlowWrites++;
+			if (ms > s_logSlowestMs) s_logSlowestMs = ms;
+			fprintf(s_logFile, "[log] the SD card took %lu ms for %lu KB of the log (%lu commits over a second so far, the longest %lu ms; the game did not wait)\n",
+			        (unsigned long)ms, (unsigned long)(bytes >> 10), (unsigned long)s_logSlowWrites, (unsigned long)s_logSlowestMs);
+		}
 	}
 	LightLock_Unlock(&s_logFileLock);
 }
@@ -995,6 +1012,10 @@ static void* game_thread(void*)
 		if (setting_value(kAutoPath, "vram_textures", v, sizeof v) && strcmp(v, "off") == 0) {
 			pica_set_vram_textures(0);
 			fprintf(stderr, "[3ds] autorun.txt: textures in FCRAM only (no VRAM textures)\n");
+		}
+		if (setting_value(kAutoPath, "log_card_delay_ms", v, sizeof v)) {
+			s_logCardDelayMs = (uint32_t)atoi(v);
+			fprintf(stderr, "[3ds] autorun.txt: each log commit %lu ms longer (a slow SD card)\n", (unsigned long)s_logCardDelayMs);
 		}
 		if (setting_value(kAutoPath, "quit_after", v, sizeof v)) s_quitAfter = atoi(v);
 		// renderer_log = on: the renderer's once-per-kind [tevdump], [tev] and [copy] lines (as holding
