@@ -2,8 +2,9 @@
 
 A native port of Super Mario Sunshine (GMSE01, NTSC-U) to the New Nintendo 3DS. The decompiled
 game code is compiled for the 3DS's ARM CPU, its GameCube graphics (GX) are translated to the
-3DS's PICA200 GPU, and its sound plays on the 3DS's DSP. No game data, art or music is included:
-the port reads everything from **your own disc image** on the SD card.
+3DS's PICA200 GPU, and its sound plays on the 3DS's DSP. The game reads its data and music from
+**your own disc image** on the SD card. The CIA builder includes the separately credited Mario
+promotional artwork and authored relief profile used for its HOME banner.
 
 ## Status: 0.1.2-beta
 
@@ -49,10 +50,14 @@ SD:/3ds/sms3ds/sms3ds.3dsx    for the Homebrew Launcher
 
 ### The HOME Menu (.cia)
 
-No `.cia` is published: its icon (the Shine Sprite), its banner (the title logo) and the banner's
-sound (the first seconds of the title theme) are made from your own disc, so the release carries
-none of Nintendo's art or music. The builder takes about half a minute and needs Python 3.8 or
-newer (no packages).
+No `.cia` is published. The builder makes the Shine Sprite icon, title logo and default title-theme
+sound from your disc. Its default banner combines that logo with the credited Mario promotional
+artwork in a fixed-facing stereoscopic relief, with a gentle eight-second bob. The image and
+authored depth profile are included; no AI model is downloaded or run.
+
+The default needs **Python 3.11 or newer**. On first use it downloads a pinned CGFX converter and
+installs Pillow/gltflib into a local, isolated `.banner-tools` cache. Later builds reuse those
+tools. `--banner flat` retains the original dependency-free banner with Python 3.8 or newer.
 
 - Windows: unzip the builder and double-click `Build SMS CIA.bat`, then choose your disc image.
 - macOS: double-click `Build SMS CIA.command` and drag your disc image into its window. The first
@@ -63,6 +68,18 @@ newer (no packages).
 It writes `output/sms3ds.cia` and `output/sd-card/` (the same SD files as above, the `.3dsx` with
 the same icon). Copy `sms3ds.cia` to `SD:/cias/`, then in FBI choose SD → cias → sms3ds.cia →
 Install CIA. Please don't share the built `.cia`: it carries art and music from your disc.
+
+The CLI also accepts an existing stereo PCM16 WAV, at most three seconds long. It preserves its
+samples without trimming, normalizing or adding fades:
+
+```sh
+python3 build_cia.py /path/to/GMSE01.iso --banner-audio /path/to/voice.wav
+python3 build_cia.py /path/to/GMSE01.iso --banner flat
+```
+
+From a source checkout, use `make MODE=game cia ISO=/path/to/GMSE01.iso`; add
+`BANNER_AUDIO=/path/to/voice.wav` for custom sound, or `BANNER=flat` for the original banner.
+See [the banner pipeline](docs/HOME_BANNER.md) for artwork attribution, budgets and validation.
 
 ## Controls
 

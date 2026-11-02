@@ -5,7 +5,8 @@
 #   scripts/cia/package.sh 0.1.0-beta
 # Needs the game, platform and GX libraries built (scripts/build_*_lib.sh) and the tools in
 # build/tools/dist (scripts/cia/build_tools.sh). The .3dsx is linked again here with the default
-# icon: the release carries no art (meta/icon.png is for local builds only).
+# icon (meta/icon.png is for local builds only). The builder separately includes the credited
+# promotional banner artwork/profile, but no extracted disc assets or audio.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 VER=${1:?usage: scripts/cia/package.sh <version, as 0.1.0-beta>}
@@ -33,8 +34,11 @@ cp LICENSE "$H/LICENSES/sms3ds.txt"  # the port's own (MIT)
 
 K="$R/SMS-3DS-CIA-Builder"
 mkdir -p "$K/tools"
-cp scripts/cia/build_cia.py scripts/cia/gcdisc.py scripts/cia/sms3ds.rsf scripts/cia/settings.txt \
+cp scripts/cia/build_cia.py scripts/cia/gcdisc.py scripts/cia/banner_verify.py \
+	scripts/cia/relief_banner.py scripts/cia/bootstrap_banner.py scripts/cia/requirements-banner.txt \
+	scripts/cia/sms3ds.rsf scripts/cia/settings.txt \
 	scripts/cia/README.txt "scripts/cia/Build SMS CIA.command" "scripts/cia/Build SMS CIA.bat" "$K/"
+cp -R scripts/cia/banner_assets "$K/"
 "$DEVKITARM/bin/arm-none-eabi-strip" -o "$K/sms3ds.elf" sms3ds.elf
 cp sms3ds.3dsx "$K/"
 echo "$VER" > "$K/version.txt"

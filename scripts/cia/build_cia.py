@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """Builds the Super Mario Sunshine 3DS port's .cia (for the HOME Menu) from the player's own disc.
 
-The icon (the HUD's Shine Sprite), the banner (the title logo) and the banner's sound (the title
-theme's first seconds) are made from GMSE01.iso, so the release carries no Nintendo art or music.
-The .3dsx next to this script gets the same icon, for the Homebrew Launcher.
+The icon, title logo and default title-theme excerpt are made from GMSE01.iso. The supplied
+Mario promotional artwork and fixed depth profile are credited in banner_assets/README.md.
+The .3dsx next to this script gets the same icon and titles, for the Homebrew Launcher.
 
     python3 build_cia.py [GMSE01.iso] [--out DIR]
 
-Needs Python 3.8 or newer (no packages) and makerom and bannertool: tools/<windows|macos|linux>/
-next to this script, else on the PATH.
+The default relief banner needs Python 3.11 or newer; its image/converter tools are prepared in
+an isolated local cache on first use. --banner flat retains the Python 3.8/no-packages route.
+makerom and bannertool go in tools/<windows|macos|linux>/, else on the PATH.
 """
 import argparse
+import json
 import math
 import os
 import shutil
 import struct
 import subprocess
 import sys
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gcdisc  # noqa: E402
+from banner_verify import align_audio, validate_banner, validate_wave  # noqa: E402
 
 # The HOME Menu's titles when there is no .3dsx to take them from (its SMDH, as the Makefile made it).
 TITLE = 'Super Mario Sunshine'
@@ -214,6 +218,12 @@ def main():
     ap.add_argument('--rsf', default=os.path.join(HERE, APP + '.rsf'))
     ap.add_argument('--tools', default=os.path.join(HERE, 'tools'))
     ap.add_argument('--version', default=None, help='title version, as 0.1.0 (default: version.txt)')
+    ap.add_argument('--banner', choices=('relief', 'flat'), default='relief',
+                    help='relief: fixed-facing 3D artwork (default); flat: original dependency-free banner')
+    ap.add_argument('--banner-audio', type=Path,
+                    help='optional stereo PCM16 WAV, at most three seconds; copied without trimming or gain changes')
+    ap.add_argument('--banner-tools', type=Path, default=Path(HERE) / '.banner-tools',
+                    help='isolated cache for the relief converter and its Python environment')
     args = ap.parse_args()
 
     iso = args.iso or ask_iso()
@@ -221,6 +231,11 @@ def main():
         sys.exit('error: no disc image at %s' % iso)
     if not os.path.isfile(args.elf):
         sys.exit('error: %s is missing' % args.elf)
+    if args.banner_audio:
+        try:
+            validate_wave(args.banner_audio)
+        except (OSError, ValueError) as exc:
+            sys.exit('error: %s' % exc)
     version = args.version
     vfile = os.path.join(HERE, 'version.txt')
     if version is None and os.path.isfile(vfile):
@@ -237,19 +252,44 @@ def main():
 
     work = os.path.join(args.out, 'art')
     os.makedirs(work, exist_ok=True)
-    print('Making the icon, banner and banner sound from your disc...')
+    print('Making the icon and banner sound from your disc...')
     gcdisc.write_png(os.path.join(work, 'icon.png'), make_icon(disc))
-    gcdisc.write_png(os.path.join(work, 'banner.png'), make_banner(disc))
-    gcdisc.write_wav(os.path.join(work, 'jingle.wav'), *make_jingle(disc))
+    audio_path = os.path.join(work, 'jingle.wav')
+    if args.banner_audio:
+        if os.path.abspath(str(args.banner_audio)) != os.path.abspath(audio_path):
+            shutil.copyfile(str(args.banner_audio), audio_path)
+    else:
+        gcdisc.write_wav(audio_path, *make_jingle(disc))
 
     title, description, publisher = TITLE, DESCRIPTION, PUBLISHER
     if os.path.isfile(args.tdsx):
         title, description, publisher = smdh_titles(args.tdsx)
+    if args.banner == 'relief':
+        title = description = TITLE
     icn, bnr = os.path.join(work, 'icon.icn'), os.path.join(work, 'banner.bnr')
     run([bannertool, 'makesmdh', '-s', title, '-l', description, '-p', publisher,
          '-i', os.path.join(work, 'icon.png'), '-f', 'visible,allow3d,recordusage,new3ds', '-o', icn])
-    run([bannertool, 'makebanner', '-i', os.path.join(work, 'banner.png'),
-         '-a', os.path.join(work, 'jingle.wav'), '-o', bnr])
+    cgfx = None
+    if args.banner == 'relief':
+        try:
+            from bootstrap_banner import ensure_tools
+            python, converter = ensure_tools(args.banner_tools)
+            run([str(python), '-I', os.path.join(HERE, 'relief_banner.py'), '--iso', iso,
+                 '--out', work, '--pycgfx', str(converter)])
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            sys.exit('error: %s\nUse --banner flat for the original banner.' % exc)
+        cgfx = Path(work) / 'banner.cgfx'
+        run([bannertool, 'makebanner', '-ci', str(cgfx), '-a', audio_path, '-o', bnr])
+        align_audio(Path(bnr))
+    else:
+        gcdisc.write_png(os.path.join(work, 'banner.png'), make_banner(disc))
+        run([bannertool, 'makebanner', '-i', os.path.join(work, 'banner.png'), '-a', audio_path, '-o', bnr])
+    try:
+        report = validate_banner(Path(bnr), Path(audio_path), cgfx)
+    except (OSError, ValueError) as exc:
+        sys.exit('error: %s' % exc)
+    report.update(banner_mode=args.banner, hardware_tested=False)
+    Path(work, 'banner-report.json').write_text(json.dumps(report, indent=2) + '\n')
 
     cia = os.path.join(args.out, APP + '.cia')
     print('Building the CIA...')
@@ -273,7 +313,7 @@ def main():
     print()
     print('Next: install %s.cia with FBI, copy the sd-card folder\'s contents to your SD card, and put' % APP)
     print('your disc image there as /sms/GMSE01.iso (the game reads it from there; the CIA holds none of it).')
-    print('Please don\'t share the built CIA: its icon, banner and sound come from your disc.')
+    print('Please don\'t share the built CIA: it contains game artwork and music.')
 
 
 if __name__ == '__main__':

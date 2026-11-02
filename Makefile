@@ -156,11 +156,12 @@ all: $(BUILD)
 clean:
 	@echo clean ...
 	@rm -fr $(BUILD) $(TARGET).3dsx $(OUTPUT).smdh $(TARGET).elf
-# make MODE=game cia ISO=<GMSE01.iso>: build/cia/$(TARGET).cia, its icon, banner and banner sound made
-# from that disc (scripts/cia/build_cia.py; makerom and bannertool from scripts/cia/build_tools.sh).
+# The relief artwork/profile is bundled; the icon/logo and default sound come from the disc.
+# BANNER=flat retains the original banner. BANNER_AUDIO supplies an unmodified PCM16 WAV.
+BANNER ?= relief
 cia: all
 	@python3 -I scripts/cia/build_cia.py $(if $(ISO),"$(ISO)") --elf $(TARGET).elf --3dsx $(TARGET).3dsx \
-		--tools build/tools/dist --out build/cia
+		--tools build/tools/dist --out build/cia --banner $(BANNER) $(if $(BANNER_AUDIO),--banner-audio "$(BANNER_AUDIO)")
 $(BUILD):
 	@mkdir -p $@
 else

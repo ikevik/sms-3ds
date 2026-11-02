@@ -20,6 +20,8 @@ meta/*.bnr
 # The CIA builder run from the repository (scripts/cia/build_cia.py: output/ and its module cache)
 scripts/cia/output/
 scripts/cia/__pycache__/
+scripts/cia/.banner-tools/
+scripts/cia/tests/__pycache__/
 
 # macOS folder metadata
 .DS_Store

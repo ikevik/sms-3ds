@@ -65,7 +65,10 @@ land in `SD:/luma/dumps/arm11/`.
   frame times before and after.
 - Match the code around your change. Comments say why, not what. Where a change trades accuracy
   for speed, put it behind a setting (as `lite` does) rather than making it the default.
-- Nothing from the game: no disc files, extracted assets, art, music or links to them.
+- No disc files, extracted game assets or music. Keep generated CIAs and local build outputs out
+  of the repository. The fixed promotional artwork, native texture and authored relief profile
+  in `scripts/cia/banner_assets/` are the documented banner-asset exception; see its source credits
+  before proposing changes to that bundle.
 - Nothing personal: no `/Users/<name>` paths or real names in files, patches or commit messages.
 - AI assistance is welcome, as long as you say so (a `Co-Authored-By:` line in the commit is
   enough) and the result is tested like any other change. See the README's AI disclosure.
