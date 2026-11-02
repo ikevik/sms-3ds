@@ -2,7 +2,8 @@ Super Mario Sunshine for New 3DS - beta
 =======================================
 
 An unofficial native port: the game's decompiled code, running on the 3DS. It plays your own
-disc image. No game data, art or music comes with it.
+disc image. The CIA builder includes the credited promotional banner artwork; disc assets
+and audio are extracted locally.
 
 What you need
 -------------
@@ -22,15 +23,33 @@ Setting up the SD card
 
 Building the .cia (SMS-3DS-CIA-Builder)
 ---------------------------------------
-The .cia is not in the release: its icon (the Shine Sprite), banner (the title logo) and banner
-sound (the first seconds of the title theme) are made from your disc. The builder takes about
-half a minute and needs Python 3.8 or newer (https://www.python.org/downloads/).
+The .cia is not in the release. Its icon, title logo and default title-theme sound are made from
+your disc. The default fixed-facing 3D relief also uses the credited Mario promotional artwork
+and authored depth profile in banner_assets/. Mario and the water bob together every eight seconds.
+
+Use Python 3.11 or newer (https://www.python.org/downloads/). First use downloads the pinned CGFX
+converter and installs image packages in the local .banner-tools cache; later builds reuse them.
+It does not download an AI depth model or modify your system Python. --banner flat keeps the old,
+dependency-free banner and supports Python 3.8 or newer.
 
 - Windows: double-click "Build SMS CIA.bat" and choose your disc image.
 - macOS: double-click "Build SMS CIA.command" and drag your disc image into the window. The first
   time, macOS refuses it as from an unidentified developer: right-click it, choose Open, then Open.
 - Linux: python3 build_cia.py /path/to/GMSE01.iso, with makerom and bannertool on your PATH
   (build them from https://github.com/3DSGuy/Project_CTR and https://github.com/diasurgical/bannertool).
+
+Custom sound: python3 build_cia.py /path/to/GMSE01.iso --banner-audio /path/to/voice.wav
+The WAV must be uncompressed stereo 16-bit PCM, nonempty and at most three seconds. Its samples
+are preserved exactly: no trimming, gain changes, padding or extra fades. Without this option the
+builder retains the original title-theme excerpt and its existing fade.
+Old banner: python3 build_cia.py /path/to/GMSE01.iso --banner flat
+An alternate --banner-tools directory selects where the isolated tools are cached.
+
+The short and long HOME titles in relief mode are both Super Mario Sunshine. All relief nodes
+stay screen-facing. Conservative model and full-banner budgets prevent returning to the larger
+profile that produced sustained noise in a physical cold-boot test. The full-banner budget is a
+project precaution, not a claim about a documented firmware-wide size limit.
+Artwork attribution and the fixed texture/depth profile are documented in banner_assets/README.md.
 
 It writes output/sms3ds.cia and output/sd-card/, the same SD files as above with the .3dsx given
 the same icon. Install sms3ds.cia with FBI. Please don't share the built .cia: it carries art
